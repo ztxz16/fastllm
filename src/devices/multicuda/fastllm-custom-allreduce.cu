@@ -1,3 +1,4 @@
+#include <numeric>
 // Graph-safe small-tensor all-reduce for single-process MultiCUDA.
 //
 // The kernel/barrier design is adapted from vLLM's Apache-2.0 licensed
@@ -12,6 +13,7 @@
 #include "devices/cuda/fastllm-swa-prepare.cuh"
 #endif
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-launch.cuh"
 #include "fastllm-multicuda.cuh"
 #include "fastllm-draft-sm120.h"
 #include "naive-n05-cuda.cuh"
@@ -32,6 +34,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <climits>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -56,6 +60,15 @@
 #include <curand_kernel.h>
 #include <cub/block/block_scan.cuh>
 #include <cub/block/block_reduce.cuh>
+#endif
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+#include "../cuda/models/naive-n05-mxfp8-projection.cuh"
+#include "../cuda/models/naive-n05-swa-mma.cuh"
+#include "devices/cuda/naive-n05-kv.cuh"
+#include "../cuda/models/naive-n05-verify-softmax.cuh"
+#include "../cuda/models/naive-n05-sm90-replicated-dsa.h"
+#include <cooperative_groups.h>
+#include <cub/block/block_radix_sort.cuh>
 #endif
 
 namespace {
@@ -1382,20 +1395,12 @@ __global__ void FastllmCustomAllReduceResidualKernel(CustomArPointers data, Cust
         CustomArBarrierFinal<Ranks>(signals, self, rank);
     }
 }
-__global__ void FastllmCustomRMSNormPdlKernel(const CustomArNormBF16 *input, const float *weight,
-                                           CustomArNormBF16 *output, float eps) {
-    __shared__ float sums[8];
-    float value[16], affine[16], partial = 0;
-    int row = blockIdx.x;
+__device__ __forceinline__ void CustomArNormRow256(const CustomArNormBF16 *input, const float *affine,
+        CustomArNormBF16 *output, float eps, float *sums) {
+    float value[16], partial = 0;
 #pragma unroll
     for (int i = 0; i < 16; ++i)
-        affine[i] = weight[threadIdx.x + i * 256];
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
-#pragma unroll
-    for (int i = 0; i < 16; ++i)
-        value[i] = (float)input[row * 4096 + threadIdx.x + i * 256];
+        value[i] = (float)input[threadIdx.x + i * 256];
 #pragma unroll
     for (int i = 0; i < 16; ++i)
         partial += value[i] * value[i];
@@ -1412,8 +1417,64 @@ __global__ void FastllmCustomRMSNormPdlKernel(const CustomArNormBF16 *input, con
     float scale = rsqrtf(sums[0] / 4096 + eps);
 #pragma unroll
     for (int i = 0; i < 16; ++i)
-        output[row * 4096 + threadIdx.x + i * 256] =
+        output[threadIdx.x + i * 256] =
             __float2bfloat16_rn(CustomArNormRound(value[i] * scale) * affine[i]);
+}
+
+__global__ void FastllmCustomRMSNormPdlKernel(const CustomArNormBF16 *input, const float *weight,
+                                           CustomArNormBF16 *output, float eps) {
+    __shared__ float sums[8];
+    float affine[16];
+    int row = blockIdx.x;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        affine[i] = weight[threadIdx.x + i * 256];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    CustomArNormRow256(input + row * 4096, affine, output + row * 4096, eps, sums);
+}
+
+// Reuse a bounded set of collective signal slots for arbitrarily many rows.
+template <int Ranks>
+__global__ void FastllmCustomAllReduceNormRowsKernel(CustomArPointers data, CustomArRankSignals signals,
+        CustomArSignal *self, CustomArRankScratch scratch, CustomArNormBF16 *hidden, const float *weight,
+        CustomArNormBF16 *output, float eps, int rank, int rows, bool staged) {
+    __shared__ __align__(16) CustomArNormBF16 values[4096];
+    __shared__ float sums[8];
+    const CustomArRankData peers = data.Load();
+    constexpr int part = 512 / Ranks, pitch = part + 512 % Ranks;
+    float affine[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) affine[i] = weight[threadIdx.x + i * 256];
+    CustomArBarrierStart<Ranks>(signals, self, rank);
+    if (staged) {
+        // A rank computes its slice of every row owned by the CTA. The
+        // other ranks gather that slice after a single publish handshake.
+        const int t = threadIdx.x;
+        if (t < (rank == Ranks - 1 ? pitch : part))
+            for (int row = blockIdx.x; row < rows; row += gridDim.x)
+                reinterpret_cast<CustomArNormPacketType *>(scratch.scratch[rank])[row * pitch + t] =
+                    CustomArReducePacket<Ranks>(peers, row * 512 + rank * part + t);
+        CustomArBarrierPublish<Ranks>(signals, self, rank);
+    }
+    for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+        auto *residual = reinterpret_cast<CustomArNormPacketType *>(hidden + row * 4096);
+        for (int t = threadIdx.x; t < 512; t += 256) {
+            const int peer = min(t / part, Ranks - 1);
+            auto v = staged ? reinterpret_cast<const CustomArNormPacketType *>(scratch.scratch[peer])[
+                                  row * pitch + t - peer * part]
+                            : CustomArReducePacket<Ranks>(peers, row * 512 + t);
+            CustomArAddPacket<CustomArNormBF16>(v, residual[t]);
+            reinterpret_cast<CustomArNormPacketType *>(values)[t] = residual[t] = v;
+        }
+        __syncthreads();
+        CustomArNormRow256(values, affine, output + row * 4096, eps, sums);
+        if (row + gridDim.x < rows) __syncthreads();
+    }
+    // Publish completed all peer input reads. The next collective starts
+    // only after every rank has finished reading the shared scratch.
+    if (!staged) CustomArBarrierFinal<Ranks>(signals, self, rank);
 }
 
 template <int Ranks, int RowsPerBlock>
@@ -1522,6 +1583,8 @@ struct CustomArState {
     CustomArRankScratch expertBoxes{};
     CustomArPushWorkspaces allPushWorkspaces{};
     std::unique_ptr<CustomArTaggedPeer> taggedPeer;
+    int hopperSignalSlots = 0;
+    bool swaFusionEnabled = false;
     std::unique_ptr<SwaOutputState> swaOutput;
     void *inplaceScratch[kCustomArMaxRanks]{};
     int pushBlocks = 0;
@@ -3005,7 +3068,397 @@ uint32_t SelectCustomArPaths(CustomArState &state, bool benchmarkPerformance) {
 #include "fastllm-draft-head-sm120.cuh"
 #include "fastllm-draft-context-sm120.cuh"
 #endif
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+#include "fastllm-sm90-swa-tail.cuh"
+void LaunchHopperTaggedNorm(const void *input, CustomArNormBF16 *residual, const float *gamma,
+        CustomArNormBF16 *normed, float eps, int rank, int rows, TaggedPeerView transport,
+        const float *routerWeight = nullptr) {
+    auto kernel = rows <= 8 ? HopperTaggedNormRouterInput<true> : HopperTaggedNormRouterInput<false>;
+    kernel<<<kTaggedPeerBlocks, rows <= 8 ? 512 : 256, 0, cudaStreamPerThread>>>(
+        static_cast<const unsigned *>(input), residual, gamma, normed, eps, rank, rows, transport, routerWeight);
+}
+
+#include "fastllm-naive-sm90-verify.cuh"
+#endif
 }  // namespace
+
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+
+bool FastllmCudaNaiveHopperReduceNormRouter(const fastllm::Data &projection, fastllm::Data &hidden,
+        const fastllm::Data &gamma, fastllm::Data &normed, const fastllm::Data &weight,
+        fastllm::Data &router, float eps, int gpu) {
+    using namespace fastllm;
+    if (FastllmCudaRuntimeArch() != 90) return false;
+    auto &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, 8192, BFLOAT16, gpu, true, rank) || state.devices.size() != 8) return false;
+    const int rows = projection.dims.size() == 3 ? projection.dims[1] : 0;
+    auto local = [&](const Data &x, DataType type, const std::vector<int> &dims) {
+        if (x.dataType != type || x.dims != dims || x.dataDevice != CUDA || x.dataDeviceIds != std::vector<int>{gpu} ||
+            !x.cudaData || uintptr_t(x.cudaData) % 16 || x.strides.size() != dims.size()) return false;
+        size_t stride = 1;
+        for (int i = int(dims.size()) - 1; i >= 0; --i) {
+            if (x.strides[i] != stride) return false;
+            stride *= dims[i];
+        }
+        return true;
+    };
+    auto disjoint = [](const Data &a, const Data &b) {
+        return &a != &b && (!a.cudaData || !b.cudaData ||
+            CustomArBuffersDisjoint(a.cudaData, a.GetBytes(), b.cudaData, b.GetBytes()));
+    };
+    const bool supportedRows = rows >= 2 && rows <= 16;
+    const bool eligible = supportedRows && state.taggedPeer && std::isfinite(eps) && eps > 0 &&
+        local(projection, BFLOAT16, {1, rows, 4096}) && local(hidden, BFLOAT16, projection.dims) &&
+        local(gamma, FLOAT32, {4096}) && local(weight, FLOAT32, {256, 4096}) &&
+        disjoint(projection, hidden) && disjoint(hidden, gamma) && disjoint(hidden, weight) &&
+        disjoint(normed, hidden) && disjoint(normed, projection) && disjoint(normed, gamma) &&
+        disjoint(normed, weight) && disjoint(router, hidden) && disjoint(router, normed) &&
+        disjoint(router, projection) && disjoint(router, weight) && disjoint(router, gamma);
+    CustomArPointers registered{};
+    if (!FindOrRegisterCustomArPointers(state, rank, projection.cudaData, supportedRows ? rows * 4096 : 0,
+                                        BFLOAT16, eligible, registered)) return false;
+    auto output = [&](Data &x, DataType type, int cols) {
+        x.dataType = type;
+        x.UpdateUnitSize();
+        x.Resize({1, rows, cols});
+        x.ToDevice(CUDA, {gpu}, false);
+        x.Allocate(false);
+    };
+    output(normed, BFLOAT16, 4096);
+    output(router, FLOAT32, 256);
+    LaunchHopperTaggedNorm(projection.cudaData, static_cast<CustomArNormBF16 *>(hidden.cudaData),
+        static_cast<const float *>(gamma.cudaData), static_cast<CustomArNormBF16 *>(normed.cudaData),
+        eps, rank, rows, state.taggedPeer->View(rank), static_cast<const float *>(weight.cudaData));
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(std::string("Hopper SWA TP reduction failed: ") + cudaGetErrorString(status));
+    }
+    FastllmCudaNaiveHopperRouterAfterNorm(normed.cudaData, static_cast<const float *>(weight.cudaData),
+                                         static_cast<float *>(router.cudaData), rows);
+    return true;
+}
+
+bool FastllmCudaNaiveHopperVerifyLayer(const fastllm::Data &input, const fastllm::Data &qkvWeight,
+                                       const fastllm::Data &bias, const fastllm::Data &outWeight,
+                                       const fastllm::Data &norm, const fastllm::Data &sink,
+                                       const fastllm::Data &positions, fastllm::Data &q, fastllm::Data &attn,
+                                       fastllm::Data &projected, fastllm::Data &hidden, fastllm::Data &normed,
+                                       fastllm::Data &scratch, const std::vector<FastllmNaiveDSARow> &rows,
+                                       int stride, bool ring, float theta, float valueScale, float eps, int gpu,
+                                       const FastllmNaiveHopperIndexer *indexer,
+                                       const fastllm::Data *routerWeight, fastllm::Data *router) {
+    return FastllmCudaNaiveHopperVerifyLayer(input, qkvWeight, bias, outWeight, norm, sink, positions, q, attn,
+                                             projected, hidden, normed, scratch, rows, stride, ring, theta,
+                                             valueScale, eps, gpu, indexer, routerWeight, router, nullptr);
+}
+
+bool FastllmCudaNaiveHopperVerifyLayer(const fastllm::Data &input, const fastllm::Data &qkvWeight,
+                                       const fastllm::Data &bias, const fastllm::Data &outWeight,
+                                       const fastllm::Data &norm, const fastllm::Data &sink,
+                                       const fastllm::Data &positions, fastllm::Data &q, fastllm::Data &attn,
+                                       fastllm::Data &projected, fastllm::Data &hidden, fastllm::Data &normed,
+                                       fastllm::Data &scratch, const std::vector<FastllmNaiveDSARow> &rows,
+                                       int stride, bool ring, float theta, float valueScale, float eps, int gpu,
+                                       const FastllmNaiveHopperIndexer *indexer,
+                                       const fastllm::Data *routerWeight, fastllm::Data *router,
+                                       std::shared_ptr<void> *wideBindings) {
+    return FastllmCudaNaiveHopperVerifyLayer(input, qkvWeight, bias, outWeight, norm, sink, positions, q, attn,
+        projected, hidden, normed, scratch, rows, stride, ring, theta, valueScale, eps, gpu, indexer,
+        routerWeight, router, wideBindings, nullptr);
+}
+
+bool FastllmCudaNaiveHopperVerifyLayer(const fastllm::Data &input, const fastllm::Data &qkvWeight,
+                                       const fastllm::Data &bias, const fastllm::Data &outWeight,
+                                       const fastllm::Data &norm, const fastllm::Data &sink,
+                                       const fastllm::Data &positions, fastllm::Data &q, fastllm::Data &attn,
+                                       fastllm::Data &projected, fastllm::Data &hidden, fastllm::Data &normed,
+                                       fastllm::Data &scratch, const std::vector<FastllmNaiveDSARow> &rows,
+                                       int stride, bool ring, float theta, float valueScale, float eps, int gpu,
+                                       const FastllmNaiveHopperIndexer *indexer,
+                                       const fastllm::Data *routerWeight, fastllm::Data *router,
+                                       std::shared_ptr<void> *wideBindings, fastllm::Data *feature) {
+    using namespace fastllm;
+    if (FastllmCudaRuntimeArch() != 90 || (ring == (indexer != nullptr)))
+        return false;
+    CustomArCallLease lease;
+    hopper_verify::Args a{};
+    auto &state = GetCustomArState();
+    if (!lease.Acquire(state, 8192, BFLOAT16, gpu, true, a.rank) || !state.swaFusionEnabled ||
+        state.devices.size() != 8)
+        return false;
+    const bool replicated = indexer && !rows.empty() && !rows[0].fp8 && rows[0].keyStride == 320;
+    const int expectedStride = ring ? 128 : (replicated ? std::min(2048, rows.empty() ? 0 : rows[0].capacity) : 2048);
+    const int floatsPerRow = 1152 + 8 * expectedStride + (ring ? 0 : (expectedStride / 64) * 1024);
+    // Both element offsets and scratch dimensions use signed 32-bit indexing.
+    const int count = rows.size() <= size_t(INT_MAX / std::max(4096, floatsPerRow)) ? int(rows.size()) : 0;
+    auto local = [&](const Data &x, int type) {
+        if (x.dims.empty() || x.strides.size() != x.dims.size())
+            return false;
+        size_t stride = 1;
+        for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
+            if (x.dims[i] <= 0 || x.strides[i] != stride)
+                return false;
+            stride *= x.dims[i];
+        }
+        return x.dataDevice == CUDA && x.dataDeviceIds == std::vector<int>{gpu} && x.dataType == type &&
+               x.cudaData && !(reinterpret_cast<uintptr_t>(x.cudaData) & 15);
+    };
+    auto matrix = [&](const Data &w, int n, int k) {
+        return local(w, FP8_E4M3) && w.dims == std::vector<int>({n, k}) && !w.IsRepacked && w.blockM == 32 &&
+               w.blockK == 1 && !w.extraCudaData.empty() && w.extraCudaData[0];
+    };
+    bool eligible = std::isfinite(eps) && eps > 0 && std::isfinite(theta) && theta > 0 &&
+                    std::isfinite(valueScale) && count > 0 &&
+                    stride == expectedStride && local(input, BFLOAT16) &&
+                    input.Count(0) == size_t(count) * 4096 && local(hidden, BFLOAT16) &&
+                    hidden.Count(0) == input.Count(0) && local(norm, FLOAT32) && norm.Count(0) == 4096 &&
+                    (sink.dims.empty() || (local(sink, FLOAT32) && sink.Count(0) == 8)) &&
+                    local(positions, FLOAT32) && positions.Count(0) >= count && bias.dims.empty() &&
+                    matrix(qkvWeight, 1856, 4096) && matrix(outWeight, 4096, 1024);
+    for (const auto &r : rows)
+        eligible = eligible && r.cache && r.liveKeys && r.capacity > 0 && r.keyStride == (replicated ? 320 : 192) && !r.fp4 &&
+                   r.key && r.value &&
+                   (ring ? !r.pageLen && r.verifyOffset >= 0 && r.verifyOffset < INT_MAX - 128 : r.verifyOffset < 0);
+    if (indexer) {
+        eligible = eligible && indexer->wq && indexer->wk && indexer->weights && indexer->norm &&
+                   indexer->bias && indexer->indices;
+        auto indexWeight = [&](const Data &w, int n) {
+            return local(w, BFLOAT16) && w.dims == std::vector<int>({n, 4096});
+        };
+        eligible = eligible && indexer->rank == a.rank && (replicated || stride == 2048) &&
+                   indexWeight(*indexer->wq, 2048) && indexWeight(*indexer->wk, 128) &&
+                   indexWeight(*indexer->weights, 16) && local(*indexer->norm, FLOAT32) &&
+                   indexer->norm->Count(0) == 128 && local(*indexer->bias, FLOAT32) &&
+                   indexer->bias->Count(0) == 128;
+        for (const auto &r : rows)
+            eligible = eligible && (replicated
+                ? !r.fp8 && count <= 8 && r.capacity == rows[0].capacity && r.cache == rows[0].cache
+                : r.fp8 && r.capacity > 2048 && r.pageLen >= 8 && r.pageLen % 8 == 0 &&
+                    ((r.capacity + r.pageLen - 1) / r.pageLen) * (r.pageLen / 8) <= hopper_verify::ShardWidth);
+    }
+    // A cooperative grid must fit together, including the CTAs waiting for TP peers.
+    auto kernel = routerWeight
+        ? (ring ? hopper_verify::Layer<true, true> : hopper_verify::Layer<false, true>)
+        : (ring ? hopper_verify::Layer<true, false> : hopper_verify::Layer<false, false>);
+    const bool wide = count > 8 && count <= 16 && state.taggedPeer &&
+        state.taggedPeer->CanUseBf16Publish(count * 4096);
+    if (wide) kernel = routerWeight
+        ? (ring ? hopper_verify::WideLayer<true, true> : hopper_verify::WideLayer<false, true>)
+        : (ring ? hopper_verify::WideLayer<true, false> : hopper_verify::WideLayer<false, false>);
+    // One tagged word per BF16 pair within this rank's 512-channel shard.
+    const bool shardedSwa = ring && count > 16 && count <= 32 && state.taggedPeer &&
+        state.taggedPeer->CanUse(count * 512);
+    if (shardedSwa) kernel = routerWeight
+        ? hopper_verify::WideLayer<true, true, 4> : hopper_verify::WideLayer<true, false, 4>;
+    const auto replicatedFront = !rows.empty() && rows.front().capacity <= 2048
+        ? hopper_verify::ReplicatedProjection<true> : hopper_verify::ReplicatedProjection<false>;
+    bool splitRing = eligible && ring && count <= 8 && routerWeight &&
+        state.taggedPeer && state.taggedPeer->CanUse(count * 4096) &&
+        !(reinterpret_cast<uintptr_t>(qkvWeight.extraCudaData[0]) & 15) &&
+        std::all_of(rows.begin(), rows.end(), [](const auto &r) { return !r.fp8; });
+    if (splitRing && cudaFuncSetAttribute(hopper_verify::SwaQkv, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         hopper_verify::QkvStageBytes) != cudaSuccess) {
+        cudaGetLastError();
+        splitRing = false;
+    }
+    if (splitRing) kernel = hopper_verify::SwaPackedOutput;
+    if (feature) {
+        eligible = eligible && ring && local(*feature, BFLOAT16) && feature->dims == hidden.dims;
+        for (const auto *data : std::initializer_list<const Data *>{&input, &hidden, &normed, &projected, &q,
+                 &attn, &scratch, &qkvWeight, &outWeight, &norm, &sink, &positions, routerWeight, router})
+            if (data && (feature == data || feature->cudaData == data->cudaData)) eligible = false;
+    }
+    int selectGrid = 0, frontActive = 0;
+    size_t indexBytes = 0;
+    if (replicated) {
+        kernel = routerWeight ? hopper_verify::ReplicatedOutput<true> : hopper_verify::ReplicatedOutput<false>;
+        a.indexCapacity = rows.empty() ? 0 : rows[0].capacity;
+        eligible = eligible && FastllmSm90DsaSelectConfig(gpu, count, a.indexCapacity, selectGrid, indexBytes) &&
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&frontActive, replicatedFront,
+                hopper_verify::Threads, 0) == cudaSuccess && frontActive > 0;
+    }
+    int sm = 0, coop = 0, active = 0;
+    int dynamicBytes = 0;
+    if (cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, gpu) != cudaSuccess ||
+        cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, gpu) != cudaSuccess || !coop)
+        eligible = false;
+    if (eligible && ring && !splitRing && !(reinterpret_cast<uintptr_t>(qkvWeight.extraCudaData[0]) & 15) &&
+        (!shardedSwa || !(reinterpret_cast<uintptr_t>(outWeight.extraCudaData[0]) & 15))) {
+        // Smaller Hopper partitions can keep the same fused layer and use direct weight reads.
+        constexpr int bytes = hopper_verify::QkvStageBytes;
+        if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) == cudaSuccess &&
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, kernel, hopper_verify::Threads, bytes) ==
+                cudaSuccess &&
+            active * sm >= hopper_verify::QkvTiles) {
+            dynamicBytes = bytes;
+            a.stageWeights = true;
+        } else {
+            cudaGetLastError();
+        }
+    }
+    if ((!dynamicBytes && cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, kernel, hopper_verify::Threads,
+                                                                        0) != cudaSuccess) ||
+        active * sm <= 0)
+        eligible = false;
+    auto output = [&](Data &x, DataType type, std::vector<int> dims) {
+        x.dataType = type;
+        x.UpdateUnitSize();
+        x.Resize(dims);
+        x.ToDevice(CUDA, {gpu}, false);
+        x.Allocate(false);
+    };
+    if (routerWeight || router) {
+        eligible = eligible && routerWeight && router && local(*routerWeight, FLOAT32) &&
+            routerWeight->dims == std::vector<int>({256, 4096}) && router != routerWeight &&
+            router != &input && router != &q && router != &attn && router != &projected &&
+            router != &hidden && router != &normed && router != &scratch;
+    }
+    a.signalSlots = state.hopperSignalSlots;
+    eligible = eligible && a.signalSlots > 0;
+    if (eligible && count > FastllmNaiveDSABatchLimit) {
+        using namespace hopper_verify;
+        auto table = wideBindings ? std::static_pointer_cast<BindingTable>(*wideBindings) : nullptr;
+        if (!table && wideBindings) {
+            cudaStreamCaptureStatus status;
+            if (cudaStreamIsCapturing(cudaStreamPerThread, &status) == cudaSuccess &&
+                status == cudaStreamCaptureStatusNone) {
+                table = std::make_shared<BindingTable>();
+                for (const auto &r : rows)
+                    table->rows.push_back(RowBinding::From(r));
+                const int bytes = count * sizeof(RowBinding);
+                output(table->device, INT8, {bytes});
+                if (cudaMemcpyAsync(table->device.cudaData, table->rows.data(), bytes, cudaMemcpyHostToDevice,
+                                    cudaStreamPerThread) == cudaSuccess)
+                    *wideBindings = table;
+                else
+                    table.reset();
+            }
+        }
+        eligible = table && table->rows.size() == rows.size();
+        for (int i = 0; eligible && i < count; ++i) {
+            const RowBinding b = RowBinding::From(rows[i]);
+            eligible = std::memcmp(&b, &table->rows[i], sizeof(b)) == 0;
+        }
+        if (eligible) a.external = static_cast<const RowBinding *>(table->device.cudaData);
+    }
+    if (eligible)
+        output(projected, BFLOAT16, {1, count, 4096});
+    if (!FindOrRegisterCustomArPointers(state, a.rank, projected.cudaData, count * 4096, BFLOAT16, eligible,
+                                        a.peers))
+        return false;
+    if (routerWeight) {
+        output(*router, FLOAT32, {1, count, 256});
+        a.routerWeight = static_cast<const float *>(routerWeight->cudaData);
+        a.probabilities = static_cast<float *>(router->cudaData);
+    }
+    output(q, BFLOAT16, {1, count, 1536});
+    output(attn, BFLOAT16, {1, count, 1024});
+    output(normed, BFLOAT16, {1, count, 4096});
+    const int scoreFloats = replicated ? 4 : count * 8 * stride, partialFloats = ring ? 0 : count * ((stride + 63) / 64) * 1024;
+    const int packedFloats = count * 4096 / 4, scaleFloats = count * 128;
+    const int workFloats = replicated ? int(indexBytes / sizeof(float)) : partialFloats;
+    output(scratch, FLOAT32, {packedFloats + scaleFloats + scoreFloats + workFloats});
+    a.packed = static_cast<uint8_t *>(scratch.cudaData);
+    a.scales = static_cast<float *>(scratch.cudaData) + packedFloats;
+    a.scores = a.scales + scaleFloats;
+    a.partials = a.scores + scoreFloats;
+    a.input = static_cast<const __nv_bfloat16 *>(input.cudaData);
+    a.qkvWeight = qkvWeight.cudaData;
+    a.outWeight = outWeight.cudaData;
+    a.qkvScales = static_cast<const float *>(qkvWeight.extraCudaData[0]);
+    a.outScales = static_cast<const float *>(outWeight.extraCudaData[0]);
+    a.query = static_cast<__nv_bfloat16 *>(q.cudaData);
+    a.attn = static_cast<__nv_bfloat16 *>(attn.cudaData);
+    a.projection = static_cast<__nv_bfloat16 *>(projected.cudaData);
+    a.hidden = static_cast<__nv_bfloat16 *>(hidden.cudaData);
+    a.normed = static_cast<__nv_bfloat16 *>(normed.cudaData);
+    a.gamma = static_cast<const float *>(norm.cudaData);
+    a.pos = static_cast<const float *>(positions.cudaData);
+    a.sink = sink.dims.empty() ? nullptr : static_cast<const float *>(sink.cudaData);
+    a.rows = count;
+    a.stride = stride;
+    a.theta = theta;
+    a.valueScale = float(__float2bfloat16_rn(valueScale));
+    a.eps = eps;
+    a.signals = state.allSignals;
+    if (shardedSwa || wide || (count <= 8 && state.taggedPeer && state.taggedPeer->CanUse(count * 4096)))
+        a.transport = state.taggedPeer->View(a.rank);
+    if (!a.external) {
+        for (int i = 0; i < count; ++i) a.local[i] = hopper_verify::RowBinding::From(rows[i]);
+    }
+    if (indexer) {
+        a.iqWeight = static_cast<const __nv_bfloat16 *>(indexer->wq->cudaData);
+        a.ikWeight = static_cast<const __nv_bfloat16 *>(indexer->wk->cudaData);
+        a.iwWeight = static_cast<const __nv_bfloat16 *>(indexer->weights->cudaData);
+        a.indexNorm = static_cast<const float *>(indexer->norm->cudaData);
+        a.indexBias = static_cast<const float *>(indexer->bias->cudaData);
+        // Index scratch expires before sparse attention starts using the value partials.
+        a.indexRaw = reinterpret_cast<__nv_bfloat16 *>(a.partials);
+        a.iqBytes = reinterpret_cast<uint8_t *>(a.indexRaw + count * 2192);
+        a.iqScale = reinterpret_cast<float *>(a.iqBytes + (replicated ? 0 : count * 2048));
+        a.indexScores = reinterpret_cast<unsigned *>(a.iqScale + count * 16);
+        if (!replicated)
+            a.lists = reinterpret_cast<unsigned long long *>(a.indexScores + count * hopper_verify::ShardWidth);
+        output(*indexer->indices, INT32, {count, stride});
+        a.selected = static_cast<int *>(indexer->indices->cudaData);
+    }
+    // For multiple M8 tiles, each CTA keeps its QKV weight tile in shared
+    // memory while projecting every row group assigned to that tile.
+    const int ringBlocks = !a.stageWeights ? 128 : hopper_verify::QkvTiles +
+        (count <= 8 ? count * hopper_verify::RingTilesPerRow : 0);
+    const int grid = std::min(active * sm, ring ? ((wide || shardedSwa) ? 128 : ringBlocks) : (replicated ? 256 : sm));
+    void *args[] = {&a};
+    cudaError_t status = cudaSuccess;
+    // A device without four-stage resources can still run the original ring kernel.
+    if (feature && !splitRing)
+        status = cudaMemcpyAsync(feature->cudaData, hidden.cudaData, size_t(count) * 4096 * sizeof(__nv_bfloat16),
+                                 cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    if (splitRing) {
+        status = fastllm::cuda_launch::LaunchProgrammatic<hopper_verify::SwaPrepare>(
+            8, hopper_verify::Threads, 0, cudaStreamPerThread, a,
+            feature ? static_cast<__nv_bfloat16 *>(feature->cudaData) : nullptr);
+        if (status == cudaSuccess)
+            status = fastllm::cuda_launch::LaunchProgrammatic<hopper_verify::SwaQkv>(hopper_verify::QkvTiles,
+                hopper_verify::Threads, hopper_verify::QkvStageBytes, cudaStreamPerThread, a);
+    } else if (replicated) {
+        status = cudaLaunchCooperativeKernel((const void *)replicatedFront,
+            std::min(frontActive * sm, hopper_verify::QkvTiles + 137), hopper_verify::Threads,
+            args, 0, cudaStreamPerThread);
+        if (status == cudaSuccess)
+            status = FastllmSm90DsaSelectAttention(rows, selectGrid, a.indexScores, a.query,
+                a.sink, a.attn, a.partials, a.selected, a.indexRaw, a.iqScale, a.packed, a.scales);
+    }
+    if (splitRing && status == cudaSuccess) {
+        cudaLaunchAttribute attrs[2]{};
+        attrs[0].id = cudaLaunchAttributeCooperative;
+        attrs[0].val.cooperative = 1;
+        attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[1].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = grid;
+        cfg.blockDim = hopper_verify::Threads;
+        cfg.stream = cudaStreamPerThread;
+        cfg.attrs = attrs;
+        cfg.numAttrs = 2;
+        status = cudaLaunchKernelExC(&cfg, (const void *)kernel, args);
+        if (status == cudaSuccess)
+            status = fastllm::cuda_launch::LaunchProgrammatic<hopper_verify::SwaNormRouter>(((count + 3) / 4) * 64,
+                hopper_verify::Threads, 0, cudaStreamPerThread, a);
+    } else if (status == cudaSuccess) {
+        status = cudaLaunchCooperativeKernel((const void *)kernel, grid, hopper_verify::Threads, args,
+                                            dynamicBytes, cudaStreamPerThread);
+    }
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(std::string("Hopper verify launch failed: ") + cudaGetErrorString(status));
+    }
+    return true;
+}
+
+#endif
 
 fastllm::TransientAllReduceInputs::TransientAllReduceInputs(bool enabled)
     : previous(customArTransientInputs) {
@@ -3537,7 +3990,19 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
     }
     if (ok) {
         state.taggedPeer = CustomArTaggedPeer::Create(devices);
-        state.swaOutput = SwaOutputState::Create(devices);
+        state.swaFusionEnabled = SwaOutputState::Enabled();
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+        state.hopperSignalSlots = kCustomArMaxBlocks;
+        for (int id : devices) {
+            int sm = 0;
+            if (cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, id) != cudaSuccess) {
+                cudaGetLastError();
+                sm = 0;
+            }
+            state.hopperSignalSlots = std::min(state.hopperSignalSlots, sm);
+        }
+#endif
+        state.swaOutput = SwaOutputState::Create(devices, state.swaFusionEnabled);
     }
     FastllmCudaSetDevice(originalDevice);
     if (!ok) {
@@ -4294,8 +4759,15 @@ bool FastllmCudaPackedVerifySupported(int rows, int ranks) {
 // performs its ordinary residual and norm after any required DP row exchange.
 static bool RunReplicaVerifyAttention(const FastllmNaiveVerifyAttentionInput &x) {
     const auto &c = x.config;
-    if (x.branch || !x.projectionScratch || !x.qkv || x.requests.size() != 1 ||
-        x.requests.front() < 2 || x.requests.front() > 8 || x.caches.size() != x.requests.front() ||
+    const int owners = x.requests.size();
+    const int rows = x.caches.size();
+    const bool hopper = FastllmCudaRuntimeArch() == 90;
+    if (owners < 1 || rows < 1 || rows > 128 || owners > rows ||
+        !std::all_of(x.requests.begin(), x.requests.end(), [](int n) { return n >= 1 && n <= 8; }) ||
+        std::accumulate(x.requests.begin(), x.requests.end(), 0) != rows) return false;
+    const bool staged = hopper && rows > 16;
+    const bool pair = owners == 2;
+    if (x.branch || !x.projectionScratch || !x.qkv || (!hopper && (owners != 1 || rows < 2)) ||
         c.heads != 64 || c.headDim != 192 || c.valueDim != 128 || c.rotaryDim != 64) return false;
     const auto &cache = x.caches.front();
     if (!cache.key || !cache.value || !cache.cache) return false;
@@ -4304,31 +4776,44 @@ static bool RunReplicaVerifyAttention(const FastllmNaiveVerifyAttentionInput &x)
     } else {
 #ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
         if (c.kvHeads != 4 || x.indexHeads != 16 || x.indexDim != 128 || x.topK != 2048 ||
-            !x.fp8Query || x.fp8IndexerCache || x.capacity <= 8192 || x.capacity > 65536) return false;
+            !x.fp8Query || x.fp8IndexerCache || x.capacity <= (staged ? 2048 : 0) || x.capacity > 65536 ||
+            (FastllmCudaRuntimeArch() != 90 && x.capacity <= 8192)) return false;
 #else
         return false;
 #endif
     }
     const auto *projection = FastllmCudaGetMxfp8ProjectionBackend();
     if (!projection) return false;
-    const int rows = x.requests.front();
-    auto packed = projection->Borrow(*x.outputWeight, rows, *x.projectionScratch);
+    const auto *output = projection;
+    const bool overlap = !staged;
+    if (staged) {
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+        output = FastllmCudaSm90SwaOutputProjection();
+#else
+        return false;
+#endif
+    }
+    const auto *second = pair ? &x.caches[x.requests.front()] : nullptr;
+    auto packed = output->Borrow(*x.outputWeight, rows, *x.projectionScratch);
     if (!packed.Matches(rows, c.heads * c.valueDim)) return false;
-    if (!projection->TryProject(x.qkvActivation, *x.normed, *x.qkvWeight, *x.qkvBias, *x.qkv, true))
+    if (!projection->TryProject(x.qkvActivation, *x.normed, *x.qkvWeight, *x.qkvBias, *x.qkv, overlap))
         fastllm::Linear(*x.normed, *x.qkvWeight, *x.qkvBias, *x.qkv);
     bool ready = false;
     if (x.sliding)
-        ready = FastllmCudaTryPackedSwaVerify(*x.qkv, *x.positions, *x.live, cache, *x.sink,
-            c.heads, c.kvHeads, x.theta, x.valueScale, packed, *x.attention, projection->projectPdl != nullptr);
+        ready = FastllmCudaTryPackedSwaVerify(*x.qkv, *x.positions, *x.live, x.caches.data(), *x.sink,
+            c.heads, c.kvHeads, x.theta, x.valueScale, packed, *x.attention, overlap && projection->projectPdl != nullptr,
+            x.requests.data(), owners);
 #ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
+    else if (hopper && (staged || (owners > 1 && !pair) || cache.key->dataType == fastllm::FP8_E4M3))
+        ready = FastllmCudaSm90VerifyDsaBatch(x, packed);
     else
         ready = FastllmCudaTryDpDSAVerify(*x.normed, *x.qkv, *x.indexKeyWeight, *x.indexQueryWeight,
             *x.indexWeight, *x.indexNorm, *x.indexBias, *x.sink, *x.positions, *x.live,
             *cache.key, *cache.value, cache.cache, x.capacity, x.theta, x.valueScale,
-            packed, *x.scratch, *x.attention, projection->projectPdl != nullptr);
+            packed, *x.scratch, *x.attention, projection->projectPdl != nullptr, second, x.requests.front());
 #endif
     if (!ready) return false;
-    if (!projection->TryProject(packed, *x.attention, *x.outputWeight, fastllm::Data(), *x.projected, true))
+    if (!output->TryProject(packed, *x.attention, *x.outputWeight, fastllm::Data(), *x.projected, overlap))
         fastllm::Linear(*x.attention, *x.outputWeight, fastllm::Data(), *x.projected);
     return true;
 }
@@ -4341,6 +4826,55 @@ FastllmVerifyOutput FastllmCudaVerifyAttention(const FastllmNaiveVerifyAttention
     const bool verifyShape = cfg.heads == 8 && cfg.kvHeads == 1 && cfg.headDim == 192 &&
                              cfg.valueDim == 128 && cfg.rotaryDim == 64;
     if (!x.sliding && !verifyShape) return Result::Unsupported;
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+    if (FastllmCudaRuntimeArch() == 90) {
+        if (!x.packedTp || x.branch || !verifyShape || x.caches.empty() || x.requests.empty() ||
+            (x.sliding ? cfg.window != 128 : !x.indices || x.topK != 2048 ||
+             x.indexHeads != 16 || x.indexDim != 128)) return Result::Unsupported;
+        std::vector<FastllmNaiveDSARow> rows(x.caches.size());
+        size_t first = 0, seq = 0;
+        for (int n : x.requests) {
+            if (n <= 0 || size_t(n) > rows.size() - first) return Result::Unsupported;
+            for (int j = 0; j < n; ++j) {
+                const size_t i = first + j;
+                const auto &cache = x.caches[i];
+                const auto &k = *cache.key, &v = *cache.value;
+                if (k.isPagedKVCache != v.isPagedKVCache || k.dataType != v.dataType ||
+                    (k.dataType != fastllm::BFLOAT16 && k.dataType != fastllm::FP8_E4M3) ||
+                    k.dims.size() != 3 || v.dims.size() != 3 || v.dims.back() != 128 ||
+                    (k.isPagedKVCache && (k.pageLen != v.pageLen || !k.pagedKVCacheData || !v.pagedKVCacheData)) ||
+                    (x.sliding && (k.isPagedKVCache || k.expansionDims.size() != 3 || v.expansionDims.size() != 3 ||
+                     std::min(k.expansionDims[1], v.expansionDims[1]) < 128 + n))) continue;
+                auto &row = rows[i];
+                row.key = k.isPagedKVCache ? k.pagedKVCacheData->cudaData : k.cudaData;
+                row.value = v.isPagedKVCache ? v.pagedKVCacheData->cudaData : v.cudaData;
+                row.pageLen = k.isPagedKVCache ? k.pageLen : 0;
+                row.keyStride = k.dims.back();
+                row.fp8 = k.dataType == fastllm::FP8_E4M3;
+                row.capacity = x.capacity;
+                // Context-sharded DSA has a second four-pointer descriptor for its Indexer.
+                row.cache = !x.sliding && x.fp8Query && x.caches.front().cache
+                    ? x.caches.front().cache + 8 * seq : cache.cache;
+                row.verifyOffset = x.sliding ? j : -1;
+                row.liveKeys = static_cast<const int *>(x.live->cudaData) + i;
+            }
+            first += n;
+            ++seq;
+        }
+        if (first != rows.size()) return Result::Unsupported;
+        FastllmNaiveHopperIndexer index{x.indexQueryWeight, x.indexKeyWeight, x.indexWeight,
+                                        x.indexNorm, x.indexBias, x.indices, x.attentionRank};
+        auto *table = rows.size() > FastllmNaiveDSABatchLimit ?
+            &x.scratch->wideBindings[{x.caches.front().cache, x.live->cudaData, rows.size(), x.capacity}] : nullptr;
+        if (!FastllmCudaNaiveHopperVerifyLayer(*x.normed, *x.qkvWeight, *x.qkvBias, *x.outputWeight,
+                *x.postNorm, *x.sink, *x.positions, *x.query, *x.attention, *x.projected, *x.hidden,
+                *x.normed, x.scratch->attentionPartial, rows, x.sliding ? 128 : std::min(x.topK, x.capacity),
+                x.sliding, x.theta, x.valueScale, x.eps, device, x.sliding ? nullptr : &index,
+                x.routerWeight, x.router, table, x.feature)) return Result::Unsupported;
+        if (x.sliding && x.router) fastllm::cuda_pdl::Mark(fastllm::cuda_pdl::Producer::VerifyRouter);
+        return x.router ? Result::Router : Result::Normalized;
+    }
+#endif
 #ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
     if (FastllmCudaRuntimeArch() == 120) {
         if (!x.packedTp || !verifyShape || x.requests.size() != 1 || x.requests.front() != 8 || x.caches.size() != 8 ||
@@ -4647,7 +5181,7 @@ static bool CustomReduceAddNorm(void *data, void *residual,
         float eps, int dataType, int deviceId, bool draft) {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
     if (dataType != fastllm::BFLOAT16 || channels != 4096 || count <= 0 ||
-        count % channels || (size_t)count * 2 > CustomArMaxBytes() ||
+        count % channels ||
         !std::isfinite(eps) || eps <= 0) return false;
     CustomArState &state = GetCustomArState();
     CustomArCallLease lease;
@@ -4664,7 +5198,8 @@ static bool CustomReduceAddNorm(void *data, void *residual,
     const int arch = FastllmCudaRuntimeArch();
     // The direct one-CTA-per-row kernel uses only portable packet loads and warp reductions.
     const int rows = count / channels;
-    const bool eligible = aligned && ((rows <= 8 && arch >= 70) || arch == 90 || arch == 103) &&
+    const bool eligible = aligned && (arch == 90 || (size_t)count * 2 <= CustomArMaxBytes()) &&
+        ((rows <= 8 && arch >= 70) || arch == 90 || arch == 103) &&
         disjoint(data, residual) && disjoint(data, output) && disjoint(residual, output);
     CustomArPointers pointers{};
     if (!FindOrRegisterCustomArPointers(state, rank, data, count, dataType,
@@ -4682,12 +5217,19 @@ static bool CustomReduceAddNorm(void *data, void *residual,
     const bool twoStage = CustomArUseTwoStage(state.devices.size(), (size_t)count * 2);
     const int threads = twoStage && rows <= 128 ? 256 : 512;
     const int packed = count / 8, ranks = state.devices.size();
+    const bool rowLoop = arch == 90 && ((rows > 8 && rows <= 16) || rows > kCustomArMaxBlocks);
     const int work = twoStage ? packed / ranks + packed % ranks : packed;
     const int blocks = std::min(kCustomArMaxBlocks, (work + threads - 1) / threads);
     const bool directRows = rows <= 8 && !(state.sm120EightRanks && rows == 8);
 #define CUSTOM_AR_NORM_RANK_CASE(RANKS)                                      \
     case RANKS:                                                             \
-        if (directRows || (RANKS == 2 && rows <= kCustomArMaxBlocks))            \
+        if (rowLoop)                                                        \
+            FastllmCustomAllReduceNormRowsKernel<RANKS>                      \
+                <<<std::min(rows, kCustomArMaxBlocks), 256, 0, cudaStreamPerThread>>>( \
+                    pointers, state.allSignals, state.allSignals.signals[rank], \
+                    state.allScratch, hidden, weight, normed, eps, rank, rows, \
+                    size_t(rows) * (512 / RANKS + 512 % RANKS) * 16 <= CustomArMaxBytes()); \
+        else if (directRows || (RANKS == 2 && rows <= kCustomArMaxBlocks))          \
             FastllmCustomAllReduceRMSNormKernel<RANKS, true>                 \
                 <<<rows, 512, 0, cudaStreamPerThread>>>(                    \
                     pointers, state.allSignals, state.allSignals.signals[rank], \
@@ -4708,6 +5250,27 @@ static bool CustomReduceAddNorm(void *data, void *residual,
                     pointers, state.allSignals, state.allSignals.signals[rank], \
                     state.allScratch, hidden, rank, packed);                \
         break
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+    if (arch == 90 && state.taggedPeer && rows >= 2 && rows <= 16) {
+        if (fastllm::cuda_pdl::Follows(fastllm::cuda_pdl::Producer::VerifyExperts)) {
+            auto launch = [&](auto small) {
+                constexpr auto kernel = HopperTaggedNormRouterInput<decltype(small)::value, true>;
+                return fastllm::cuda_launch::LaunchProgrammatic<kernel>(kTaggedPeerBlocks, small ? 512 : 256, 0,
+                    cudaStreamPerThread, static_cast<const unsigned *>(data), hidden, weight, normed, eps,
+                    rank, rows, state.taggedPeer->View(rank), static_cast<const float *>(nullptr));
+            };
+            const auto status = rows <= 8 ? launch(std::true_type{}) : launch(std::false_type{});
+            if (status != cudaSuccess) {
+                FastllmCudaSetThreadError();
+                std::fprintf(stderr, "[Fastllm] tagged all-reduce RMSNorm failed on GPU %d: %s.\n",
+                             deviceId, cudaGetErrorString(status));
+                return false;
+            }
+        } else {
+            LaunchHopperTaggedNorm(data, hidden, weight, normed, eps, rank, rows, state.taggedPeer->View(rank));
+        }
+    } else
+#endif
     switch (ranks) {
         CUSTOM_AR_NORM_RANK_CASE(2);
         CUSTOM_AR_NORM_RANK_CASE(4);
@@ -4717,7 +5280,7 @@ static bool CustomReduceAddNorm(void *data, void *residual,
     }
 #undef CUSTOM_AR_NORM_RANK_CASE
     cudaError_t status = cudaGetLastError();
-    if (status == cudaSuccess && rows > kCustomArMaxBlocks) {
+    if (status == cudaSuccess && !rowLoop && rows > kCustomArMaxBlocks) {
         cudaLaunchConfig_t config{};
         config.gridDim = dim3(rows);
         config.blockDim = dim3(256);

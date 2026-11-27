@@ -36,6 +36,15 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
               !whole.ForLayer(true, false, false, false, true, false) &&
               whole.ForLayer(false, false, true, false, false, false).dsa,
               "whole-layer SWA and DSA accept their own producer state");
+        for (int arch : {90, 103, 120}) {
+            NaiveVerifyAttentionPlan replica{};
+            replica.replicaArch = arch;
+            for (int requests : {0, 1, 2, 8, 16}) {
+                const bool supported = requests == 1 || (arch == 90 && requests > 1);
+                Check(replica.ForLayer(true, false, false, requests, true, false).replica == supported,
+                      "replicated SWA must respect the cache request count on each architecture");
+            }
+        }
         // The plan must also track large batches and arbitrary request order.
         {
             AttentionParallelState::RequestPlan plan;

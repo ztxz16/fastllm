@@ -865,7 +865,7 @@ Data NaiveN05FlashModel::RunTarget(
         if (!tensorParallel) return false;
 #ifndef USE_ROCM
         if (residual && decodeWorkspace &&
-            (!verifying || inputIds.dims[1] <= 8 || (inputIds.dims[1] > 16 && inputIds.dims[1] <= 128))) {
+            (!verifying || FastllmCudaVerifyReduceNormSupported(inputIds.dims[1], tpDevices))) {
             normOutput->dataType = BFLOAT16;
             normOutput->Resize(residual->dims);
             normOutput->ToDevice(data.dataDevice, data.dataDeviceIds, false);
@@ -1216,8 +1216,8 @@ Data NaiveN05FlashModel::RunTarget(
 #ifndef USE_ROCM
         const bool ring = slidingLayers[layer];
         const auto layerPlan = verifyPlan.ForLayer(ring, pendingMlp, localIndexer,
-            batch && batch->Size() == 1 && capture && capture->ringVerify && buf.cacheTable &&
-                !initialNormPending && weight.weight.count(ap + "mergeqkv.weight"),
+            batch && capture && capture->ringVerify && buf.cacheTable && !initialNormPending &&
+                weight.weight.count(ap + "mergeqkv.weight") ? batch->Size() : 0,
             tpSwaRingCache, indexerContextSharding && separateIndex && !sparseLayer && indexFp8 && indexerCompute == NaiveIndexerCompute::FP8);
         if (layerPlan) {
             FastllmNaiveVerifyAttentionInput input;
@@ -1313,9 +1313,9 @@ Data NaiveN05FlashModel::RunTarget(
         }
         if (attentionLayerReady) trackCommunication(projected);
 #endif
-        if (pendingMlp) {
+        if (pendingMlp || pendingFeature) {
             if (!attentionLayerReady) {
-                FastllmCudaNaiveAddDecodeRMSNorm(hidden, *pendingMlp,
+                if (pendingMlp) FastllmCudaNaiveAddDecodeRMSNorm(hidden, *pendingMlp,
                     localWeight(prefix + ".input_layernorm.weight"), rms_norm_eps, normed);
                 if (pendingFeature) Copy(hidden, *pendingFeature);
             }
@@ -1444,11 +1444,20 @@ Data NaiveN05FlashModel::RunTarget(
             (ringBatchDecode && decodeWorkspace) || eagerSwa;
         std::vector<FastllmNaiveSWARow> swaRows;
         if (batchedSWA) swaRows.reserve(length);
-        auto prepareIndexKey = [&](Data &normed, TargetWorkspace &buf, bool alreadyProjected = false) {
+        bool indexProjectionPrepared = false;
+        auto prepareIndexKey = [&](Data &normed, TargetWorkspace &buf, bool tryPacked = false) {
             if (!localIndexer) return;
             Data &indexKey = buf.indexKey;
             const std::string ip = ap + "indexer.";
-            if (!alreadyProjected) Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
+#ifndef USE_ROCM
+            if (tryPacked) {
+                // Attention reuses the indexer scratch buffer for its output projection.
+                indexProjectionPrepared = FastllmCudaIndexerProjection(normed, localWeight(ip + "wq.weight"),
+                    localWeight(ip + "wk.weight"), localWeight(ip + "weights_proj.weight"),
+                    buf.indexQ, indexKey, buf.indexWeights, projected);
+            }
+#endif
+            if (!tryPacked || !indexProjectionPrepared) Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
             if (FastllmCudaNaiveIndexerKeyNorm(indexKey,
                     localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"))) return;
             // LayerNorm accumulates in FP32; the generic CUDA operation does
@@ -1464,8 +1473,7 @@ Data NaiveN05FlashModel::RunTarget(
                 ToDataType(indexKey, DataType::BFLOAT16);
             }
         };
-            bool batchRopePrepared = false, dsaFrontPrepared = false;
-        bool indexProjectionPrepared = false;
+        bool batchRopePrepared = false, dsaFrontPrepared = false;
         bool batchNeedsIndex = false;
         // DSA needs a second binding for the independent Indexer. Keep SWA's
         // four-pointer row so existing projection/RoPE fusion stays eligible.
@@ -1512,17 +1520,8 @@ Data NaiveN05FlashModel::RunTarget(
                         item.first->Allocate(false);
                     }
                 }
-            if (batchNeedsIndex && localIndexer) {
-                const std::string ip = ap + "indexer.";
-                // O projection is not live yet. Reuse its full-width buffer for
-                // the packed GEMM; graph shapes already share this allocation.
-                indexProjectionPrepared = FastllmCudaIndexerProjection(normed,
-                    localWeight(ip + "wq.weight"), localWeight(ip + "wk.weight"),
-                    localWeight(ip + "weights_proj.weight"), buf.indexQ, buf.indexKey,
-                    buf.indexWeights, projected);
-            }
 #endif
-                if (!tryDsaFront) prepareIndexKey(normed, buf, indexProjectionPrepared);
+            if (!tryDsaFront) prepareIndexKey(normed, buf, batchNeedsIndex);
             std::vector<Data> indexKeys(batch->Size());
             for (int sequence = 0; sequence < batch->Size(); ++sequence) {
                 if (localIndexer) {
@@ -1551,7 +1550,7 @@ Data NaiveN05FlashModel::RunTarget(
                         cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta,
                         valueScale, buf.decode, attn);
                     batchRopePrepared = dsaFrontPrepared;
-                    if (!dsaFrontPrepared) prepareIndexKey(normed, buf, indexProjectionPrepared);
+                    if (!dsaFrontPrepared) prepareIndexKey(normed, buf);
                 }
                 if (mergedQkv && !batchRopePrepared)
                 batchRopePrepared = FastllmCudaNaiveBatchQkvRopeAppendCache(normed,
@@ -1581,7 +1580,7 @@ Data NaiveN05FlashModel::RunTarget(
                         item.first->ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
                         item.first->Allocate(false);
                     }
-                } else prepareIndexKey(normed, buf);
+                } else prepareIndexKey(normed, buf, !slidingLayers[layer] && verifyPlan.packedIndexer);
             std::vector<FastllmNaiveRopeCacheRow> caches;
             std::vector<Data> indexRows(length);
             caches.reserve(length);
@@ -2671,6 +2670,13 @@ Data NaiveN05FlashModel::RunTarget(
                 nextQkv = activationFor(localWeight("model.layers." + std::to_string(layer + 1) +
                                                     ".self_attn.mergeqkv.weight"), length);
             }
+            if (captureHidden && localMoe && capture->verifying && capture->packedOutput &&
+                FastllmCudaNaiveTryAddRMSNormFeature(hidden, branch, *mlpNormWeight, rms_norm_eps,
+                    *mlpNormOutput, nextQkv, *capture->packedOutput,
+                    int(featureLayer - draftTargetLayers.begin()), int(draftTargetLayers.size()))) {
+                featureWritten = true;
+                return;
+            }
             FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, *mlpNormWeight,
                 rms_norm_eps, *mlpNormOutput, &nextQkv);
         };
@@ -2984,9 +2990,8 @@ Data NaiveN05FlashModel::RunTarget(
                 "Cannot capture local draft features");
         } else if (captureHidden && !featureWritten && (tpRank <= 0 || draftRankFeature)) {
             Data &featureHidden = localMoe ? buf.hidden : hidden;
-            if (pendingMlp) {
-                // The following attention layer consumes the deferred residual and exports
-                // this layer's materialized BF16 hidden before adding attention.
+            if (pendingMlp || (verifyPlan.exportsRingFeature && layer + 1 < block_cnt && slidingLayers[layer + 1])) {
+                // The next attention exports the materialized BF16 residual before adding its output.
                 // Warmup reserves the same feature storage used by graph replay.
                 auto &feature = capture->hidden[layer];
                 feature.dataType = hidden.dataType;

@@ -15,6 +15,8 @@ namespace fastllm_dsa_layer::dp_verify {
 using Core = fastllm_dsa_fused::Body<false, false>;
 using Arena = Core::Scratch;
 using ScoreSort = cub::BlockRadixSort<unsigned, Threads, 6, int, 4>;
+constexpr int ShortItems = 12;
+using ShortSort = cub::BlockRadixSort<unsigned, Threads, ShortItems, int, 5>;
 namespace native = fastllm_dsa_fused::native_attention;
 constexpr int Heads = 64, KvHeads = 4, KeyWidth = KvHeads * 192, ValueWidth = KvHeads * 128;
 constexpr int QWidth = Heads * 192, PackedWidth = QWidth + KeyWidth + ValueWidth;
@@ -37,11 +39,14 @@ struct Input {
     const B *normed, *qkv, *wk, *wq, *weight;
     const float *norm, *bias, *positions;
     float theta, valueScale;
+    B *pairQuery;
     int *selected;
     FastllmMxfp8Activation packed;
     fastllm_dsa_fused::Args core;
 };
 union Shared103 {
+    static_assert(sizeof(ShortSort::TempStorage) <= sizeof(native::StorageFor<256, 16>));
+    ShortSort::TempStorage shortSort;
     ProjectionStorage<8> projection;
     ScoreSort::TempStorage radix;
     Core::SharedStorage core;
@@ -225,18 +230,143 @@ __device__ __forceinline__ void ExactFp8Attention(const Input &a, Shared120<true
             fastllm_mxfp8::StoreGroup(a.packed, tile / Heads, tile % Heads * 128 + t, rounded);
         }
 }
-template<bool Fp8KV> __global__ __launch_bounds__(Threads, 1) void DpDSAVerify(const __grid_constant__ Input a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+// Each Hopper warp evaluates sixteen index heads against eight cache positions.
+// Preserve the per-head query scales, ReLU and ordered FP32 accumulation.
+__device__ void HopperIndex(const fastllm_dsa_fused::Args &a, Shared103 &s, bool directSort) {
+    auto *lengths = reinterpret_cast<int *>(a.workspace + Arena::kRadixControlOffset);
+    auto *logits = reinterpret_cast<float *>(a.workspace + Arena::kIndexLogitsOffset);
+    auto *ids = reinterpret_cast<int *>(a.workspace + Arena::kIndexSelectsOffset);
+    auto *topk = reinterpret_cast<unsigned *>(a.workspace + Arena::kTopKGridOffset);
+    auto *iq = reinterpret_cast<const B *>(a.workspace + Arena::kIqPackedOffset);
+    auto *scale = reinterpret_cast<const float *>(a.workspace + Arena::kIndexWeightsScaledOffset);
+    auto key = a.indexKey;
+    key.Bind(a.indexCache);
+    const int lane = threadIdx.x % 32, group = lane / 4, pair = lane % 4;
+    const int tiles = (lengths[8] + 7) / 8;
+    for (int work = blockIdx.x * (Threads / 32) + threadIdx.x / 32; work < 8 * tiles;
+         work += gridDim.x * (Threads / 32)) {
+        const int row = work % 8, first = work / 8 * 8;
+        if (first >= lengths[row]) continue;
+        const int token = min(first + group, lengths[row] - 1);
+        const B *kv = static_cast<const B *>(key.IndexRow(token, a.indexStride).data);
+        const int head = row * 16 + group;
+        float dot[4]{};
+#pragma unroll
+        for (int k = 0; k < 128; k += 16) {
+            auto q = [&](int h, int off) { return *reinterpret_cast<const unsigned *>(
+                iq + Core::ImageOffset(h, k + pair * 2 + off, 128) / 2); };
+            auto b = [&](int off) { return *reinterpret_cast<const unsigned *>(kv + k + pair * 2 + off); };
+            fastllm_dsa_projection::mma_bf16_16816(dot, q(head,0), q(head+8,0), q(head,8), q(head+8,8), b(0), b(8));
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            float sum = 0.f;
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int h = head + half * 8;
+                const float positive = fmaxf(dot[half * 2 + j] * scale[h], 0.f);
+                const float weight = float(a.weights[min(row, a.activeRows - 1) * 16 + group + half * 8]);
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    sum = fmaf(__shfl_sync(0xffffffff, positive, 4 * i + pair),
+                               __shfl_sync(0xffffffff, weight, 4 * i + pair), sum);
+            }
+            const int pos = first + pair * 2 + j;
+            if (!group && pos < lengths[row])
+                logits[size_t(row) * Arena::kMaxSeqLen + pos] = sum * key.IndexScale(pos, a.indexStride);
+        }
+    }
+    cooperative_groups::this_grid().sync();
+    if (!directSort) Core::select_per_query_topk_grid(logits, ids, topk, lengths,
+        reinterpret_cast<unsigned *>(&s.core), &s.core.topk_sort, false);
+}
+
+#endif
+// Assign the two attention tails to a single grid. Both requests keep their own
+// shortlisted token IDs, rotated queries and split reductions.
+template<bool Pair> __device__ __forceinline__ void FinishVerify(const Input &first, const Input *second, Shared103 &s) {
+    constexpr int GroupHeads = 16, Groups = Heads / GroupHeads;
+    const int rows = first.core.activeRows + (Pair ? second->core.activeRows : 0);
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const auto grid = cooperative_groups::this_grid();
+    constexpr int splits = 8;
+    for (int tile = blockIdx.x; tile < rows * Groups * splits; tile += gridDim.x) {
+        const int owner = (tile / splits / Groups) >= first.core.activeRows;
+        const Input &a = Pair && owner ? *second : first;
+        const auto &core = a.core;
+        const int work = tile / splits, r = work / Groups - owner * first.core.activeRows;
+        const auto *query = Pair ? a.pairQuery : reinterpret_cast<const B *>(core.workspace + Query);
+        auto descriptor = core.rows[r];
+        descriptor.indices = a.selected + r * 2048;
+        native::Attend<true, native::Phase::Produce, splits, 128, 256, true, false,
+                       native::NoOutputEpilogue, GroupHeads>(
+            query, descriptor, core.sink, core.output, reinterpret_cast<float *>(core.workspace + owner * PartialBytes), nullptr, Heads, KvHeads, r,
+            work % Groups, tile % splits, s.attention);
+        __syncthreads();
+    }
+    grid.sync();
+    // Each warp folds 64 adjacent V columns. Broadcast the eight softmax corrections
+    // once per split and preserve the original FP32 accumulation and BF16 rounding.
+    constexpr int segments = 2;
+    static_assert(splits <= native::Splits && splits <= 32);
+    const int warpIndex = blockIdx.x * (Threads / 32) + warp;
+    for (int tile = warpIndex; tile < rows * Heads * segments; tile += gridDim.x * (Threads / 32)) {
+        const int owner = (tile / segments / Heads) >= first.core.activeRows;
+        const Input &a = Pair && owner ? *second : first;
+        const auto &core = a.core;
+        const int attentionHead = tile / segments - owner * first.core.activeRows * Heads, row = attentionHead / Heads;
+        const int layerHead = attentionHead % Heads;
+        const int head = attentionHead % GroupHeads, col = tile % segments * (128 / segments) + lane;
+        const int block = attentionHead / GroupHeads;
+        const auto *part = reinterpret_cast<const float *>(core.workspace + owner * PartialBytes) +
+            size_t(block) * native::Splits * GroupHeads * (128 + 2);
+        const auto *stats = part + native::Splits * GroupHeads * 128;
+        const bool activeRow = *core.rows[row].liveKeys > 0;
+        float maximum = -INFINITY, sum = 0.f;
+        if (lane < splits && activeRow) {
+            const float2 state = reinterpret_cast<const float2 *>(stats)[lane * GroupHeads + head];
+            maximum = state.x; sum = state.y;
+        }
+        const float ownMax = maximum;
+        for (int d = 16; d; d /= 2)
+            maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, d));
+        maximum = __shfl_sync(0xffffffff, maximum, 0);
+        const float sink = core.sink ? core.sink[layerHead] : -INFINITY;
+        maximum = fmaxf(maximum, sink);
+        const float correction = maximum == -INFINITY ? 0.f : __expf(ownMax - maximum);
+        float denominator = 0.f, values[4 / segments] = {};
+        if (activeRow) {
+#pragma unroll
+            for (int k = 0; k < splits; ++k) {
+                const float c = __shfl_sync(0xffffffff, correction, k);
+                denominator = fmaf(__shfl_sync(0xffffffff, sum, k), c, denominator);
+#pragma unroll
+                for (int n = 0; n < 4 / segments; ++n)
+                    values[n] = fmaf(part[(k * GroupHeads + head) * 128 + col + 32 * n], c, values[n]);
+            }
+            if (core.sink) denominator += __expf(sink - maximum);
+        }
+#pragma unroll
+        for (int n = 0; n < 4 / segments; ++n) {
+            const B value = __float2bfloat16(denominator > 0 ? values[n] / denominator : 0.f);
+            const int column = layerHead * 128 + col + n * 32;
+            core.output[row * Heads * 128 + column] = value;
+            const B rounded[1]{value};
+            fastllm_mxfp8::StoreGroup(a.packed, row, column, rounded);
+        }
+    }
+}
+
+template<bool Fp8KV, bool Pair = false> __device__ __forceinline__ void VerifyRequest(const Input &a) {
     extern __shared__ __align__(1024) unsigned char memory[];
     using Shared = std::conditional_t<Workstation, Shared120<Fp8KV>, Shared103>;
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ != 1200
-    constexpr int GroupHeads = 16, Groups = Heads / GroupHeads;
-#endif
     auto &s = *reinterpret_cast<Shared *>(memory);
     const auto &core = a.core;
     auto *ik = reinterpret_cast<B *>(core.workspace + Ik);
     auto *iq = reinterpret_cast<B *>(core.workspace + Iq);
     auto *iw = reinterpret_cast<B *>(core.workspace + Iw);
-    auto *query = reinterpret_cast<B *>(core.workspace + Query);
+    auto *query = Pair ? a.pairQuery : reinterpret_cast<B *>(core.workspace + Query);
     const int t = threadIdx.x, lane = t % 32, warp = t / 32;
     auto grid = cooperative_groups::this_grid();
     // Padded DP owners still replay the same node. Do not fetch model or KV
@@ -292,7 +422,8 @@ template<bool Fp8KV> __global__ __launch_bounds__(Threads, 1) void DpDSAVerify(c
     // O activation arena belong to the preceding full-width projection.
     cudaGridDependencySynchronize();
     // Projection of the Indexer and publication of main Q/K/V use disjoint data.
-    for (int row = int(blockIdx.x) - ProjectionBlocks; row >= 0 && row < core.activeRows * 8; row += int(gridDim.x) - ProjectionBlocks) {
+    const int reserved = gridDim.x > ProjectionBlocks ? ProjectionBlocks : 0;
+    for (int row = int(blockIdx.x) - reserved; row >= 0 && row < core.activeRows * 8; row += int(gridDim.x) - reserved) {
         const int rId = row / 8, group = row % 8;
         auto r = FastllmNaiveResolveDSARow(core.rows[rId]);
         const int visible = *r.liveKeys;
@@ -361,12 +492,37 @@ template<bool Fp8KV> __global__ __launch_bounds__(Threads, 1) void DpDSAVerify(c
     grid.sync();
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
     ScoreOwner<Fp8KV>(a, s);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+    const bool directSort = Pair &&
+        reinterpret_cast<const int *>(core.workspace + Arena::kRadixControlOffset)[8] <= Threads * ShortItems;
+    HopperIndex(core, s, directSort);
 #else
     Core::run<false>(core, s.core, true, true);
 #endif
     // Core publishes its candidates before returning. Sort directly from that scratch.
     // The sharded selector emits exact members in token order. Stable radix
     // sorting preserves the baseline score order and lower-token tie break.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+    if (directSort) {
+        if (blockIdx.x < core.activeRows) {
+            const int row = blockIdx.x, length = max(0, *core.rows[row].liveKeys);
+            const float *scores = reinterpret_cast<const float *>(core.workspace + Arena::kIndexLogitsOffset)
+                                + size_t(row) * Arena::kMaxSeqLen;
+            unsigned keys[ShortItems];
+            int ids[ShortItems];
+#pragma unroll
+            for (int i = 0; i < ShortItems; ++i) {
+                int token = t * ShortItems + i;
+                ids[i] = token < length ? token : -1;
+                keys[i] = token < length ? Core::ordered_float_key(scores[token]) : 0;
+            }
+            ShortSort(s.shortSort).SortDescending(keys, ids);
+#pragma unroll
+            for (int i = 0; i < ShortItems; ++i)
+                if (t * ShortItems + i < 2048) a.selected[row * 2048 + t * ShortItems + i] = ids[i];
+        }
+    } else
+#endif
     if (blockIdx.x < core.activeRows) {
         const int row = blockIdx.x, count = min(2048, max(0, *core.rows[row].liveKeys));
         const auto *candidates = reinterpret_cast<const int *>(core.workspace + Arena::kIndexSelectsOffset) + row * 2048;
@@ -376,7 +532,12 @@ template<bool Fp8KV> __global__ __launch_bounds__(Threads, 1) void DpDSAVerify(c
         unsigned keys[6];
         int tokens[6];
         for (int i = 0; i < 6; ++i) {
-            int slot = t * 6 + i, token = slot < count ? (Workstation && *core.rows[row].liveKeys <= 2048 ? slot : candidates[slot]) : -1;
+            int slot = t * 6 + i;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+            int token = slot < count ? (*core.rows[row].liveKeys <= 2048 ? slot : candidates[slot]) : -1;
+#else
+            int token = slot < count ? (Workstation && *core.rows[row].liveKeys <= 2048 ? slot : candidates[slot]) : -1;
+#endif
             tokens[i] = token;
             keys[i] = token >= 0 ? Core::ordered_float_key(logits[token]) : 0;
         }
@@ -411,71 +572,39 @@ template<bool Fp8KV> __global__ __launch_bounds__(Threads, 1) void DpDSAVerify(c
                                   reinterpret_cast<const uint4 *>(core.output)[i]);
     }
 #else
-    constexpr int splits = 8;
-    for (int tile = blockIdx.x; tile < core.activeRows * Groups * splits; tile += gridDim.x) {
-        const int work = tile / splits, r = work / Groups;
-        auto descriptor = core.rows[r];
-        descriptor.indices = a.selected + r * 2048;
-        native::Attend<true, native::Phase::Produce, splits, 128, 256, true, false,
-                       native::NoOutputEpilogue, GroupHeads>(
-            query, descriptor, core.sink, core.output, (float *)core.workspace, nullptr, Heads, KvHeads, r,
-            work % Groups, tile % splits, s.attention);
-        __syncthreads();
-    }
-    grid.sync();
-    // Each warp folds 64 adjacent V columns. Broadcast the eight softmax corrections
-    // once per split and preserve the original FP32 accumulation and BF16 rounding.
-    constexpr int segments = 2;
-    static_assert(splits <= native::Splits && splits <= 32);
-    const int warpIndex = blockIdx.x * (Threads / 32) + warp;
-    for (int tile = warpIndex; tile < core.activeRows * Heads * segments; tile += gridDim.x * (Threads / 32)) {
-        const int attentionHead = tile / segments, row = attentionHead / Heads;
-        const int layerHead = attentionHead % Heads;
-        const int head = attentionHead % GroupHeads, col = tile % segments * (128 / segments) + lane;
-        const int block = attentionHead / GroupHeads;
-        const auto *part = reinterpret_cast<const float *>(core.workspace) +
-            size_t(block) * native::Splits * GroupHeads * (128 + 2);
-        const auto *stats = part + native::Splits * GroupHeads * 128;
-        const bool activeRow = *core.rows[row].liveKeys > 0;
-        float maximum = -INFINITY, sum = 0.f;
-        if (lane < splits && activeRow) {
-            const float2 state = reinterpret_cast<const float2 *>(stats)[lane * GroupHeads + head];
-            maximum = state.x; sum = state.y;
-        }
-        const float ownMax = maximum;
-        for (int d = 16; d; d /= 2)
-            maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, d));
-        maximum = __shfl_sync(0xffffffff, maximum, 0);
-        const float sink = core.sink ? core.sink[layerHead] : -INFINITY;
-        maximum = fmaxf(maximum, sink);
-        const float correction = maximum == -INFINITY ? 0.f : __expf(ownMax - maximum);
-        float denominator = 0.f, values[4 / segments] = {};
-        if (activeRow) {
-#pragma unroll
-            for (int k = 0; k < splits; ++k) {
-                const float c = __shfl_sync(0xffffffff, correction, k);
-                denominator = fmaf(__shfl_sync(0xffffffff, sum, k), c, denominator);
-#pragma unroll
-                for (int n = 0; n < 4 / segments; ++n)
-                    values[n] = fmaf(part[(k * GroupHeads + head) * 128 + col + 32 * n], c, values[n]);
-            }
-            if (core.sink) denominator += __expf(sink - maximum);
-        }
-#pragma unroll
-        for (int n = 0; n < 4 / segments; ++n) {
-            const B value = __float2bfloat16(denominator > 0 ? values[n] / denominator : 0.f);
-            const int column = layerHead * 128 + col + n * 32;
-            core.output[row * Heads * 128 + column] = value;
-            const B rounded[1]{value};
-            fastllm_mxfp8::StoreGroup(a.packed, row, column, rounded);
-        }
-    }
+    if constexpr (!Pair) FinishVerify<false>(a, nullptr, s);
+
 #endif
 }
 
-template<bool Fp8KV> int ResidentGrid(int device) {
+template<bool Fp8KV> __global__ __launch_bounds__(Threads, 1) void DpDSAVerify(const __grid_constant__ Input a) {
+    VerifyRequest<Fp8KV>(a);
+}
+
+struct PairInputs { Input first, second; };
+
+__global__ __launch_bounds__(Threads, 1) void DpDSAVerifyPair(const __grid_constant__ PairInputs inputs) {
+    VerifyRequest<false, true>(inputs.first);
+    // Reuse indexer scratch after the first shortlist has been published.
+    cooperative_groups::this_grid().sync();
+    VerifyRequest<false, true>(inputs.second);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+    cooperative_groups::this_grid().sync();
+    extern __shared__ __align__(1024) unsigned char memory[];
+    FinishVerify<true>(inputs.first, &inputs.second, *reinterpret_cast<Shared103 *>(memory));
+#endif
+}
+
+template<bool Fp8KV, auto Kernel = DpDSAVerify<Fp8KV>> int ResidentGrid(int device) {
     const int arch = FastllmCudaRuntimeArch();
-    if ((arch != 103 || Fp8KV) && arch != 120) return 0;
+    bool supported = arch == 120;
+#ifdef FASTLLM_DP_DSA_SM103
+    supported |= arch == 103 && !Fp8KV;
+#endif
+#ifdef FASTLLM_DP_DSA_SM90
+    supported |= arch == 90 && !Fp8KV;
+#endif
+    if (!supported) return 0;
     const size_t bytes = arch == 120 ? sizeof(Shared120<Fp8KV>) : sizeof(Shared103);
     static thread_local std::unordered_map<int, int> sizes;
     auto it = sizes.find(device);
@@ -484,10 +613,10 @@ template<bool Fp8KV> int ResidentGrid(int device) {
     cudaDeviceProp prop{};
     int blocks = 0;
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess || !prop.cooperativeLaunch ||
-        prop.multiProcessorCount < (arch == 120 ? ProjectionBlocks + 1 : 128) || prop.sharedMemPerBlockOptin < bytes ||
-        cudaFuncSetAttribute(DpDSAVerify<Fp8KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+        prop.multiProcessorCount < (arch == 120 ? ProjectionBlocks + 1 : arch == 90 ? 8 : 128) || prop.sharedMemPerBlockOptin < bytes ||
+        cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess ||
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, DpDSAVerify<Fp8KV>, Threads, bytes) !=
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, Kernel, Threads, bytes) !=
             cudaSuccess ||
         !blocks) {
         cudaGetLastError();
@@ -505,16 +634,31 @@ bool FastllmCudaTryDpDSAVerify(const fastllm::Data &normalized, const fastllm::D
                                const fastllm::Data &value, const void *const *binding, int capacity,
                                float theta, float valueScale, FastllmMxfp8Activation packed,
                                FastllmNaiveDecodeScratch &scratch, fastllm::Data &attention, bool overlapQkv) {
+    return FastllmCudaTryDpDSAVerify(normalized, qkv, wk, wq, weights, keyNorm, keyBias, sink,
+        positions, live, key, value, binding, capacity, theta, valueScale, packed, scratch, attention, overlapQkv, nullptr, packed.rows);
+}
+
+bool FastllmCudaTryDpDSAVerify(const fastllm::Data &normalized, const fastllm::Data &qkv,
+                               const fastllm::Data &wk, const fastllm::Data &wq, const fastllm::Data &weights,
+                               const fastllm::Data &keyNorm, const fastllm::Data &keyBias,
+                               const fastllm::Data &sink, const fastllm::Data &positions,
+                               const fastllm::Data &live, const fastllm::Data &key,
+                               const fastllm::Data &value, const void *const *binding, int capacity,
+                               float theta, float valueScale, FastllmMxfp8Activation packed,
+                               FastllmNaiveDecodeScratch &scratch, fastllm::Data &attention, bool overlapQkv, const FastllmNaiveRopeCacheRow *second, int firstRows) {
     using namespace fastllm;
     using namespace fastllm_dsa_layer::dp_verify;
     using fastllm_dsa_layer::B;
     const int rows = packed.rows, device = FastllmCudaGetDevice();
-    const bool workstation = FastllmCudaRuntimeArch() == 120;
+    const int arch = FastllmCudaRuntimeArch();
+    const bool workstation = arch == 120;
     const bool fp8 = key.dataType == FP8_E4M3;
     const int stride = key.dims.empty() ? 0 : key.dims.back();
     const bool sidecar = workstation && stride == KeyWidth && key.isPagedKVCache;
     if ((fp8 && !workstation) || (!sidecar && stride != KeyWidth + 128)) return false;
-    if (rows < 2 || rows > 8 || !packed.Matches(rows, Heads * 128) || !binding || capacity <= 8192 ||
+    if (second && (arch != 90 || firstRows < 1 || firstRows > 8 || rows <= firstRows || rows - firstRows > 8 || !second->key || !second->value || !second->cache)) return false;
+    if ((!second && (rows < (arch == 90 ? 1 : 2) || rows > 8)) || !packed.Matches(rows, Heads * 128) || !binding || capacity <= 0 ||
+        (arch != 90 && capacity <= 8192) ||
         capacity > Arena::kMaxSeqLen || !std::isfinite(theta) || theta <= 0 || !std::isfinite(valueScale))
         return false;
     auto resident = [&](const Data &d, DataType type) {
@@ -550,7 +694,11 @@ bool FastllmCudaTryDpDSAVerify(const fastllm::Data &normalized, const fastllm::D
         !cache(key, stride) || !cache(value, ValueWidth) || key.kvCacheFp8Indexer ||
         key.isPagedKVCache != value.isPagedKVCache || (key.isPagedKVCache && key.pageLen != value.pageLen))
         return false;
-    const int grid = fp8 ? ResidentGrid<true>(device) : ResidentGrid<false>(device);
+    if (second && (!cache(*second->key, stride) || !cache(*second->value, ValueWidth) ||
+        second->key->kvCacheFp8Indexer || second->key->isPagedKVCache != second->value->isPagedKVCache ||
+        (second->key->isPagedKVCache && second->key->pageLen != second->value->pageLen))) return false;
+    const int grid = second ? ResidentGrid<false, DpDSAVerifyPair>(device) :
+        fp8 ? ResidentGrid<true>(device) : ResidentGrid<false>(device);
     auto &arena = scratch.attentionPartial;
     if (!grid || (FastllmCudaGraphIsCapturingFast() &&
                   (!arena.cudaData || arena.expansionBytes < FallbackElements * sizeof(float) ||
@@ -566,39 +714,55 @@ bool FastllmCudaTryDpDSAVerify(const fastllm::Data &normalized, const fastllm::D
     attention.Resize({1, rows, Heads * 128});
     attention.ToDevice(CUDA, normalized.dataDeviceIds, false);
     attention.Allocate(false);
-    Input a{};
-    a.selected = static_cast<int *>(arena.cudaData);
-    a.normed = (const B *)normalized.cudaData;
-    a.qkv = (const B *)qkv.cudaData;
-    a.wk = (const B *)wk.cudaData;
-    a.wq = (const B *)wq.cudaData;
-    a.weight = (const B *)weights.cudaData;
-    a.norm = (const float *)keyNorm.cudaData;
-    a.bias = (const float *)keyBias.cudaData;
-    a.positions = (const float *)positions.cudaData;
-    a.theta = theta;
-    a.valueScale = valueScale;
-    a.packed = packed;
-    auto &c = a.core;
-    c.workspace = static_cast<unsigned char *>(arena.cudaData) + SelectionBytes;
-    c.indexQuery = (B *)(c.workspace + Iq);
-    c.weights = (B *)(c.workspace + Iw);
-    c.activeRows = rows;
-    c.output = (B *)attention.cudaData;
-    c.sink = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-    c.indexStride = stride;
-    c.indexKey = FastllmNaiveKV(key);
-    c.indexCache = binding;
-    for (int i = 0; i < rows; ++i) {
-        auto &d = c.rows[i];
-        d.cache = binding;
-        d.capacity = capacity;
-        d.keyStride = c.indexStride;
-        d.pageLen = key.isPagedKVCache ? key.pageLen : 0;
-        d.liveKeys = (const int *)live.cudaData + i;
-        d.selectedCount = 2048;
-        d.indices = nullptr; // Sort the published candidates directly into the attention payload.
-    }
+    auto input = [&](int first, int requestRows, const Data &ownerKey, const void *const *ownerBinding) {
+        Input a{};
+        a.selected = static_cast<int *>(arena.cudaData);
+        a.normed = (const B *)normalized.cudaData + first * 4096;
+        a.qkv = (const B *)qkv.cudaData + first * PackedWidth;
+        a.wk = (const B *)wk.cudaData;
+        a.wq = (const B *)wq.cudaData;
+        a.weight = (const B *)weights.cudaData;
+        a.norm = (const float *)keyNorm.cudaData;
+        a.bias = (const float *)keyBias.cudaData;
+        a.positions = (const float *)positions.cudaData + first;
+        a.theta = theta;
+        a.valueScale = valueScale;
+        a.packed = packed;
+        a.packed.rows = requestRows;
+        a.packed.values += size_t(first) * packed.width;
+        if (packed.swizzledRowOffset >= 0) a.packed.swizzledRowOffset += first;
+        else a.packed.scales += first * sizeof(uint32_t);
+        auto &c = a.core;
+        c.workspace = static_cast<unsigned char *>(arena.cudaData) + SelectionBytes;
+        if (second) {
+            constexpr size_t queries = std::max(Bytes, 2 * PartialBytes);
+            constexpr size_t queryBytes = 8 * QWidth * sizeof(B);
+            static_assert(2 * SelectionBytes + queries + 2 * queryBytes <= FallbackElements * sizeof(float));
+            const int owner = first != 0;
+            a.pairQuery = reinterpret_cast<B *>(c.workspace + queries + owner * queryBytes);
+            if (owner) a.selected = reinterpret_cast<int *>(c.workspace + queries + 2 * queryBytes);
+        }
+        c.indexQuery = (B *)(c.workspace + Iq);
+        c.weights = (B *)(c.workspace + Iw);
+        c.activeRows = requestRows;
+        c.output = (B *)attention.cudaData + first * Heads * 128;
+        c.sink = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        c.indexStride = stride;
+        c.indexKey = FastllmNaiveKV(ownerKey);
+        c.indexCache = ownerBinding;
+        for (int i = 0; i < requestRows; ++i) {
+            auto &d = c.rows[i];
+            d.cache = ownerBinding;
+            d.capacity = capacity;
+            d.keyStride = c.indexStride;
+            d.pageLen = ownerKey.isPagedKVCache ? ownerKey.pageLen : 0;
+            d.liveKeys = (const int *)live.cudaData + first + i;
+            d.selectedCount = 2048;
+            d.indices = nullptr; // Sort the published candidates directly into the attention payload.
+        }
+        return a;
+    };
+    const Input a = input(0, second ? firstRows : rows, key, binding);
     cudaLaunchAttribute attrs[2]{};
     attrs[0].id = cudaLaunchAttributeCooperative;
     attrs[0].val.cooperative = 1;
@@ -611,7 +775,9 @@ bool FastllmCudaTryDpDSAVerify(const fastllm::Data &normalized, const fastllm::D
     cfg.stream = cudaStreamPerThread;
     cfg.attrs = attrs;
     cfg.numAttrs = overlapQkv ? 2 : 1;
-    auto error = cudaLaunchKernelEx(&cfg, fp8 ? DpDSAVerify<true> : DpDSAVerify<false>, a);
+    auto error = second
+        ? cudaLaunchKernelEx(&cfg, DpDSAVerifyPair, PairInputs{a, input(firstRows, rows - firstRows, *second->key, second->cache)})
+        : cudaLaunchKernelEx(&cfg, fp8 ? DpDSAVerify<true> : DpDSAVerify<false>, a);
     AssertInFastLLM(error == cudaSuccess,
                     std::string("DP DSA verification launch failed: ") + cudaGetErrorString(error));
     return true;

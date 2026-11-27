@@ -488,6 +488,7 @@ __global__ __launch_bounds__(Threads, 1) void Layer(
     __grid_constant__
 #endif
         const Args a) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     static_assert(!DirectInput || !Small, "direct QKV reads require normalized row owners");
     static_assert(Chunks == 1 || (!Small && Chunks == 2), "unsupported projection tile");
     extern __shared__ __align__(1024) unsigned char tile[];
@@ -543,6 +544,7 @@ __global__ __launch_bounds__(Threads, 1) void Layer(
     // tags; high words above are independent local QKV readiness flags.
     for (int first = 0; first < (Small ? 8 : a.rows); first += Chunks * 8)
         Tail<Threads, Chunks, DirectInput>(a, first);
+#endif
 }
 // Packed native QKV needs no cross-CTA projection reduction. Stage the
 // current head locally, and publish all candidate KV slots once per layer.
@@ -605,6 +607,7 @@ __global__ __launch_bounds__(Threads, 1) void PackedLayer(
     __grid_constant__
 #endif
         const Args a) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const int t = threadIdx.x, task = blockIdx.x;
     const int row = task / 16, head = task / 2 % 8, valueTile = task % 2;
     StageHistory<64>(a, row, valueTile);
@@ -666,6 +669,7 @@ __global__ __launch_bounds__(Threads, 1) void PackedLayer(
 #endif
     if (task == 127 && t < a.rows) *flag(t) = 0;
     Tail<Threads, 1, true, true>(a, 0, weights);
+#endif
 }
 inline int Threads(int rows) {
     return rows <= 8 ? 1024 : 512;

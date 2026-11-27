@@ -27,8 +27,8 @@
 namespace deep_gemm {
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumStages,
-          bool Swapped, bool Split, uint32_t kNumSMs>
-CUTLASS_GLOBAL __launch_bounds__(128 + (BLOCK_M <= 64 ? 128 : 256), 1) void
+          bool Swapped, bool Split, uint32_t kNumSMs, bool PackedActivation = false, bool BlockSplit = false>
+CUTLASS_GLOBAL __launch_bounds__((128 + (BLOCK_M <= 64 ? 128 : BLOCK_M == 192 ? 384 : 256)) * (BlockSplit ? 2 : 1), 1) void
 sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
@@ -38,7 +38,7 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfb) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     constexpr uint32_t BLOCK_K = 128, SF_GRAN = 32;
-    constexpr uint32_t kNumMathThreads = BLOCK_M <= 64 ? 128 : 256;
+    constexpr uint32_t kNumMathThreads = BLOCK_M <= 64 ? 128 : BLOCK_M == 192 ? 384 : 256;
     constexpr uint32_t kSwizzleAMode = 128, kSwizzleBMode = 128;
     constexpr uint32_t kScaleGroupsPerStage = BLOCK_K / SF_GRAN;
     constexpr uint32_t kAccumBanks = 2;
@@ -49,7 +49,7 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     DG_STATIC_ASSERT(BLOCK_M % WGMMA::M == 0 or BLOCK_M < WGMMA::M, "Invalid block size");
-    constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
+    constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * (kNumMathThreads / 128);
     DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
     // Shared memory
     static constexpr uint32_t SMEM_D_SIZE = math::constexpr_align(BLOCK_M * BLOCK_N * static_cast<uint32_t>(sizeof(__nv_bfloat16)), 1024u);
@@ -64,9 +64,14 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
     DG_STATIC_ASSERT(WGMMA_A_SIZE_PER_STAGE <= SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE * kNumStages, "Memory Out of bound for WGMMA");
 
     // Configs
-    const uint32_t num_total_k_blocks = shape_k / BLOCK_K / (Split ? 2 : 1);
-    const uint32_t k_block_start = Split ? blockIdx.y * num_total_k_blocks : 0;
-    const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    constexpr bool separateSplit = Split && !PackedActivation;
+    static_assert(!BlockSplit || (Swapped && Split && PackedActivation && BLOCK_M == 64));
+    constexpr int teamThreads = 128 + kNumMathThreads;
+    const int team = BlockSplit ? threadIdx.x / teamThreads : 0;
+    const int localThread = BlockSplit ? threadIdx.x % teamThreads : threadIdx.x;
+    const uint32_t num_total_k_blocks = shape_k / BLOCK_K / ((separateSplit || BlockSplit) ? 2 : 1);
+    const uint32_t k_block_start = (separateSplit ? blockIdx.y : team) * num_total_k_blocks;
+    const uint32_t warp_idx = __shfl_sync(0xffffffff, localThread / 32, 0);
     const uint32_t lane_idx = ptx::get_lane_idx();
 
     // Prefetch TMA descriptors at the very beginning
@@ -80,7 +85,11 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
     __syncwarp();
 
     // Align to 1024 bytes for swizzle-128B
-    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    extern __shared__ __align__(1024) uint8_t ctaMemory[];
+    constexpr int teamBytes = math::constexpr_align(SMEM_D_SIZE + kNumStages *
+        (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + ALIGNED_SMEM_SFA_SIZE_PER_STAGE + 2u * static_cast<uint32_t>(sizeof(Barrier)))
+        + SMEM_SFB_SIZE, 1024u);
+    uint8_t *smem_buffer = ctaMemory + team * teamBytes;
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
 
     // Data on shared memory
@@ -119,13 +128,19 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
 
     // Register reconfigurations
     constexpr uint32_t kNumTMARegisters = 40;
-    constexpr uint32_t kNumMathRegisters = kNumMathThreads == 128 ? 248 : 232;
+    constexpr uint32_t kNumMathRegisters = BlockSplit ? 200 : kNumMathThreads == 128 ? 248 : kNumMathThreads == 384 ? 152 : 232;
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
+    if constexpr (PackedActivation) {
+        // Descriptor and barrier setup is independent of the producer. Release
+        // the next attention grid only once its normalized BF16 input is ready.
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
+    }
     auto scheduler = sched::Scheduler<GemmType::Normal, BLOCK_M, BLOCK_N, 1, 1, true, kNumSMs>(shape_m, shape_n, shape_k);
 
     // Pipeline and TMA phases
@@ -160,6 +175,10 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
                         tma::copy<kScaleGroupsPerStage, BLOCK_M, 0>(&tensor_map_sfa, &full_barrier,
                             smem_sfa[stage_idx], (k_block_idx + k_block_start) * kScaleGroupsPerStage,
                             m_block_idx * BLOCK_M, 1);
+                    } else if constexpr (PackedActivation) {
+                        // Each activation row carries four K32 exponents in one word.
+                        tma::copy<BLOCK_M, 1, 0>(&tensor_map_sfa, &full_barrier, smem_sfa[stage_idx],
+                            m_block_idx * BLOCK_M, k_block_idx + k_block_start, 1);
                     } else {
                         tma::copy<BLOCK_M, kScaleGroupsPerStage, 0>(&tensor_map_sfa, &full_barrier,
                             smem_sfa[stage_idx], m_block_idx * BLOCK_M,
@@ -169,7 +188,11 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
                     // Issue TMA B
                     tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(&tensor_map_b, &full_barrier,
                              smem_b[stage_idx], k_idx, n_block_idx * BLOCK_N);
-                    if constexpr (Swapped) {
+                    if constexpr (PackedActivation && Swapped) {
+                        tma::copy<BLOCK_N, 1, 0>(&tensor_map_sfb, &full_barrier,
+                            smem_sfb + stage_idx * BLOCK_N * kScaleGroupsPerStage,
+                            n_block_idx * BLOCK_N, k_block_idx + k_block_start, 1);
+                    } else if constexpr (Swapped) {
                         tma::copy<BLOCK_N, kScaleGroupsPerStage, 0>(&tensor_map_sfb, &full_barrier,
                             smem_sfb + stage_idx * BLOCK_N * kScaleGroupsPerStage,
                             n_block_idx * BLOCK_N, (k_block_idx + k_block_start) * kScaleGroupsPerStage, 1);
@@ -178,8 +201,9 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
                             smem_sfb + stage_idx * BLOCK_N * kScaleGroupsPerStage,
                             (k_block_idx + k_block_start) * kScaleGroupsPerStage, n_block_idx * BLOCK_N, 1);
                     }
-                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE
-                        + BLOCK_N * kScaleGroupsPerStage * sizeof(float));
+                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE
+                        + BLOCK_M * (PackedActivation && !Swapped ? 1 : kScaleGroupsPerStage) * sizeof(float)
+                        + BLOCK_N * (PackedActivation && Swapped ? 1 : kScaleGroupsPerStage) * sizeof(float));
                 }
             }
         }
@@ -188,7 +212,7 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
         // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
-        const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
+        const auto math_wg_idx = __shfl_sync(0xffffffff, localThread / 128, 0);
         const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
 
         auto a_desc = mma::sm90::make_smem_desc(smem_a[0] + math_wg_idx * WGMMA::M * BLOCK_K, 1);
@@ -198,11 +222,12 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+            cutlass::arch::NamedBarrier::sync(kNumMathThreads * (BlockSplit ? 2 : 1), 0);
 
             // Accumulation for WGMMA or CUDA promotion
             float accum[WGMMA::kNumAccum * kAccumBanks], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
 
+            float first_half[Split && PackedActivation && !BlockSplit ? WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M) : 1];
             // Pick threads whose WGMMA results are to be stored in shared memory
             DG_STATIC_ASSERT(BLOCK_M >= 64 or kNumMathThreads == 128, "Only one math warp group for `BLOCK_M < 64`");
             constexpr uint32_t kNumWGMMAStoreThreads = WAVE_BLOCK_M * (128 / WGMMA::M);
@@ -225,16 +250,46 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
                     for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
                         const auto m_offset = local_idx * WAVE_BLOCK_M;
                         auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                        if constexpr (Split && PackedActivation && !BlockSplit) {
+                            if (k_block_idx == num_total_k_blocks / 2) {
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++i) {
+                                    first_half[local_idx * WGMMA::kNumAccum + i] = shifted_accum[i];
+                                    shifted_accum[i] = 0.f;
+                                }
+                            }
+                        }
                         float sa0[kScaleGroupsPerStage], sa1[kScaleGroupsPerStage];
                         // Capture all scales before arrive: non-storing warps can preload
                         // the next tile immediately after the final WGMMA retires.
-                        #pragma unroll
-                        for (uint32_t sub_k = 0; sub_k < kScaleGroupsPerStage; ++ sub_k) {
-                            const auto sf_a = smem_sfa[stage_idx];
-                            const uint32_t a0 = Swapped ? (m_offset + r_0) * 4 + sub_k : sub_k * BLOCK_M + m_offset + r_0;
-                            const uint32_t a1 = Swapped ? (m_offset + r_1) * 4 + sub_k : sub_k * BLOCK_M + m_offset + r_1;
-                            sa0[sub_k] = do_wgmma_store ? ptx::ld_shared(sf_a + a0) : 0;
-                            sa1[sub_k] = do_wgmma_store ? ptx::ld_shared(sf_a + a1) : 0;
+                        if constexpr (PackedActivation && !Swapped) {
+                            const auto *words = reinterpret_cast<const uint32_t *>(smem_sfa[stage_idx]) + m_offset;
+                            const uint32_t lo = do_wgmma_store ? ptx::ld_shared(words + r_0) : 0;
+                            const uint32_t hi = do_wgmma_store ? ptx::ld_shared(words + r_1) : 0;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kScaleGroupsPerStage; ++i) {
+                                sa0[i] = __uint_as_float(((lo >> (8 * i)) & 255) << 23);
+                                sa1[i] = __uint_as_float(((hi >> (8 * i)) & 255) << 23);
+                            }
+                        } else {
+                            #pragma unroll
+                            for (uint32_t sub_k = 0; sub_k < kScaleGroupsPerStage; ++ sub_k) {
+                                const auto sf_a = smem_sfa[stage_idx];
+                                const uint32_t a0 = Swapped ? (m_offset + r_0) * 4 + sub_k : sub_k * BLOCK_M + m_offset + r_0;
+                                const uint32_t a1 = Swapped ? (m_offset + r_1) * 4 + sub_k : sub_k * BLOCK_M + m_offset + r_1;
+                                sa0[sub_k] = do_wgmma_store ? ptx::ld_shared(sf_a + a0) : 0;
+                                sa1[sub_k] = do_wgmma_store ? ptx::ld_shared(sf_a + a1) : 0;
+                            }
+                        }
+                        constexpr bool reuseScales = PackedActivation && Swapped && BLOCK_N == 32;
+                        uint2 packedScales[reuseScales ? WGMMA::kNumAccum / 4 : 1];
+                        if constexpr (reuseScales) {
+                            // A word supplies four K32 exponents. Read each adjacent pair once
+                            // while this stage is owned by the consumer warp group.
+                            const auto *bs = reinterpret_cast<const uint2 *>(smem_sfb + stage_idx * 4 * BLOCK_N);
+                            #pragma unroll
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++i)
+                                packedScales[i] = bs[i * 4 + lane_idx % 4];
                         }
                         auto promote = [&](const uint32_t sub_k, float* partial) {
                             if (not do_wgmma_store) return;
@@ -244,8 +299,16 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
                                 const uint32_t bcol = i * 8 + (lane_idx % 4) * 2;
                                 const uint32_t b0idx = Swapped ? sub_k * BLOCK_N + bcol : bcol * 4 + sub_k;
                                 const uint32_t b1idx = Swapped ? sub_k * BLOCK_N + bcol + 1 : (bcol + 1) * 4 + sub_k;
-                                const float b0 = ptx::ld_shared(smem_sfb + stage_idx * 4 * BLOCK_N + b0idx);
-                                const float b1 = ptx::ld_shared(smem_sfb + stage_idx * 4 * BLOCK_N + b1idx);
+                                const auto *bs = smem_sfb + stage_idx * 4 * BLOCK_N;
+                                const auto scale = [&](uint32_t col, uint32_t idx) {
+                                    if constexpr (PackedActivation && Swapped) {
+                                        uint32_t word;
+                                        if constexpr (reuseScales) word = (col & 1) ? packedScales[i].y : packedScales[i].x;
+                                        else word = ptx::ld_shared(reinterpret_cast<const uint32_t *>(bs) + col);
+                                        return __uint_as_float(((word >> (sub_k * 8)) & 255) << 23);
+                                    } else return ptx::ld_shared(bs + idx);
+                                };
+                                const float b0 = scale(bcol, b0idx), b1 = scale(bcol + 1, b1idx);
                                 shifted_accum[i * 4 + 0] += (sa0[sub_k]*b0) * partial[i * 4 + 0];
                                 shifted_accum[i * 4 + 1] += (sa0[sub_k]*b1) * partial[i * 4 + 1];
                                 shifted_accum[i * 4 + 2] += (sa1[sub_k]*b0) * partial[i * 4 + 2];
@@ -294,9 +357,30 @@ sm90_fp8_gemm_block32_impl(void* output, uint32_t logical_rows,
                         const uint32_t row0 = m_block_idx * BLOCK_M + local_idx * WAVE_BLOCK_M + r_0;
                         const uint32_t row1 = m_block_idx * BLOCK_M + local_idx * WAVE_BLOCK_M + r_1;
                         auto values = final_accum + WGMMA::kNumAccum * local_idx;
+                        if constexpr (Split && PackedActivation && !BlockSplit) {
+                            #pragma unroll
+                            for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                                values[i] += first_half[local_idx * WGMMA::kNumAccum + i];
+                        }
+                        if constexpr (BlockSplit) {
+                            // The matching lanes own the same fragment in the two K halves.
+                            // Publish the upper half, then let the lower half round the single FP32 sum.
+                            auto *peer = reinterpret_cast<float *>(ctaMemory + 2 * teamBytes)
+                                       + localThread * WGMMA::kNumAccum;
+                            if (team == 1) {
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++i) peer[i] = values[i];
+                            }
+                            cutlass::arch::NamedBarrier::sync(2 * kNumMathThreads, 0);
+                            if (team == 0) {
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++i) values[i] += peer[i];
+                            }
+                        }
                         auto store = [&](uint32_t row, uint32_t col, float value) {
+                            if constexpr (BlockSplit) if (team) return;
                             if (row >= shape_m || col >= logical_rows) return;
-                            if constexpr (Split)
+                            if constexpr (separateSplit)
                                 static_cast<float*>(output)[(size_t)blockIdx.y * shape_m * logical_rows + (size_t)col * shape_m + row] = value;
                             else
                                 static_cast<__nv_bfloat16*>(output)[(size_t)col * shape_m + row] = __float2bfloat16_rn(value);

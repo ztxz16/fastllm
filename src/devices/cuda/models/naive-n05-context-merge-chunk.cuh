@@ -58,7 +58,7 @@ __device__ __forceinline__ void MergeInterval(
 }
 
 template<int Threads, int Items, class Rows = Batch, int Ranks = 4>
-__global__ __launch_bounds__(Threads) void MergeChunked(Rows batch) {
+__global__ __launch_bounds__(Threads) void MergeChunked(Rows batch, int inputWidth) {
     static_assert(K % Items == 0 && (Ranks == 2 || Ranks == 4 || Ranks == 8));
     const Row row = MergeRow(batch, blockIdx.x);
     extern __shared__ __align__(16) Key storage[];
@@ -70,7 +70,7 @@ __global__ __launch_bounds__(Threads) void MergeChunked(Rows batch) {
     for (int i = threadIdx.x; i < Ranks * K; i += Threads) {
         const int owner = i / K, local = i % K;
         merge_screen::GlobalList list{
-            row.merged + ((size_t)owner * row.mergedRows + row.mergedRow) * K * 2};
+            row.merged + ((size_t)owner * row.mergedRows + row.mergedRow) * inputWidth * 2};
         input[i] = local < count[owner] ? list[local] : 0;
     }
     __syncthreads();

@@ -3,6 +3,21 @@
 #include "naive-n05-prefill-mma.cuh"
 #include "devices/cuda/naive-n05-swa-prefill.cuh"
 namespace naive_prefill_mma {
+// The Hopper block32 GEMM uses the standalone quantizer's 1e-4 floor and FP32 scale.
+__device__ __forceinline__ void StoreSwaBlock32(FastllmMxfp8Activation dst, int row, int col, uint4 word) {
+    const auto *values = reinterpret_cast<const __nv_bfloat16 *>(&word);
+    float maximum = 1.e-4f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) maximum = fmaxf(maximum, fabsf(__bfloat162float(values[i])));
+    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, 1, 4));
+    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, 2, 4));
+    const float scale = exp2f(ceilf(log2f(maximum / 448.f)));
+    if (col % 32 == 0) dst.scales[fastllm_mxfp8::ScaleIndex(dst, row, col)] = __float_as_uint(scale) >> 23;
+    alignas(8) __nv_fp8_e4m3 packed[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) packed[i] = __nv_fp8_e4m3(__bfloat162float(values[i]) / scale);
+    *reinterpret_cast<uint2 *>(dst.values + size_t(row) * dst.width + col) = *reinterpret_cast<uint2 *>(packed);
+}
 template <int Queries> struct SwaQueryStorage {
     BF q[Queries][8][200];
     union {
@@ -33,14 +48,15 @@ __device__ void LoadSwaUnion(BF (*dst)[Pitch], int *selected, KV kv, int first, 
         __syncthreads();
     }
 }
-template <int Queries>
+template <int Teams = 1, int Queries>
 __device__ __forceinline__ void SwaQueryScores(SwaQueryStorage<Queries> &s, const int *offsets,
         const int *lengths, int count, const float *sink, int head, int w, int l) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_attention_bulk;
+    const int team = Teams == 1 ? 0 : threadIdx.x / 256;
     const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
 #pragma unroll
-    for (int r = 0; r < Queries; ++r) if (r < count) {
+    for (int base = 0; base < Queries; base += Teams) if (int r = base + team; r < count) {
         float scores[4] = {};
 #pragma unroll
         for (int d = 0; d < 192; d += 16) {
@@ -59,36 +75,37 @@ __device__ __forceinline__ void SwaQueryScores(SwaQueryStorage<Queries> &s, cons
     }
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < Queries; ++r) if (r < count)
+    for (int base = 0; base < Queries; base += Teams) if (int r = base + team; r < count)
         Normalize<128, false>(&s.prob[r][0][0], sink, head, lengths[r], w, l);
     __syncthreads();
 #endif
 }
-template <bool Pack = false, int Queries>
+template <bool Pack = false, int Teams = 1, bool Block32 = false, int Queries>
 __device__ __forceinline__ void SwaQueryValues(SwaQueryStorage<Queries> &s, const int *offsets,
         BF *out, int row, int count, int heads, int head, int w, int l, const int *lengths = nullptr,
         FastllmMxfp8Activation packed = {}, BF (*valueTile)[136] = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_attention_bulk;
     const auto values = valueTile ? valueTile : s.tile.v;
-    float acc[Queries][4] = {};
+    const int team = Teams == 1 ? 0 : threadIdx.x / 256;
+    float acc[(Queries + Teams - 1) / Teams][4] = {};
 #pragma unroll
     for (int k = 0; k < 128; k += 16) {
 #pragma unroll
-        for (int r = 0; r < Queries; ++r) if (r < count) {
+        for (int base = 0; base < Queries; base += Teams) if (int r = base + team; r < count) {
             uint32_t a[4], b[2];
             ldt4(a, &values[offsets[r] + k + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
             ld2(b, &s.prob[r][l & 7][k + ((l >> 3) & 1) * 8]);
-            mma(acc[r], a, b);
+            mma(acc[base / Teams], a, b);
         }
     }
 #pragma unroll
-    for (int r = 0; r < Queries; ++r)
-        if (r < count) {
+    for (int base = 0; base < Queries; base += Teams)
+        if (int r = base + team; r < count) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int h = (l % 4) * 2 + i % 2, col = w * 16 + l / 4 + (i / 2) * 8;
-                const BF value = __float2bfloat16(lengths && !lengths[r] ? 0.f : acc[r][i]);
+                const BF value = __float2bfloat16(lengths && !lengths[r] ? 0.f : acc[base / Teams][i]);
                 if constexpr (Pack) s.q[r][h][col] = value;
                 else out[((size_t)(row + r) * heads + head + h) * 128 + col] = value;
             }
@@ -97,12 +114,13 @@ __device__ __forceinline__ void SwaQueryValues(SwaQueryStorage<Queries> &s, cons
         // Q is dead after the score MMA. Transpose the PV fragments there so
         // adjacent lanes can write BF16 and quantize the same rounded values.
         __syncthreads();
-        for (int i = threadIdx.x; i < count * 128; i += 256) {
+        for (int i = threadIdx.x; i < count * 128; i += 256 * Teams) {
             const int r = i / 128, h = i / 16 % 8, col = i % 16 * 8;
             const uint4 value = *reinterpret_cast<const uint4 *>(&s.q[r][h][col]);
             const int offset = (head + h) * 128 + col;
             *reinterpret_cast<uint4 *>(out + size_t(row + r) * heads * 128 + offset) = value;
-            fastllm_mxfp8::Store8(packed, row + r, offset, value);
+            if constexpr (Block32) StoreSwaBlock32(packed, row + r, offset, value);
+            else fastllm_mxfp8::Store8(packed, row + r, offset, value);
         }
     }
 #endif

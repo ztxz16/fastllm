@@ -56,11 +56,11 @@ struct PackedOutput {
         view = {static_cast<uint8_t *>(values.cudaData), static_cast<uint8_t *>(scales.cudaData),
                 rows, width, pitch};
     }
-    void Check(const Data &output, int first = 0) const {
+    void Check(const Data &output, int first = 0, float minimum = 0.f) const {
         auto bf16 = Read<uint16_t>(output);
         auto bytes = Read<uint8_t>(values), exponents = Read<uint8_t>(scales);
         for (int row = 0; row < int(bf16.size() / view.width); ++row) for (int col = 0; col < view.width; col += 32) {
-            float block[32], maximum = 0.f;
+            float block[32], maximum = minimum;
             for (int i = 0; i < 32; ++i) {
                 uint32_t bits = uint32_t(bf16[row * view.width + col + i]) << 16;
                 std::memcpy(&block[i], &bits, sizeof(bits));
@@ -343,6 +343,13 @@ static void TestResidualNorm(int channels, int rows = 1, bool unalignedWeight = 
         weight.Resize({channels});
         weight.FakeFrom(weightStorage, sizeof(float));
     } else Upload(weight, {channels}, 93);
+    const bool hopperBlock32 = verifyPack && FastllmCudaRuntimeArch() == 90 && rows > 64 && rows <= 128;
+    if (hopperBlock32) {
+        // Exercise a zero group and a nonzero group smaller than the standalone quantizer floor.
+        float gains[64]{};
+        std::fill(gains + 32, gains + 64, 1.e-6f);
+        Cuda(cudaMemcpy(weight.cudaData, gains, sizeof(gains), cudaMemcpyHostToDevice));
+    }
     Upload(expected, {1, rows, channels}, 94);
     auto original = Read<uint16_t>(hidden);
     PackedOutput packed;
@@ -364,7 +371,7 @@ static void TestResidualNorm(int channels, int rows = 1, bool unalignedWeight = 
         graph.Run();
         Require(Read<uint16_t>(hidden) == Read<uint16_t>(reference), "fused residual differs");
         Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "fused norm differs");
-        if (channels == 4096 && packed.view.values) packed.Check(actual);
+        if (channels == 4096 && packed.view.values) packed.Check(actual, 0, hopperBlock32 ? 1.e-4f : 0.f);
         original = Read<uint16_t>(reference);
         ++checks;
     }
@@ -1049,6 +1056,12 @@ int main(int argc, char **argv) {
         if (argc == 2 && std::strcmp(argv[1], "--router-batch") == 0) {
             TestRouters();
             std::puts("ROUTER BATCH PASS");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--verify-qkv-pack") == 0) {
+            if (FastllmCudaRuntimeArch() != 90) return 77;
+            for (int rows : {65, 128}) TestResidualNorm(4096, rows, false, true);
+            std::printf("Verification QKV pack PASS (%d graph checks)\n", checks);
             return 0;
         }
         if (argc == 2 && std::strcmp(argv[1], "--projection-pack") == 0) {

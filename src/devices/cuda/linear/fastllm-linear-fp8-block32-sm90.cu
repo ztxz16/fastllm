@@ -1,6 +1,9 @@
 // Native Hopper W8A8 for row-wise FP8 weights with one FP32 scale per 32 values.
 // Weight bytes/scales are never expanded, requantized or copied into a cache.
 #include "fastllm-cuda.cuh"
+#include "fastllm.h"
+#include "devices/cuda/fastllm-mxfp8-projection.h"
+#include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "fastllm-bf16-lt.cuh"
 #include <cuda.h>
 #include <cuda_fp8.h>
@@ -52,12 +55,14 @@ bool MakeTma(cute::TmaDescriptor &desc, CUtensorMapDataType type, void *ptr,
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-template<int BM, int BN, int Stages, bool Swapped, bool Split>
+template<int BM, int BN, int Stages, bool Swapped, bool Split, bool Packed = false, bool Pdl = false,
+         bool BlockSplit = false>
 struct Projection {
-    static constexpr int Shared = (BM * BN * 2 + 1023) / 1024 * 1024 +
+    static constexpr int TeamBytes = (BM * BN * 2 + 1023) / 1024 * 1024 +
         Stages * (BM * 128 + BN * 128 + BM * 16 + BN * 16) + Stages * 16;
+    static constexpr int Shared = BlockSplit ? 2 * ((TeamBytes + 1023) / 1024 * 1024) + BM * BN * sizeof(float) : TeamBytes;
     static auto Kernel() {
-        return deep_gemm::sm90_fp8_gemm_block32_impl<BM, BN, Stages, Swapped, Split, kWorkers>;
+        return deep_gemm::sm90_fp8_gemm_block32_impl<BM, BN, Stages, Swapped, Split, kWorkers, Packed, BlockSplit>;
     }
     static bool Configure() {
         return cudaFuncSetAttribute(Kernel(), cudaFuncAttributeMaxDynamicSharedMemorySize, Shared) == cudaSuccess;
@@ -72,21 +77,34 @@ struct Projection {
             return false;
         if constexpr (Swapped) {
             if (!MakeTma(tsa, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sa, inner / 32, channels, inner / 8, 4, BM) ||
-                !MakeTma(tsb, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sb, paddedRows, inner / 32, paddedRows * 4, BN, 4)) return false;
+                !MakeTma(tsb, Packed ? CU_TENSOR_MAP_DATA_TYPE_UINT32 : CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sb, paddedRows,
+                         inner / (Packed ? 128 : 32), paddedRows * 4, BN, Packed ? 1 : 4)) return false;
             // The small-M epilogue stores directly; use a valid descriptor for its prefetch.
             td = ta;
         } else {
-            if (!MakeTma(tsa, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sa, paddedRows, inner / 32, paddedRows * 4, BM, 4) ||
+            if (!MakeTma(tsa, Packed ? CU_TENSOR_MAP_DATA_TYPE_UINT32 : CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+                         sa, paddedRows, inner / (Packed ? 128 : 32), paddedRows * 4, BM, Packed ? 1 : 4) ||
                 !MakeTma(tsb, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sb, inner / 32, channels, inner / 8, 4, BN) ||
                 !MakeTma(td, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, out, channels, rows, channels * 2, 64, BM, CU_TENSOR_MAP_SWIZZLE_128B)) return false;
         }
-        void *result = Split ? static_cast<void *>(partial) : static_cast<void *>(out);
+        constexpr bool separateSplit = Split && !Packed;
+        void *result = separateSplit ? static_cast<void *>(partial) : static_cast<void *>(out);
         auto kernel = Kernel();
-        kernel<<<dim3(kWorkers, Split ? 2 : 1), 128 + (BM <= 64 ? 128 : 256), Shared, cudaStreamPerThread>>>(
-            result, rows, m, n, inner, ta, tb, td, tsa, tsb);
-        auto error = cudaGetLastError();
+        constexpr int threads = (128 + (BM <= 64 ? 128 : BM == 192 ? 384 : 256)) * (BlockSplit ? 2 : 1);
+        const dim3 grid(kWorkers, separateSplit ? 2 : 1);
+        cudaError_t error;
+        if constexpr (Pdl) {
+            cudaLaunchAttribute attribute{};
+            attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute.val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t config{grid, dim3(threads), Shared, cudaStreamPerThread, &attribute, 1};
+            error = cudaLaunchKernelEx(&config, kernel, result, rows, m, n, inner, ta, tb, td, tsa, tsb);
+        } else {
+            kernel<<<grid, threads, Shared, cudaStreamPerThread>>>(result, rows, m, n, inner, ta, tb, td, tsa, tsb);
+            error = cudaGetLastError();
+        }
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-        if constexpr (Split) {
+        if constexpr (separateSplit) {
             const size_t length = size_t(rows) * channels;
             ReduceSplit<<<(length + 255) / 256, 256, 0, cudaStreamPerThread>>>(partial, out, length);
         }
@@ -130,6 +148,11 @@ auto SelectProjection(int rows, int inner, int channels, bool splitFits) {
     return rows <= 32 ? Medium32::Run : rows <= 64 ? Medium64::Run : Large::Run;
 }
 
+using Packed8 = Projection<256, 8, 6, true, false, true>;
+using PackedSplit8 = Projection<64, 8, 6, true, true, true>;
+using Packed16 = Projection<256, 16, 5, true, false, true>;
+using PackedSplit16 = Projection<64, 16, 6, true, true, true>;
+
 bool PrepareKernels() {
     static thread_local std::map<int, bool> ready;
     const int device = FastllmCudaGetDevice();
@@ -145,7 +168,109 @@ bool PrepareKernels() {
     return ok;
 }
 
+int PackedVerifyRows(const fastllm::Data &w, bool verify) {
+    if (!verify || w.dataType != fastllm::FP8_E4M3 || w.dims.size() != 2 || w.blockM != 32 ||
+        w.blockK != 1 || w.IsRepacked || !w.cudaData || w.dataDevice != fastllm::CUDA ||
+        w.strides.size() != 2 || w.strides[0] != w.dims[1] || w.strides[1] != 1) return 0;
+    const int out = w.dims[0], in = w.dims[1];
+    if (in == 4096 && (out == 13568 || out == 14848)) return 128;
+    return in == 8192 && out == 4096 ? 16 : 0;
+}
+void PreparePackedVerify(fastllm::Data &w) {
+    if (!PackedVerifyRows(w, true)) return;
+    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(w, *fastllm::GetEmptyData(), w.dims[0]);
+}
+bool PackedVerifyKernelsReady() {
+    static thread_local std::map<int, bool> configured;
+    const int device = FastllmCudaGetDevice();
+    auto it = configured.find(device);
+    if (it == configured.end()) {
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        const bool ok = Packed8::Configure() && PackedSplit8::Configure() &&
+                        Packed16::Configure() && PackedSplit16::Configure();
+        if (!ok) cudaGetLastError();
+        it = configured.emplace(device, ok).first;
+    }
+    return it->second;
+}
+
+template<class Kernel> bool SwaKernelReady() {
+    static thread_local std::map<int, bool> ready;
+    const int device = FastllmCudaGetDevice();
+    auto it = ready.find(device);
+    if (it == ready.end()) {
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        it = ready.emplace(device, Kernel::Configure()).first;
+        if (!it->second) cudaGetLastError();
+    }
+    return it->second;
+}
+
+// Three 64-channel warp groups cover one 192-channel SWA QKV tile.
+using SwaQuery32 = Projection<192, 32, 5, true, false, true>;
+
+// Wide tiles keep activations on the M axis and write BF16 with TMA.
+using VerifyProjection128 = Projection<128, 64, 4, false, false, true>;
+template<class Kernel>
+bool RunVerifyProjection(FastllmMxfp8Activation x, const fastllm::Data &w, void *out) {
+    if (!SwaKernelReady<Kernel>()) return false;
+    return Kernel::Run(x.values, w.cudaData, reinterpret_cast<float *>(x.scales),
+        static_cast<float *>(w.extraCudaData[0]), static_cast<__nv_bfloat16 *>(out), nullptr,
+        x.rows, x.width, w.dims[0], x.pitch);
+}
+
+template<bool Pdl> bool ProjectPackedVerify(FastllmMxfp8Activation x, const fastllm::Data &w, void *out) {
+    if (x.rows > PackedVerifyRows(w, true) || x.swizzledRowOffset >= 0 || x.rows < 2 ||
+        !x.Matches(x.rows, w.dims[1]) || w.extraCudaData.empty() || !w.extraCudaData[0]) return false;
+    if (x.rows > 64)
+        return RunVerifyProjection<VerifyProjection128>(x, w, out);
+    if (x.rows > 32) {
+        // Three warp groups cover 192 output channels per tile with up to 64 verification rows.
+        using VerifyQuery64 = Projection<192, 64, 4, true, false, true>;
+        return RunVerifyProjection<VerifyQuery64>(x, w, out);
+    }
+    if (x.rows > 16) {
+        return RunVerifyProjection<SwaQuery32>(x, w, out);
+    }
+    if (!PackedVerifyKernelsReady()) return false;
+    const bool split = w.dims[0] == 4096;
+    const auto run = x.rows > 8
+        ? (split ? Projection<64, 16, 6, true, true, true, Pdl>::Run
+                 : Projection<256, 16, 5, true, false, true, Pdl>::Run)
+        : split ? Projection<64, 8, 6, true, true, true, Pdl>::Run
+                           : Projection<256, 8, 6, true, false, true, Pdl>::Run;
+    return run(x.values, w.cudaData, reinterpret_cast<float *>(x.scales), static_cast<float *>(w.extraCudaData[0]),
+               static_cast<__nv_bfloat16 *>(out), nullptr, x.rows, x.width, w.dims[0], x.pitch);
+}
+
+// Two warp groups compute opposite K halves and reduce their FP32 fragments in shared memory.
+using SwaOutput32 = Projection<64, 32, 4, true, true, true, false, true>;
+int SwaOutputRows(const fastllm::Data &w, bool verify) {
+    return PackedVerifyRows(w, verify) && w.dims[1] == 8192 ? 128 : 0;
+}
+bool ProjectVerifyOutput(FastllmMxfp8Activation x, const fastllm::Data &w, void *out) {
+    if (!SwaOutputRows(w, true) || (x.rows <= 16 || x.rows > 128) || !x.Matches(x.rows, 8192) || x.swizzledRowOffset >= 0 ||
+        w.extraCudaData.empty() || !w.extraCudaData[0]) return false;
+    if (x.rows > 64)
+        return RunVerifyProjection<VerifyProjection128>(x, w, out);
+    using VerifyOutput64 = Projection<64, 64, 4, true, true, true, false, true>;
+    return x.rows > 32 ? RunVerifyProjection<VerifyOutput64>(x, w, out) : RunVerifyProjection<SwaOutput32>(x, w, out);
+}
 } // namespace
+
+const FastllmMxfp8ProjectionBackend *FastllmCudaSm90SwaOutputProjection() {
+    static const FastllmMxfp8ProjectionBackend backend{PreparePackedVerify, SwaOutputRows, ProjectVerifyOutput};
+    return &backend;
+}
+
+const FastllmMxfp8ProjectionBackend *FastllmCudaSm90PackedVerifyProjection() {
+    static const auto ops = [] {
+        FastllmMxfp8ProjectionBackend backend{PreparePackedVerify, PackedVerifyRows, ProjectPackedVerify<false>};
+        backend.projectPdl = ProjectPackedVerify<true>;
+        return backend;
+    }();
+    return &ops;
+}
 
 // Raw entry shared by the Data dispatcher and numerical/Graph tests. Scales
 // use the same original row-major FP32 layout as the generic fallback.

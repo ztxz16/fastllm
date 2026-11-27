@@ -595,6 +595,7 @@ if (USE_CUDA)
     if (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
+        set(FASTLLM_NAIVE_SM90_ENABLED ON)
         set(FASTLLM_CUDA_SM90_SOURCES
             src/devices/cuda/linear/fastllm-linear-fp8-sm90.cu
             src/devices/cuda/linear/fastllm-linear-fp8-decode-sm90.cu
@@ -604,6 +605,9 @@ if (USE_CUDA)
             src/devices/cuda/linear/fastllm-linear-fp8.cu
             src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DEEPGEMM_FP8_SM90)
+        set_property(SOURCE src/devices/multicuda/fastllm-naive-context-indexer.cpp
+            src/devices/multicuda/fastllm-custom-allreduce.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY)
         message(STATUS "Hopper SM90 DeepGEMM FP8 linear: ON")
     endif()
 
@@ -980,7 +984,13 @@ if (FASTLLM_CUDA_SM120_SOURCES)
         set_property(SOURCE ${dp_dsa_source} ${dp_draft_source} APPEND PROPERTY COMPILE_OPTIONS
             "--generate-code=arch=compute_120f,code=sm_120f")
     else()
-        target_sources(fastllm_cuda_sm120 PRIVATE ${dp_dsa_source} ${dp_draft_source})
+        target_sources(fastllm_cuda_sm120 PRIVATE ${dp_draft_source})
+        if (FASTLLM_NAIVE_SM90_ENABLED)
+            set_property(SOURCE ${dp_dsa_source} APPEND PROPERTY COMPILE_OPTIONS
+                "--generate-code=arch=compute_120f,code=sm_120f")
+        else()
+            target_sources(fastllm_cuda_sm120 PRIVATE ${dp_dsa_source})
+        endif()
         set_property(SOURCE ${dp_dsa_source} ${dp_draft_source} APPEND PROPERTY COMPILE_OPTIONS
             "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
         set_property(SOURCE ${dp_dsa_source} APPEND PROPERTY INCLUDE_DIRECTORIES
@@ -1140,8 +1150,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_FLEX_SM103)
     set(FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_flex_sm103>)
     add_library(fastllm_naive_dsa_fused OBJECT src/devices/cuda/models/naive-n05-dsa-fused.cu
-        src/devices/cuda/models/naive-n05-dsa-layer.cu
-        src/devices/cuda/models/naive-n05-dp-dsa-verify.cu)
+        src/devices/cuda/models/naive-n05-dsa-layer.cu)
     set_target_properties(fastllm_naive_dsa_fused PROPERTIES
         CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_naive_dsa_fused BEFORE PRIVATE
@@ -1189,6 +1198,27 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_definitions(fastllm_shared_flex_sm103 PRIVATE FM_RELAXED_MAILBOX=1)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_shared_flex_sm103>)
     message(STATUS "Naive FlexMoE SM103 TP8: built-in, opt-in at runtime")
+endif()
+
+if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR FASTLLM_NAIVE_SM90_ENABLED)
+    add_library(fastllm_dp_dsa_verify OBJECT src/devices/cuda/models/naive-n05-dp-dsa-verify.cu)
+    set_target_properties(fastllm_dp_dsa_verify PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_dp_dsa_verify BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_dsa/include" "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_dp_dsa_verify PRIVATE
+        "--expt-relaxed-constexpr" "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
+    if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+        target_compile_options(fastllm_dp_dsa_verify PRIVATE "--generate-code=arch=compute_103a,code=sm_103a")
+        target_compile_definitions(fastllm_dp_dsa_verify PRIVATE FASTLLM_DP_DSA_SM103)
+    endif()
+    if (FASTLLM_NAIVE_SM90_ENABLED)
+        target_compile_options(fastllm_dp_dsa_verify PRIVATE "--generate-code=arch=compute_90a,code=sm_90a")
+        target_compile_definitions(fastllm_dp_dsa_verify PRIVATE FASTLLM_DP_DSA_SM90)
+    endif()
+    list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_dp_dsa_verify>)
+    set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DP_VERIFY)
 endif()
 
 if (TARGET fastllm_draft_fused OR FASTLLM_CUDA_SM120_SOURCES)
@@ -1334,7 +1364,7 @@ endif()
 if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_MIMO_EP8_MEGA_OBJECTS})
 endif()
-if (TARGET fastllm_naive_flex_sm103)
+if (FASTLLM_NAIVE_FLEX_OBJECTS)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_NAIVE_FLEX_OBJECTS})
 endif()
 if (FASTLLM_CUDA_SM90_SOURCES)
@@ -2976,6 +3006,13 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_swa_output naive_n05_swa_output_disabled
                 naive_n05_swa_output_mma naive_n05_swa_output_mma_disabled PROPERTIES
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 480)
+            if (FASTLLM_NAIVE_SM90_ENABLED)
+                add_executable(naive_n05_hopper_verify_test test/basic/test_cuda_naive_hopper_verify.cpp)
+                target_link_libraries(naive_n05_hopper_verify_test PRIVATE fastllm)
+                target_include_directories(naive_n05_hopper_verify_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+                add_test(NAME naive_n05_hopper_verify COMMAND naive_n05_hopper_verify_test)
+                set_tests_properties(naive_n05_hopper_verify PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+            endif()
             add_executable(naive_n05_swa_verify_layer_test test/basic/test_cuda_naive_swa_verify_layer.cpp)
             target_link_libraries(naive_n05_swa_verify_layer_test PRIVATE fastllm)
             target_include_directories(naive_n05_swa_verify_layer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -3015,6 +3052,9 @@ if (UNIT_TEST)
             "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR FASTLLM_CUDA_SM120_SOURCES)
             add_executable(naive_n05_qkv_test test/basic/test_cuda_naive_qkv.cu)
             target_link_libraries(naive_n05_qkv_test PRIVATE fastllm)
+            if (FASTLLM_NAIVE_SM90_ENABLED)
+                target_compile_definitions(naive_n05_qkv_test PRIVATE FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY)
+            endif()
             add_test(NAME naive_n05_qkv COMMAND naive_n05_qkv_test)
             add_test(NAME naive_n05_packed_swa_verify COMMAND naive_n05_qkv_test --packed-swa)
             add_test(NAME naive_n05_swa_qkv_attention COMMAND naive_n05_qkv_test --attention)
@@ -3965,6 +4005,14 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_dsa_fused_bf16 naive_n05_dsa_fused_fp8 PROPERTIES
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
                 PASS_REGULAR_EXPRESSION "FUSED DSA PASS")
+        endif()
+
+        if (FASTLLM_NAIVE_SM90_ENABLED AND FASTLLM_DEEPGEMM_FP8_SM90_ENABLED)
+            add_executable(naive_n05_dp_dsa32_test test/basic/test_naive_n05_dp_dsa32.cu)
+            target_link_libraries(naive_n05_dp_dsa32_test PRIVATE fastllm)
+            set_target_properties(naive_n05_dp_dsa32_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME naive_n05_dp_dsa32 COMMAND naive_n05_dp_dsa32_test)
+            set_tests_properties(naive_n05_dp_dsa32 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         endif()
 
         add_executable(naive_n05_dsa_batch_test test/basic/test_naive_n05_dsa_batch.cpp)

@@ -40,7 +40,7 @@ struct ContextShard {
         view.strides = {size_t(pages * local) * width, size_t(width), 1};
     }
 };
-static void ContextCase(int capacity, int page, int ranks, int batch, int kind, bool uniform, bool graph, int verifyBlock = 0) {
+static void ContextCase(int capacity, int page, int ranks, int batch, int kind, bool uniform, bool graph, int verifyBlock = 0, bool mixedCapacity = false) {
     DataType type = (kind == 0 || kind == 3) ? BFLOAT16 : FP8_E4M3;
     bool scaled = kind == 2 || kind == 3;
     int width = scaled ? (type == FP8_E4M3 ? 144 : 72) : 128;
@@ -128,9 +128,8 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
         Cuda(cudaMemcpy(bindings[rank].cudaData, table, sizeof(table), cudaMemcpyHostToDevice));
     }
     Data candidates;
-    const int directWidth = !verifyBlock && batch < 16
-        ? std::min(2048, ((capacity + page - 1) / page) * (page / ranks)) : 0;
-    // The same tensor shape also exercises legacy verification with a full-width exchange.
+    const int shardWidth = std::min(2048, ((capacity + page - 1) / page) * (page / ranks));
+    const int directWidth = batch < 16 || (verifyBlock && shardWidth < 2048) ? shardWidth : 0;
     Device(candidates, INT32, {ranks, batch, directWidth ? directWidth : 2048, 2});
     for (int rank = 0; rank < ranks; rank++) {
         scratch[rank].resize(batch);
@@ -151,10 +150,11 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
         verifyOutputs[rank].resize(batch);
         for (int first = 0, group = 0; first < batch; ++group) {
             const int count = std::min(batch - first, std::max(1, verifyBlock - group % 3));
-            const int past = std::max(0, capacity - count - group * 19);
+            const int rowCapacity = mixedCapacity && group ? std::max(count, capacity / (1 + group % 4)) : capacity;
+            const int past = std::max(0, rowCapacity - count - group * 19);
             for (int row = 0; row < count; ++row) lengths[first + row] = past + row + 1;
             verifyItems[rank].push_back({&shards[rank]->view, &verifyOutputs[rank][group],
-                first, count, past, capacity, (const void *const *)bindings[rank].cudaData});
+                first, count, past, rowCapacity, (const void *const *)bindings[rank].cudaData});
             first += count;
         }
     }
@@ -163,8 +163,8 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
         if (verifyBlock) {
             for (int rank = 0; rank < ranks; ++rank)
                 Require(FastllmCudaNaiveBatchVerifyIndexer(q, weights, verifyItems[rank], true,
-                    verifyScratch[rank], live, rank, ranks, &candidates, page), "context verify dispatch");
-            FastllmCudaNaiveMergeVerifyIndexer(verifyItems[0], verifyScratch[0], live, candidates, ranks, page);
+                    verifyScratch[rank], live, rank, ranks, &candidates, page, directWidth), "context verify dispatch");
+            FastllmCudaNaiveMergeVerifyIndexer(verifyItems[0], verifyScratch[0], live, candidates, ranks, page, directWidth);
             return;
         }
         for (int rank = 0; rank < ranks; rank++)
@@ -394,6 +394,10 @@ int main(int argc, char **argv) {
                         ContextCase(8193, 128, ranks, batch, kind, kind == 0, true);
             for (int capacity : {129, 2049, 4612, 200000})
                 ContextCase(capacity, 128, 8, 128, 1, false, true);
+            for (int rows : {1, 8, 16, 65})
+                ContextCase(4097, 128, 8, rows, 1, true, true, 8);
+            ContextCase(16385, 128, 8, 17, 1, false, true, 11);
+            ContextCase(8193, 128, 8, 257, 1, false, true, 11, true);
             for (int block : {3, 5, 7, 8})
                 ContextCase(8193, 128, 8, 129, 1, false, true, block);
             printf("PASS %d context-shard checks\n", checks);

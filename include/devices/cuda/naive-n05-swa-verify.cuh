@@ -10,3 +10,13 @@ bool FastllmCudaTryPackedSwaVerify(const fastllm::Data &qkv, const fastllm::Data
         const fastllm::Data &live, const FastllmNaiveRopeCacheRow &binding,
         const fastllm::Data &sink, int heads, int kvHeads, float theta, float valueScale,
         FastllmMxfp8Activation packed, fastllm::Data &attention, bool overlapQkv = false);
+
+bool FastllmCudaTryPackedSwaVerify(const fastllm::Data &qkv, const fastllm::Data &positions,
+        const fastllm::Data &live, const FastllmNaiveRopeCacheRow *bindings,
+        const fastllm::Data &sink, int heads, int kvHeads, float theta, float valueScale,
+        FastllmMxfp8Activation packed, fastllm::Data &attention, bool overlapQkv,
+        const int *requestLengths, int owners);
+
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+const FastllmMxfp8ProjectionBackend *FastllmCudaSm90SwaOutputProjection();
+#endif

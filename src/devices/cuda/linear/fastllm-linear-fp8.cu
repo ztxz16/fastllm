@@ -3068,7 +3068,13 @@ const FastllmMxfp8ProjectionBackend *FastllmCudaBlackwellMxfp8Projection();
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
 const FastllmMxfp8ProjectionBackend *FastllmCudaSm120PackedProjection();
 #endif
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+const FastllmMxfp8ProjectionBackend *FastllmCudaSm90PackedVerifyProjection();
+#endif
 const FastllmMxfp8ProjectionBackend *FastllmCudaGetMxfp8ProjectionBackend() {
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+    if (FastllmCudaRuntimeArch() == 90) return FastllmCudaSm90PackedVerifyProjection();
+#endif
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
     if (FastllmCudaRuntimeArch() == 103) return FastllmCudaBlackwellMxfp8Projection();
 #endif

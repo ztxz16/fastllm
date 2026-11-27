@@ -19,14 +19,22 @@ struct Storage {
         BF16 probability[Heads][136];
     };
     BF16 value[128][136];
-    float scores[128][Heads];
+    union {
+        float scores[128][Heads];
+        // Page lookup precedes QK. Both arrays expire before any score is written.
+        struct { int key[128], value[128]; } physical;
+    };
     int valid[128];
 };
 
-template<bool Pack = false>
+struct StoreBf16 {
+    static constexpr bool Packed = false;
+    __device__ __forceinline__ void operator()(BF16 *out, size_t i, BF16 value) const { out[i] = value; }
+};
+template<bool Pack = false, class Store = StoreBf16>
 __device__ __forceinline__ void Attend(const BF16 *query,
         FastllmNaiveDSARow descriptor, const float *sink, BF16 *output,
-        float *scratch, unsigned *completion, int heads, int kvHeads, int row, int group, int split, FastllmMxfp8Activation packed = {}) {
+        float *scratch, unsigned *completion, int heads, int kvHeads, int row, int group, int split, Store store = {}, FastllmMxfp8Activation packed = {}) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_dsa_mma;
     const int t = threadIdx.x, warp = t / 32, lane = t % 32;
@@ -38,7 +46,7 @@ __device__ __forceinline__ void Attend(const BF16 *query,
     if (!count) {
         if (!split) for (int i = t; i < Heads * Values; i += Threads) {
             const BF16 value[] = {__float2bfloat16(0.f)};
-            output[(size_t)row * heads * Values + h0 * Values + i] = value[0];
+            store(output, (size_t)row * heads * Values + h0 * Values + i, value[0]);
             if constexpr (Pack) fastllm_mxfp8::StoreGroup(packed, row, h0 * Values + i, value);
         }
         return;
@@ -57,18 +65,30 @@ __device__ __forceinline__ void Attend(const BF16 *query,
         const int slot = begin + i;
         const int key = slot < count ? (r.indices ? r.indices[slot] : slot) : -1;
         s.valid[i] = key >= 0 && key < length ? key : -1;
+        if constexpr (Store::Packed) {
+            if (s.valid[i] >= 0) {
+                s.physical.key[i] = FastllmNaivePhysicalRow(r, key);
+                s.physical.value[i] = FastllmNaivePhysicalRow(r, key, true);
+            }
+        }
     }
     __syncthreads();
     for (int i = t; i < tokens * 24; i += Threads) {
         const int k = s.valid[i / 24], d = i % 24 * 8;
         const auto *src = static_cast<const BF16 *>(r.key);
-        if (k >= 0) src += (size_t)FastllmNaivePhysicalRow(r, k) * r.keyStride + kh * Dim + d;
+        if (k >= 0) {
+            const int physical = Store::Packed ? s.physical.key[i / 24] : FastllmNaivePhysicalRow(r, k);
+            src += size_t(physical) * r.keyStride + kh * Dim + d;
+        }
         naive_dsa_decode::Copy<true>(&s.key[i / 24][d], src, k >= 0);
     }
     for (int i = t; i < tokens * 16; i += Threads) {
         const int k = s.valid[i / 16], d = i % 16 * 8;
         const auto *src = static_cast<const BF16 *>(r.value);
-        if (k >= 0) src += (size_t)FastllmNaivePhysicalRow(r, k, true) * kvHeads * Values + kh * Values + d;
+        if (k >= 0) {
+            const int physical = Store::Packed ? s.physical.value[i / 16] : FastllmNaivePhysicalRow(r, k, true);
+            src += size_t(physical) * kvHeads * Values + kh * Values + d;
+        }
         naive_dsa_decode::Copy<true>(&s.value[i / 16][d], src, k >= 0);
     }
     for (int i = t; i < Heads * 24; i += Threads)
@@ -144,29 +164,34 @@ __device__ __forceinline__ void Attend(const BF16 *query,
     }
     __syncthreads();
     if (!last) return;
-    float maximum = lane < active ? stats[(lane * Heads + warp) * 2] : -INFINITY;
-    for (int d = 16; d; d /= 2) maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, d));
-    maximum = __shfl_sync(0xffffffff, maximum, 0);
-    if (sink) maximum = fmaxf(maximum, sink[h0 + warp]);
-    // Reuse score storage; each head has its own sixteen correction factors.
-    float *correction = reinterpret_cast<float *>(s.scores) + warp * Splits;
-    if (lane < active) correction[lane] = maximum == -INFINITY ? 0.f
-        : expf(stats[(lane * Heads + warp) * 2] - maximum);
-    __syncwarp();
-    float denominator = 0;
-    if (!lane) {
-        for (int k = 0; k < active; ++k)
-            denominator = fmaf(stats[(k * Heads + warp) * 2 + 1], correction[k], denominator);
-        if (sink) denominator += expf(sink[h0 + warp] - maximum);
-    }
-    denominator = __shfl_sync(0xffffffff, denominator, 0);
-    for (int d = lane; d < Values; d += 32) {
-        float v = 0;
-        for (int k = 0; k < active; ++k)
-            v = fmaf(part[(k * Heads + warp) * Values + d], correction[k], v);
-        const BF16 value[] = {__float2bfloat16(denominator > 0 ? v / denominator : 0.f)};
-        output[((size_t)row * heads + h0 + warp) * Values + d] = value[0];
-        if constexpr (Pack) fastllm_mxfp8::StoreGroup(packed, row, (h0 + warp) * Values + d, value);
+    if constexpr (Store::Packed) {
+        store.Finish(output, (size_t)row * heads + h0 + warp, part, stats,
+                     sink ? sink + h0 + warp : nullptr, active);
+    } else {
+        float maximum = lane < active ? stats[(lane * Heads + warp) * 2] : -INFINITY;
+        for (int d = 16; d; d /= 2) maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, d));
+        maximum = __shfl_sync(0xffffffff, maximum, 0);
+        if (sink) maximum = fmaxf(maximum, sink[h0 + warp]);
+        // Reuse score storage; each head has its own sixteen correction factors.
+        float *correction = reinterpret_cast<float *>(s.scores) + warp * Splits;
+        if (lane < active) correction[lane] = maximum == -INFINITY ? 0.f
+            : expf(stats[(lane * Heads + warp) * 2] - maximum);
+        __syncwarp();
+        float denominator = 0;
+        if (!lane) {
+            for (int k = 0; k < active; ++k)
+                denominator = fmaf(stats[(k * Heads + warp) * 2 + 1], correction[k], denominator);
+            if (sink) denominator += expf(sink[h0 + warp] - maximum);
+        }
+        denominator = __shfl_sync(0xffffffff, denominator, 0);
+        for (int d = lane; d < Values; d += 32) {
+            float v = 0;
+            for (int k = 0; k < active; ++k)
+                v = fmaf(part[(k * Heads + warp) * Values + d], correction[k], v);
+            const BF16 value[] = {__float2bfloat16(denominator > 0 ? v / denominator : 0.f)};
+            store(output, ((size_t)row * heads + h0 + warp) * Values + d, value[0]);
+            if constexpr (Pack) fastllm_mxfp8::StoreGroup(packed, row, (h0 + warp) * Values + d, value);
+        }
     }
     __syncthreads();
     if (!t) {
@@ -179,6 +204,6 @@ template<bool Pack> __global__ __launch_bounds__(Threads, 1) void Attention(cons
         FastllmNaiveDSABatch batch, const float *sink, BF16 *output,
         float *scratch, unsigned *completion, int heads, int kvHeads, FastllmMxfp8Activation packed) {
     Attend<Pack>(query, batch.rows[blockIdx.y], sink, output, scratch, completion, heads, kvHeads,
-        blockIdx.y, blockIdx.z, blockIdx.x, packed);
+        blockIdx.y, blockIdx.z, blockIdx.x, StoreBf16{}, packed);
 }
 } // namespace naive_dsa_split

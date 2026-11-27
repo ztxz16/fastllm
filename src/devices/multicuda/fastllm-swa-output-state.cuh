@@ -32,8 +32,8 @@ public:
     static bool Enabled() {
         return fastllm_swa_settings::Enabled("FASTLLM_NAIVE_SWA_FUSION");
     }
-    static std::unique_ptr<SwaOutputState> Create(const std::vector<int> &requested) {
-        if (requested.size() != 8 || !Enabled()) return {};
+    static std::unique_ptr<SwaOutputState> Create(const std::vector<int> &requested, bool enabled = Enabled()) {
+        if (requested.size() != 8 || !enabled) return {};
         auto state = std::unique_ptr<SwaOutputState>(new SwaOutputState);
         if (!state->Initialize(requested)) { cudaGetLastError(); return {}; }
         return state;

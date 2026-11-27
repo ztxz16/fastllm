@@ -42,7 +42,7 @@ __global__ void CheckOutput(const BF *input, const BF *source, const BF *hidden,
 
 struct Case {
     int count, rank;
-    bool gather;
+    bool gather, exactNorm;
     Data input{BFLOAT16}, hidden{BFLOAT16}, output{BFLOAT16}, weight{FLOAT32};
     Data source{BFLOAT16}, residual{BFLOAT16}, expected{BFLOAT16}, lower{BFLOAT16}, upper{BFLOAT16};
     Data referenceNorm{BFLOAT16};
@@ -50,7 +50,8 @@ struct Case {
     Case(int rows, int rank, int ranks, bool gather) : count(rows * 4096), rank(rank), gather(gather) {
         for (Data *d : {&input, &hidden, &output, &source, &residual, &expected, &lower, &upper})
             Init(*d, {1, rows, 4096}, rank);
-        if (gather) Init(referenceNorm, {1, rows, 4096}, rank);
+        exactNorm = gather || (FastllmCudaRuntimeArch() == 90 && ((rows > 8 && rows <= 16) || rows > 36));
+        if (exactNorm) Init(referenceNorm, {1, rows, 4096}, rank);
         Init(weight, {4096}, rank);
         unsigned seed = 31 + rank + rows * 19;
         auto random = [&]() { seed = seed * 1664525u + 1013904223u; return (int(seed >> 16) - 32768) / 30000.f; };
@@ -77,7 +78,7 @@ struct Case {
         } else Require(FastllmCudaCustomAllReduceRows(input.cudaData, input.cudaData,
             count, 4096, BFLOAT16, rank), "reference collective rejected");
         FastllmCudaNaiveAddDecodeRMSNorm(hidden, input, weight, 1e-5f, output);
-        if (gather)
+        if (exactNorm)
             Check(cudaMemcpyAsync(referenceNorm.cudaData, output.cudaData, count * 2,
                                   cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         Check(cudaMemcpy(h.data(), hidden.cudaData, count * 2, cudaMemcpyDeviceToHost));
@@ -118,7 +119,7 @@ struct Case {
         CheckOutput<<<32, 256, 0, cudaStreamPerThread>>>((const BF *)input.cudaData,
             (const BF *)source.cudaData, (const BF *)hidden.cudaData, (const BF *)expected.cudaData,
             (const BF *)output.cudaData, (const BF *)lower.cudaData, (const BF *)upper.cudaData,
-            (const BF *)referenceNorm.cudaData, gather, count, errors);
+            (const BF *)referenceNorm.cudaData, exactNorm, count, errors);
         Check(cudaGetLastError());
     }
     void Run(int *errors) {
@@ -148,6 +149,12 @@ int main(int argc, char **argv) {
     setenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE", "1", 1);
     Require(FastllmInitNccl(devices) && FastllmCudaCustomAllReduceInit(devices), "initialization failed");
     std::vector<int> shapes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 32, 33, 36, 37, 64, 65, 127, 128, 129, 255, 256, 512, 1024};
+    if (!gather && FastllmCudaRuntimeArch() == 90) {
+        shapes.push_back(1025);
+        shapes.push_back(1537);
+        // Exercise the single-node direct peer path beyond the 8 MiB scratch per rank.
+        shapes.push_back((8 << 20) / ((512 / ranks + 512 % ranks) * 16) + 1);
+    }
     if (gather) {
         shapes.clear();
         for (int n = ranks; n <= 256; n += ranks) shapes.push_back(n);
@@ -179,6 +186,16 @@ int main(int argc, char **argv) {
                     (const float *)c.weight.cudaData, c.output.cudaData, c.count - 1, 4096,
                     1e-5f, BFLOAT16, rank), "partial row accepted");
                 c.Validate(deviceErrors);
+            }
+            if (!gather && FastllmCudaRuntimeArch() == 90) {
+                cudaGraph_t single;
+                Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                Require(c.Fused(c.output.cudaData), "capture rejected");
+                Check(cudaStreamEndCapture(cudaStreamPerThread, &single));
+                size_t nodes;
+                Check(cudaGraphGetNodes(single, nullptr, &nodes));
+                Require(nodes == 1, "all-reduce + add + RMSNorm must be a single node");
+                Check(cudaGraphDestroy(single));
             }
             c.Run(deviceErrors); Check(cudaStreamSynchronize(cudaStreamPerThread));
             cudaGraph_t graph;

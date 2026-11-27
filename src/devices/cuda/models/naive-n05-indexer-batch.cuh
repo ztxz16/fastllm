@@ -157,8 +157,8 @@ __device__ __forceinline__ void MmaFp8(float (&c)[4], const uint32_t (&a)[4], co
 // K occupies the MMA row dimension: each warp produces sixteen key scores.
 // Cache the reused Q in L1, while streaming K directly to shared memory.
 // The caller guarantees 16-byte alignment and retains Scores as the fallback.
-template<bool FP8, bool NativeFp8 = false, int Queries = 1>
-__global__ void HopperScores(const BF16 *weights, Batch batch) {
+template<bool FP8, bool NativeFp8 = false, int Queries = 1, class ScoreBatch = Batch>
+__global__ void HopperScores(const BF16 *weights, ScoreBatch batch) {
     static_assert(Queries > 0 && Queries <= 2, "Invalid query tile.");
     static_assert(!NativeFp8 || FP8, "Native FP8 MMA requires FP8 keys.");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800

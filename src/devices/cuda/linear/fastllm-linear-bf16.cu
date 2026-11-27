@@ -1313,9 +1313,8 @@ bool FastllmCudaPackIndexerWeights(fastllm::Data &wq, fastllm::Data &wk, fastllm
     return true;
 }
 
-bool FastllmCudaIndexerProjection(const fastllm::Data &input,
-        const fastllm::Data &wq, const fastllm::Data &wk, const fastllm::Data &weights,
-        fastllm::Data &query, fastllm::Data &key, fastllm::Data &scores, fastllm::Data &scratch) {
+static bool IndexerProjectionLayout(const fastllm::Data &input, const fastllm::Data &wq,
+        const fastllm::Data &wk, const fastllm::Data &weights) {
     if (input.dataType != fastllm::BFLOAT16 || input.dataDevice != fastllm::DataDevice::CUDA ||
         !input.cudaData || input.dims.empty() || input.dims.back() != kIndexerInput ||
         input.strides.size() != input.dims.size() ||
@@ -1328,7 +1327,131 @@ bool FastllmCudaIndexerProjection(const fastllm::Data &input,
         if (input.strides[i] != elements || input.dims[i] <= 0) return false;
         elements *= input.dims[i];
     }
-    const size_t rows = elements / kIndexerInput;
+    return true;
+}
+
+static void ProjectIndexerRows(const fastllm::Data &input, const fastllm::Data &wq, size_t rows, void *out,
+                               int width = kIndexerQKW) {
+    const auto *x = (const __nv_bfloat16 *)input.cudaData;
+    const auto *w = (const __nv_bfloat16 *)wq.cudaData;
+    auto handle = getFastllmCublasHandle();
+    if (!fastllm_bf16_lt::Matmul(input.cudaData, wq.cudaData, out, rows, kIndexerInput, width)) {
+        const float alpha = 1.0f, beta = 0.0f;
+        const auto status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, width, rows, kIndexerInput,
+            &alpha, w, CUDA_R_16BF, kIndexerInput, x, CUDA_R_16BF, kIndexerInput, &beta,
+            out, CUDA_R_16BF, width, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("Indexer BF16 projection failed.");
+    }
+}
+
+// Match the split-K reduction of the separate Q, K and score projections.
+// The library chooses their algorithms per device. Decline the packed path if
+// they use different partitions, or if that partition does not fit the packed GEMM.
+static bool PlanVerifyIndexer(int rows, fastllm_bf16_lt::State &state, fastllm_bf16_lt::Plan &packed) {
+    namespace lt = fastllm_bf16_lt;
+    lt::SearchResources search;
+    if (!lt::CheckBlas(cublasLtMatmulPreferenceCreate(&search.preference)) ||
+        !lt::CheckBlas(cublasLtMatmulPreferenceSetAttribute(search.preference,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &lt::workspaceBytes, sizeof(lt::workspaceBytes))))
+        return false;
+    auto recommend = [&](lt::Plan &plan, int width, cublasLtMatmulHeuristicResult_t &candidate) {
+        const lt::Key key{rows, width, kIndexerInput, 256, 256, 256, CUDA_R_16BF, 0};
+        int count = 0;
+        return lt::MakeLayouts(plan, key) && lt::CheckBlas(cublasLtMatmulAlgoGetHeuristic(state.handle,
+            plan.op, plan.a, plan.b, plan.c, plan.c, search.preference, 1, &candidate, &count)) &&
+            count == 1 && candidate.state == CUBLAS_STATUS_SUCCESS;
+    };
+    uint32_t split = 0, reduction = 0;
+    for (int width : {kIndexerQ, kIndexerDim, kIndexerHeads}) {
+        lt::Plan reference;
+        cublasLtMatmulHeuristicResult_t candidate{};
+        uint32_t parts = 0, scheme = 0;
+        size_t written = 0;
+        if (!recommend(reference, width, candidate) ||
+            !lt::CheckBlas(cublasLtMatmulAlgoConfigGetAttribute(&candidate.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                &parts, sizeof(parts), &written)) ||
+            !lt::CheckBlas(cublasLtMatmulAlgoConfigGetAttribute(&candidate.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                &scheme, sizeof(scheme), &written))) return false;
+        if (width != kIndexerQ && (parts != split || scheme != reduction)) return false;
+        split = parts;
+        reduction = scheme;
+    }
+    cublasLtMatmulHeuristicResult_t candidate{}, checked{};
+    if (!recommend(packed, kIndexerQKW, candidate)) return false;
+    packed.algo = candidate.algo;
+    return lt::CheckBlas(cublasLtMatmulAlgoConfigSetAttribute(&packed.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+               &split, sizeof(split))) &&
+           lt::CheckBlas(cublasLtMatmulAlgoConfigSetAttribute(&packed.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+               &reduction, sizeof(reduction))) &&
+           lt::CheckBlas(cublasLtMatmulAlgoCheck(state.handle, packed.op, packed.a, packed.b,
+               packed.c, packed.c, &packed.algo, &checked)) &&
+           checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= lt::workspaceBytes;
+}
+
+static bool ProjectWideVerifyIndexer(int rows, const fastllm::Data &input, const fastllm::Data &wq, void *out) {
+    namespace lt = fastllm_bf16_lt;
+    if ((reinterpret_cast<uintptr_t>(input.cudaData) | reinterpret_cast<uintptr_t>(wq.cudaData) |
+         reinterpret_cast<uintptr_t>(out)) & 255) return false;
+    const int device = FastllmCudaGetDevice();
+    cudaStreamCaptureStatus capture;
+    lt::CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    const bool capturing = capture != cudaStreamCaptureStatusNone;
+    auto *state = lt::GetState(device, capturing);
+    if (!state) return false;
+    static thread_local std::map<std::pair<int,int>, std::unique_ptr<lt::Plan>> plans;
+    const auto key = std::make_pair(device, rows);
+    auto it = plans.find(key);
+    if (it == plans.end()) {
+        if (capturing) return false;
+        auto plan = std::make_unique<lt::Plan>();
+        plan->valid = PlanVerifyIndexer(rows, *state, *plan);
+        it = plans.emplace(key, std::move(plan)).first;
+    }
+    const auto &plan = it->second;
+    if (!plan->valid) return false;
+    void *workspace = capturing ? lt::CaptureWorkspace(*state) : state->eager->data;
+    return workspace && lt::Run(*state, *plan, plan->algo, wq.cudaData, input.cudaData, out, workspace);
+}
+
+bool FastllmCudaSm90ProjectVerifyIndexer(const fastllm::Data &input, const fastllm::Data &wq,
+        const fastllm::Data &wk, const fastllm::Data &weights, fastllm::Data &out, bool &planar) {
+    if (!IndexerProjectionLayout(input, wq, wk, weights)) return false;
+    const auto rows = input.Count(0) / kIndexerInput;
+    if (rows < 1 || rows > 128) return false;
+    out.dataType = fastllm::BFLOAT16;
+    out.UpdateUnitSize();
+    out.Resize({static_cast<int>(rows), kIndexerQKW});
+    out.ToDevice(input.dataDevice, input.dataDeviceIds, false);
+    out.Allocate(false);
+    planar = false;
+    if (rows <= 2) {
+        // Keep the scalar/two-row reduction used by the unfused indexer.
+        auto kernel = rows == 1 ? FastllmGemvBf16Bf16WarpRows<kIndexerInput, 1>
+                                : FastllmGemvBf16Bf16WarpRows<kIndexerInput, 2>;
+        kernel<<<(kIndexerQKW + 3) / 4, 128>>>(static_cast<const __nv_bfloat16 *>(input.cudaData),
+            static_cast<const __nv_bfloat16 *>(wq.cudaData), static_cast<__nv_bfloat16 *>(out.cudaData),
+            nullptr, kIndexerQKW, nullptr, nullptr);
+    } else if (rows <= 64) {
+        ProjectIndexerRows(input, wq, rows, out.cudaData);
+    } else if (!ProjectWideVerifyIndexer(rows, input, wq, out.cudaData)) {
+        // Incompatible reference split-K plans retain the three GEMMs. The consumer
+        // reads their contiguous planes from the same allocation without a repack.
+        planar = true;
+        auto *dst = static_cast<__nv_bfloat16 *>(out.cudaData);
+        for (const auto *weight : {&wq, &wk, &weights}) {
+            const int width = weight->dims[0];
+            ProjectIndexerRows(input, *weight, rows, dst, width);
+            dst += rows * width;
+        }
+    }
+    return true;
+}
+
+bool FastllmCudaIndexerProjection(const fastllm::Data &input,
+        const fastllm::Data &wq, const fastllm::Data &wk, const fastllm::Data &weights,
+        fastllm::Data &query, fastllm::Data &key, fastllm::Data &scores, fastllm::Data &scratch) {
+    if (!IndexerProjectionLayout(input, wq, wk, weights)) return false;
+    const size_t rows = input.Count(0) / kIndexerInput;
     // Limit fusion to measured decode batches; larger GEMMs keep the fallback.
     if (rows == 0 || rows > 256) return false;
     auto prepare = [&](fastllm::Data &output, int width) {
@@ -1351,14 +1474,7 @@ bool FastllmCudaIndexerProjection(const fastllm::Data &input,
         FastllmGemvBf16Bf16WarpRows<kIndexerInput, 2, true><<<(kIndexerQKW + 3) / 4, 128>>>(x, w, q, nullptr, kIndexerQKW, k, s);
     } else {
         prepare(scratch, kIndexerQKW);
-        auto handle = getFastllmCublasHandle();
-        if (!fastllm_bf16_lt::Matmul(input.cudaData, wq.cudaData, scratch.cudaData, rows, kIndexerInput, kIndexerQKW)) {
-            const float alpha = 1.0f, beta = 0.0f;
-            const auto status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, kIndexerQKW, rows, kIndexerInput,
-                &alpha, w, CUDA_R_16BF, kIndexerInput, x, CUDA_R_16BF, kIndexerInput, &beta,
-                scratch.cudaData, CUDA_R_16BF, kIndexerQKW, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-            if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("Indexer BF16 projection failed.");
-        }
+        ProjectIndexerRows(input, wq, rows, scratch.cudaData);
         IndexerProjectionUnpack<<<(rows * kIndexerQKW + 255) / 256, 256>>>(
             (const __nv_bfloat16 *)scratch.cudaData, q, k, s, rows);
     }

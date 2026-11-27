@@ -14,13 +14,16 @@ bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime);
 struct NaiveVerifyAttentionPlan {
     bool packed = false, swa = false, dsa = false, replicaLocalDsa = false;
     int replicaArch = 0;
+    bool exportsRingFeature = false, packedIndexer = false;
+    bool hopperRing = false, hopperReplicated = false, hopperContext = false;
     struct Layer {
         bool packed, swa, dsa, replica;
         explicit operator bool() const { return packed || swa || dsa || replica; }
     };
-    Layer ForLayer(bool sliding, bool residual, bool localIndexer, bool packedCache,
+    Layer ForLayer(bool sliding, bool residual, bool localIndexer, int cacheRequests,
                    bool ringCache, bool contextIndex) const;
 };
+bool FastllmCudaVerifyReduceNormSupported(int rows, const std::vector<int> &devices);
 NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, int tpRanks,
         const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,
         int capacity, int indexHeads, int indexDim, int topK, int localAttentionRanks = 0);

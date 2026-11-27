@@ -1,13 +1,9 @@
 #pragma once
+#include "naive-n05-indexer-topk-common.cuh"
 namespace naive_indexer_ordered_topk {
 using namespace naive_indexer_batch;
 using naive_topk::kTopK;
 
-constexpr int Threads = 256, Buckets = 2048;
-// Five mantissa bits per exponent, starting at biased exponent 112.
-// The end buckets also receive values outside this range.
-constexpr int HalfBuckets = Buckets / 2, FirstBin = 112 * 32, BinShift = 18;
-template<int Items> using RadixSort = cub::BlockRadixSort<unsigned, Threads, Items, int, 5>;
 union SortStorage {
     RadixSort<1>::TempStorage one;
     RadixSort<2>::TempStorage two;
@@ -20,46 +16,6 @@ struct Candidates {
 };
 constexpr size_t SharedBytes = sizeof(Candidates) + sizeof(SortStorage);
 static_assert(SharedBytes >= naive_indexer_sortpack::SortBytes<256, 5, true, false>());
-
-// A monotone projection of ordered FP32 bits. Saturation only widens the two
-// end buckets. All selection, ordering and ties use the original 32-bit keys.
-__device__ int Bucket(unsigned key) {
-    const bool positive = key >> 31;
-    const unsigned magnitude = positive ? key ^ 0x80000000u : ~key & 0x7fffffffu;
-    const int coarse = min(HalfBuckets - 1, max(0, int(magnitude >> BinShift) - FirstBin));
-    return positive ? HalfBuckets + coarse : HalfBuckets - 1 - coarse;
-}
-__device__ unsigned LowerBound(int bucket) {
-    if (bucket >= HalfBuckets)
-        return 0x80000000u | (bucket == HalfBuckets ? 0u : unsigned(FirstBin + bucket - HalfBuckets) << BinShift);
-    return bucket == 0 ? 0u : 0x80000000u - (unsigned(FirstBin + HalfBuckets - bucket) << BinShift);
-}
-__device__ uint4 LoadFour(const unsigned *scores, int i, int n, bool aligned) {
-    if (aligned && i + 3 < n) return *reinterpret_cast<const uint4 *>(scores + i);
-    return make_uint4(i < n ? scores[i] : 0, i + 1 < n ? scores[i + 1] : 0,
-                      i + 2 < n ? scores[i + 2] : 0, i + 3 < n ? scores[i + 3] : 0);
-}
-
-template<int Items>
-__device__ void WriteRun(const Candidates &candidates, int start, int count, int keep,
-                         int bits, SortStorage &storage, int *output) {
-    using Sort = RadixSort<Items>;
-    unsigned keys[Items];
-    int positions[Items];
-#pragma unroll
-    for (int j = 0; j < Items; ++j) {
-        const int i = threadIdx.x * Items + j;
-        keys[j] = i < count ? candidates.keys[start + i] : 0;
-        positions[j] = i < count ? candidates.positions[start + i] : -1;
-    }
-    Sort(*reinterpret_cast<typename Sort::TempStorage *>(&storage)).SortDescendingBlockedToStriped(
-        keys, positions, 0, bits);
-#pragma unroll
-    for (int j = 0; j < Items; ++j) {
-        const int i = threadIdx.x + j * Threads;
-        if (i < keep) output[i] = positions[j];
-    }
-}
 
 // One CTA owns one complete logical score row. Items above the cutoff bucket
 // precede every item inside it, so the two stable sorts write disjoint ranks.

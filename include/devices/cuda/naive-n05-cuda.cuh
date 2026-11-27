@@ -188,6 +188,48 @@ bool FastllmCudaNaiveVerifySwaRing8(const fastllm::Data &packed, fastllm::Data &
         const fastllm::Data &k, const fastllm::Data &v, const fastllm::Data &positions,
         const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
         float theta, float valueScale, const fastllm::Data &sink, fastllm::Data &attention, FastllmMxfp8Activation output);
+struct FastllmNaiveHopperIndexer {
+    const fastllm::Data *wq, *wk, *weights, *norm, *bias;
+    fastllm::Data *indices;
+    int rank;
+};
+void FastllmCudaNaiveHopperRouterAfterNorm(const void *input, const float *weight, float *output, int rows);
+bool FastllmCudaNaiveHopperReduceNormRouter(const fastllm::Data &projection, fastllm::Data &hidden,
+        const fastllm::Data &gamma, fastllm::Data &normed, const fastllm::Data &weight,
+        fastllm::Data &router, float eps, int gpu);
+// TP8 verification for Hopper block-32 FP8 projections. All ranks agree on
+// admission before a single cooperative graph node updates KV and the residual.
+bool FastllmCudaNaiveHopperVerifyLayer(const fastllm::Data &input, const fastllm::Data &qkvWeight,
+                                       const fastllm::Data &bias, const fastllm::Data &outWeight,
+                                       const fastllm::Data &norm, const fastllm::Data &sink,
+                                       const fastllm::Data &positions, fastllm::Data &q, fastllm::Data &attn,
+                                       fastllm::Data &projected, fastllm::Data &hidden, fastllm::Data &normed,
+                                       fastllm::Data &scratch, const std::vector<FastllmNaiveDSARow> &rows,
+                                       int stride, bool ring, float theta, float valueScale, float eps, int gpu,
+                                       const FastllmNaiveHopperIndexer *indexer,
+                                       const fastllm::Data *routerWeight, fastllm::Data *router);
+// Wide row descriptors are uploaded at warmup. Their owner must outlive graph replay.
+bool FastllmCudaNaiveHopperVerifyLayer(const fastllm::Data &input, const fastllm::Data &qkvWeight,
+                                       const fastllm::Data &bias, const fastllm::Data &outWeight,
+                                       const fastllm::Data &norm, const fastllm::Data &sink,
+                                       const fastllm::Data &positions, fastllm::Data &q, fastllm::Data &attn,
+                                       fastllm::Data &projected, fastllm::Data &hidden, fastllm::Data &normed,
+                                       fastllm::Data &scratch, const std::vector<FastllmNaiveDSARow> &rows,
+                                       int stride, bool ring, float theta, float valueScale, float eps, int gpu,
+                                       const FastllmNaiveHopperIndexer *indexer,
+                                       const fastllm::Data *routerWeight, fastllm::Data *router,
+                                       std::shared_ptr<void> *wideBindings);
+// A split SWA verify can export the preceding layer residual while packing QKV input.
+bool FastllmCudaNaiveHopperVerifyLayer(const fastllm::Data &input, const fastllm::Data &qkvWeight,
+                                       const fastllm::Data &bias, const fastllm::Data &outWeight,
+                                       const fastllm::Data &norm, const fastllm::Data &sink,
+                                       const fastllm::Data &positions, fastllm::Data &q, fastllm::Data &attn,
+                                       fastllm::Data &projected, fastllm::Data &hidden, fastllm::Data &normed,
+                                       fastllm::Data &scratch, const std::vector<FastllmNaiveDSARow> &rows,
+                                       int stride, bool ring, float theta, float valueScale, float eps, int gpu,
+                                       const FastllmNaiveHopperIndexer *indexer,
+                                       const fastllm::Data *routerWeight, fastllm::Data *router,
+                                       std::shared_ptr<void> *wideBindings, fastllm::Data *feature);
 bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &v, const fastllm::Data &positions,
     const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
@@ -360,6 +402,7 @@ struct FastllmNaiveDecodeScratch {
     fastllm::Data indexQuery, indexScale, indexScores, topk;
     fastllm::Data attentionScores, attentionPartial, windowKey, windowValue;
     fastllm::Data attentionCompletion, dsaFrontReady, dsaFused, dsaLayer;
+    std::map<std::tuple<const void *, const void *, size_t, int>, std::shared_ptr<void>> wideBindings;
 };
 // One query per independent sequence, up to 2048 selected keys. KV stays in
 // place, and descriptors are kernel arguments. Graph replay reads device lengths
@@ -418,6 +461,10 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
     const fastllm::Data &branch, const fastllm::Data &weight,
     float eps, fastllm::Data &output, FastllmMxfp8Activation *packed);
+
+bool FastllmCudaNaiveTryAddRMSNormFeature(fastllm::Data &hidden, const fastllm::Data &branch,
+        const fastllm::Data &weight, float eps, fastllm::Data &output, FastllmMxfp8Activation packed,
+        fastllm::Data &features, int column, int columns);
 
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &newKey, const fastllm::Data &newValue,

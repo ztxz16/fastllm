@@ -26,6 +26,10 @@ bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime) {
     return FastllmCudaStablePrefillReduction(archs);
 }
 
+bool FastllmCudaVerifyReduceNormSupported(int rows, const std::vector<int> &devices) {
+    return rows <= 8 || (rows > 16 && rows <= 128) || FastllmCudaNaiveHopperGroup(devices);
+}
+
 NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, int tpRanks,
         const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,
         int capacity, int indexHeads, int indexDim, int topK, int localAttentionRanks) {
@@ -35,8 +39,27 @@ NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, in
     plan.packed = requests && requests->size() == 1 && FastllmCudaPackedVerifySupported(rows, tpRanks);
     if (localAttentionRanks == 1) {
         plan.replicaArch = FastllmCudaRuntimeArch();
-        plan.replicaLocalDsa = localDsa && (plan.replicaArch == 103 || plan.replicaArch == 120);
+        plan.replicaLocalDsa = localDsa && (plan.replicaArch == 90 || plan.replicaArch == 103 || plan.replicaArch == 120);
     }
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+    const bool hopper = FastllmCudaRuntimeArch() == 90;
+    const bool index = indexHeads == 16 && indexDim == 128 && topK == 2048;
+    // Independent attention ranks project the padded verification group in one GEMM.
+    // Their local Q and head weights are consumed even in the short-context buckets.
+    plan.packedIndexer = hopper && index && !requests && !integratedExperts &&
+                         capacity > 0 && rows > 0 && rows <= 256;
+    // Hopper TP attention materializes its residual independently of the expert layout.
+    if (requests && hopper && !requests->empty() &&
+        std::all_of(requests->begin(), requests->end(), [](int n) { return n > 0; })) {
+        plan.hopperRing = ringCache;
+        plan.exportsRingFeature = ringCache && rows <= 8 && requests->size() == 1;
+        plan.hopperReplicated = index && localDsa && requests->size() == 1 && rows <= 8;
+        plan.hopperContext = index && capacity > 2048 && capacity <= 8192;
+        plan.packedIndexer = index && capacity > topK &&
+            std::all_of(requests->begin(), requests->end(), [](int n) { return n <= 8; });
+        return plan;
+    }
+#endif
     if (requests && integratedExperts) {
         plan.swa = ringCache && rows <= 16 && FastllmCudaSwaVerifyLayerSupported(device, rows);
         plan.dsa = localDsa && FastllmCudaLocalDsaLayerSupported(*requests, rows, capacity, indexHeads, indexDim, topK);
@@ -45,9 +68,12 @@ NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, in
     return plan;
 }
 NaiveVerifyAttentionPlan::Layer NaiveVerifyAttentionPlan::ForLayer(bool sliding, bool residual, bool localIndexer,
-        bool packedCache, bool ringCache, bool contextIndex) const {
-    const bool replicaSwa = replicaArch == 100 || replicaArch == 103 || replicaArch == 120;
+        int cacheRequests, bool ringCache, bool contextIndex) const {
+    const bool packedCache = cacheRequests == 1 || (cacheRequests > 1 && replicaArch == 90);
+    const bool replicaSwa = replicaArch == 90 || replicaArch == 100 || replicaArch == 103 || replicaArch == 120;
     const bool replicaDsa = replicaLocalDsa || (replicaArch == 120 && contextIndex);
+    if (!residual && (sliding ? hopperRing && ringCache :
+        localIndexer && (hopperReplicated || (hopperContext && contextIndex)))) return {true, false, false, false};
     return {packed && packedCache && (sliding ? ringCache : !residual && localIndexer && contextIndex),
             sliding && residual && swa, !sliding && localIndexer && dsa,
             packedCache && !residual && (sliding ? ringCache && replicaSwa : localIndexer && replicaDsa)};
@@ -75,9 +101,11 @@ void RunContextVerifyIndexer(const Data &query, const Data &weights,
     }
     // Every rank derives the same exchange width from the graph capacity,
     // including ranks whose final page is empty during replay.
-    const int directWidth = rows == 8 && ranks == 8 && page > 0 && page % ranks == 0 &&
-        capacity <= 2048 * ranks && FastllmCudaNaiveIndexerContextSupported(devices, true)
-        ? ContextCandidateWidth(capacity, page, ranks) : 0;
+    const int width = ranks > 0 && page > 0 ? ContextCandidateWidth(capacity, page, ranks) : 0;
+    const bool hopper = FastllmCudaNaiveHopperGroup(devices);
+    const int directWidth = (hopper ? (width < 2048 || rows < 16) : rows == 8) && ranks == 8 && page > 0 && page % ranks == 0 &&
+        (hopper || capacity <= 2048 * ranks) && (hopper || FastllmCudaNaiveIndexerContextSupported(devices, true))
+        ? width : 0;
     const int rowWords = (directWidth ? directWidth : 2048) * 2, part = rows * rowWords;
     exchange.dataType = INT32; exchange.Resize({ranks * part});
     exchange.ToDevice(query.dataDevice, query.dataDeviceIds, false); exchange.Allocate(false);

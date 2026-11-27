@@ -25,6 +25,13 @@ constexpr int kTaggedPeerThreads = 256;
 constexpr int kTaggedPeerBuffers = 3;
 constexpr uint64_t kTaggedPeerEpochPeriod = 0xffffffffULL;
 
+// A frame can retain a high tag from the preceding generation if message
+// sizes shrink after wrap and grow again. Sweep on both sides so no earlier
+// payload can match a new tag before the current producer publishes it.
+__device__ __forceinline__ bool TaggedPeerClearUnused(uint32_t tag) {
+    return tag <= kTaggedPeerBuffers || tag > kTaggedPeerEpochPeriod - kTaggedPeerBuffers;
+}
+
 __device__ __forceinline__ uint64_t TaggedPeerLoad(const uint64_t *p) {
     uint64_t x = 0;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -33,6 +40,30 @@ __device__ __forceinline__ uint64_t TaggedPeerLoad(const uint64_t *p) {
 #endif
     return x;
 }
+// All eight ranks publish a BF16 pair at the same offset of their own slot.
+__device__ __forceinline__ unsigned TaggedPeerReduceBf16Pair(const char *local, size_t slotBytes, uint32_t tag) {
+    uint64_t packets[8];
+    bool ready;
+    do {
+        ready = true;
+        #pragma unroll
+        for (int rank = 0; rank < 8; ++rank) {
+            packets[rank] = TaggedPeerLoad(reinterpret_cast<const uint64_t *>(local + rank * slotBytes));
+            ready &= uint32_t(packets[rank]) == tag;
+        }
+    } while (!ready);
+    float2 sum{};
+    #pragma unroll
+    for (int rank = 0; rank < 8; ++rank) {
+        unsigned bits = uint32_t(packets[rank] >> 32);
+        float2 value = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&bits));
+        if (rank == 0) sum = value;
+        else { sum.x += value.x; sum.y += value.y; }
+    }
+    const auto rounded = __floats2bfloat162_rn(sum.x, sum.y);
+    return *reinterpret_cast<const unsigned *>(&rounded);
+}
+
 struct TaggedPeerPointers {
     char *data[8]{};
     char *multicast = nullptr;
@@ -54,6 +85,19 @@ __device__ __forceinline__ void TaggedPeerStore(
     }
 #endif
 }
+// Captured by the fused SWA layer on the same ordered TP stream.
+struct TaggedPeerView {
+    TaggedPeerPointers peers;
+    uint64_t *epochs = nullptr;
+    size_t slotBytes = 0, frameBytes = 0;
+    __device__ __forceinline__ void Publish(size_t offset, uint64_t payload) const {
+        if (peers.multicast)
+            TaggedPeerStore<8, true>(offset, payload, peers);
+        else
+            TaggedPeerStore<8>(offset, payload, peers);
+    }
+};
+
 template <int Ranks, bool Float32 = false, bool Multicast = false>
 __global__ void FastllmCustomTaggedAllReduceKernel(
         const void *input, void *output,
@@ -67,10 +111,7 @@ __global__ void FastllmCustomTaggedAllReduceKernel(
     }
     __syncthreads();
     const uint32_t tag = uint32_t(step) + 1;
-    // Clear unused words on the LAST use of each frame before wrap. Clearing
-    // after wrap would let a reader accept an old matching tag before its
-    // producer arrives. The period is divisible by the three-frame ring size.
-    const bool clearUnused = tag >= kTaggedPeerEpochPeriod - 2;
+    const bool clearUnused = TaggedPeerClearUnused(tag);
     const size_t base = (step % kTaggedPeerBuffers) * frameBytes;
     const int first = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
@@ -134,10 +175,7 @@ __global__ void FastllmCustomTaggedReduceGatherKernel(
     }
     __syncthreads();
     const uint32_t tag = uint32_t(step) + 1;
-    // Clear unused words on the LAST use of each frame before wrap. Clearing
-    // after wrap would let a reader accept an old matching tag before its
-    // producer arrives. The period is divisible by the three-frame ring size.
-    const bool clearUnused = tag >= kTaggedPeerEpochPeriod - 2;
+    const bool clearUnused = TaggedPeerClearUnused(tag);
     const size_t base = (step % kTaggedPeerBuffers) * frameBytes;
     const int first = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
@@ -210,7 +248,7 @@ __global__ void FastllmCustomTaggedFloatAllReduceKernel(
     }
     __syncthreads();
     const uint32_t tag = uint32_t(step) + 1;
-    const bool clearUnused = tag >= kTaggedPeerEpochPeriod - 2;
+    const bool clearUnused = TaggedPeerClearUnused(tag);
     const size_t base = (step % kTaggedPeerBuffers) * frameBytes;
     const int first = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
@@ -292,6 +330,19 @@ public:
     bool CanUse(int count, bool fp32 = false) const {
         if (verifySm103 && (fp32 || count != 6 * 5120)) return false;
         return ready && count > 0 && count <= kTaggedPeerMaxElements && count % 64 == 0;
+    }
+
+    // Direct BF16 publications use one tagged word per pair and no gather
+    // workspace. The rollover sweep covers all payload words in the frame.
+    bool CanUseBf16Publish(int elements) const {
+        return ready && elements > 0 && elements % 64 == 0 && elements / 2 <= kTaggedPeerMaxElements * 3 / 2;
+    }
+
+    TaggedPeerView View(int rank) const {
+        auto mapped = peers;
+        if (multicast)
+            mapped.multicast = multicast->Broadcast(rank);
+        return {mapped, epochs[rank], slotBytes, frameBytes};
     }
 
     bool Launch(const void *input, void *output, int count, int rank, bool fp32 = false) const {

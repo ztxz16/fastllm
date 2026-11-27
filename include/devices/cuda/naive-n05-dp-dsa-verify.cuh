@@ -12,3 +12,17 @@ bool FastllmCudaTryDpDSAVerify(const fastllm::Data &normalized, const fastllm::D
         const fastllm::Data &value, const void *const *binding, int capacity, float theta,
         float valueScale, FastllmMxfp8Activation packed, FastllmNaiveDecodeScratch &scratch,
         fastllm::Data &attention, bool overlapQkv = false);
+
+struct FastllmNaiveRopeCacheRow;
+bool FastllmCudaTryDpDSAVerify(const fastllm::Data &normalized, const fastllm::Data &qkv,
+        const fastllm::Data &wk, const fastllm::Data &wq, const fastllm::Data &weights,
+        const fastllm::Data &keyNorm, const fastllm::Data &keyBias, const fastllm::Data &sink,
+        const fastllm::Data &positions, const fastllm::Data &live, const fastllm::Data &key,
+        const fastllm::Data &value, const void *const *binding, int capacity, float theta,
+        float valueScale, FastllmMxfp8Activation packed, FastllmNaiveDecodeScratch &scratch,
+        fastllm::Data &attention, bool overlapQkv, const FastllmNaiveRopeCacheRow *second, int firstRows);
+
+struct FastllmNaiveVerifyAttentionInput;
+bool FastllmCudaSm90VerifyDsaBatch(const FastllmNaiveVerifyAttentionInput &input, FastllmMxfp8Activation packed);
+bool FastllmCudaSm90ProjectVerifyIndexer(const fastllm::Data &input, const fastllm::Data &wq,
+        const fastllm::Data &wk, const fastllm::Data &weights, fastllm::Data &out, bool &planar);

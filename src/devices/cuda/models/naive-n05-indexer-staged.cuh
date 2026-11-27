@@ -28,9 +28,9 @@ __device__ __forceinline__ void LoadStagedKey(const Row &r,int first,int n,int t
 // Reuse the released K tile with a 17-float pitch. Every key retains
 // its original ordered sixteen-head FP32 FMA sequence.
 __device__ __forceinline__ int SharedHeadOffset(int row, int head) { return row * 17 + head; }
-template<int Queries = 1>
+template<int Queries = 1, class ScoreBatch = Batch>
 __global__ __launch_bounds__(128, Queries == 4 ? 6 : Queries == 2 ? 8 : 10)
-void HopperScoresSharedHead(const BF16 *weights,Batch batch) {
+void HopperScoresSharedHead(const BF16 *weights,ScoreBatch batch) {
     static_assert(Queries == 1 || Queries == 2 || Queries == 4);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890 && CUDART_VERSION >= 12040
     using namespace naive_dsa_mma;
