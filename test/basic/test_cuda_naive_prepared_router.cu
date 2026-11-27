@@ -211,16 +211,22 @@ __global__ void ReferenceWide(const BF16*x,int rows,uint8_t*out,int*counts,uint6
  if(k==0&&t<16)out[row*4112+4096+t]=0;
 }
 void ValidateWideRouter(){
- ck(cudaSetDevice(0));constexpr int B=16*4240, Modes=2;
+ ck(cudaSetDevice(0));constexpr int B=16*4240, Modes=3;
  auto*x=alloc<BF16>(16*4096);auto*w=alloc<float>(256*4096);auto*g=alloc<float>(4096);
  BF16*n[Modes];float*y[Modes];FastllmMoePreparedInput p[Modes];uint8_t*buf[Modes];
  for(int j=0;j<Modes;++j){n[j]=alloc<BF16>(17*4096);y[j]=alloc<float>(17*256);buf[j]=alloc<uint8_t>(B+128);p[j].block128=buf[j]+64;p[j].counters=alloc<int>(256);p[j].epoch=alloc<uint64_t>(1);}
  std::mt19937 gen(78912);std::normal_distribution<float>d;std::vector<BF16>hx(16*4096);std::vector<float>hw(256*4096),hg(4096);
  for(auto&v:hw)v=.02f*d(gen);for(auto&v:hg)v=1.f+.2f*d(gen);
  ck(cudaMemcpy(w,hw.data(),hw.size()*4,cudaMemcpyHostToDevice));ck(cudaMemcpy(g,hg.data(),hg.size()*4,cudaMemcpyHostToDevice));
+ auto *delayed=alloc<BF16>(16*4096);
  auto run=[&](int mode,int rows,const float*weight){
   if(mode==0){NormRowsRouterDirect<8,4,false><<<dim3(32,(rows+3)/4),256,0,cudaStreamPerThread>>>(x,weight,y[0],g,n[0],1e-6f,rows,{});ReferenceWide<<<512,128,0,cudaStreamPerThread>>>(n[0],rows,p[0].block128,p[0].counters,p[0].epoch);}
   if(mode==1)NormRowsRouterDirect<8,4,true,16><<<dim3(32,4),256,0,cudaStreamPerThread>>>(x,weight,y[1],g,n[1],1e-6f,rows,p[1]);
+  if(mode==2){
+   DelayedResidual<<<256,32,0,cudaStreamPerThread>>>((const uint4*)x,(uint4*)delayed);
+   ck(fastllm::cuda_launch::LaunchProgrammatic<NormRowsRouterDirect<8,4,true,16,false,true>>(
+       dim3(32,4),256,0,cudaStreamPerThread,delayed,weight,y[2],g,n[2],1e-6f,rows,p[2],(const BF16*)nullptr,(BF16*)nullptr));
+  }
  };
  for(int rows=9;rows<=16;++rows){
   cudaGraph_t graph;cudaGraphExec_t exec;
@@ -229,6 +235,7 @@ void ValidateWideRouter(){
    float amplitude=seed%4==0?0.f:seed%4==1?.01f:seed%4==2?1.f:100.f;
    for(auto&v:hx)v=__float2bfloat16_rn(amplitude*d(gen));ck(cudaMemcpy(x,hx.data(),hx.size()*2,cudaMemcpyHostToDevice));
    for(int j=0;j<Modes;++j){ck(cudaMemset(n[j],0x55,17*4096*2));ck(cudaMemset(y[j],0x55,17*256*4));ck(cudaMemset(buf[j],0x55,B+128));ck(cudaMemset(p[j].counters,0x55,1024));uint64_t ep=123+seed;ck(cudaMemcpy(p[j].epoch,&ep,8,cudaMemcpyHostToDevice));}
+   ck(cudaMemset(delayed,0xff,16*4096*sizeof(BF16)));
    if(seed%2)ck(cudaGraphLaunch(exec,cudaStreamPerThread));else for(int j=0;j<Modes;++j)run(j,rows,w);
    ck(cudaStreamSynchronize(cudaStreamPerThread));
    for(int j=1;j<Modes;++j){need(SameBits(read(n[0],17*4096),read(n[j],17*4096)),"wide norm/guard differs");need(SameBits(read(y[0],17*256),read(y[j],17*256)),"wide router/guard differs");need(read(buf[0],B+128)==read(buf[j],B+128),"wide FP8 block128/guard differs");}
@@ -238,5 +245,5 @@ void ValidateWideRouter(){
  }
  puts("WIDE_ROUTER_PASS rows9..16 seeds32 changing_graph norm_router_block128_guard_bitwise=1");
  for(int j=0;j<Modes;++j){ck(cudaFree(n[j]));ck(cudaFree(y[j]));ck(cudaFree(buf[j]));ck(cudaFree(p[j].counters));ck(cudaFree(p[j].epoch));}
- ck(cudaFree(x));ck(cudaFree(w));ck(cudaFree(g));
+ ck(cudaFree(delayed));ck(cudaFree(x));ck(cudaFree(w));ck(cudaFree(g));
 }

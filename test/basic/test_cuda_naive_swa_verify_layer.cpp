@@ -7,6 +7,7 @@
 #include "utils/utils.h"
 #include "naive_n05_mxfp8_test.h"
 #include <cuda_runtime_api.h>
+#include <cuda_fp8.h>
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -29,6 +30,7 @@ void Cuda(cudaError_t e) {
     Require(e == cudaSuccess, cudaGetErrorString(e));
 }
 bool testMxProjection = false;
+bool testFp8KV = false;
 template <class F> void Parallel(F fn) {
     std::array<std::exception_ptr, 8> errors{};
     std::vector<std::thread> workers;
@@ -73,8 +75,8 @@ void Fill(Data &x, unsigned seed, float scale = 1.f, float bias = 0.f) {
         if (x.dataType == BFLOAT16) {
             uint16_t bits = Float32ToBFloat16RNEBits(value);
             std::memcpy(bytes.data() + i * 2, &bits, 2);
-        } else
-            std::memcpy(bytes.data() + i * 4, &value, 4);
+        } else if (x.dataType == FP8_E4M3) bytes[i] = __nv_fp8_e4m3(value).__x;
+        else std::memcpy(bytes.data() + i * 4, &value, 4);
     }
     Cuda(cudaMemcpy(x.cudaData, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
 }
@@ -122,6 +124,10 @@ struct State {
         Init(q, {1, rows, 1536}, rank);
         Init(attn, {1, rows, 1024}, rank);
         Init(router, {1, rows, 256}, rank);
+        if (testFp8KV) {
+            key.dataType = value.dataType = FP8_E4M3;
+            key.UpdateUnitSize(); value.UpdateUnitSize();
+        }
         Init(key, {requests, 136, 192}, rank);
         Init(value, {requests, 136, 128}, rank);
     }
@@ -180,8 +186,8 @@ struct Tensors {
         auto &s = useAlternate ? alternate : actual;
         std::vector<const void *> ptrs;
         for (int i = 0; i < requests; ++i) {
-            ptrs.push_back((char *)s.key.cudaData + i * 136 * 192 * 2);
-            ptrs.push_back((char *)s.value.cudaData + i * 136 * 128 * 2);
+            ptrs.push_back((char *)s.key.cudaData + i * 136 * 192 * s.key.unitSize);
+            ptrs.push_back((char *)s.value.cudaData + i * 136 * 128 * s.value.unitSize);
         }
         Cuda(cudaMemcpy(table, ptrs.data(), ptrs.size() * sizeof(void *), cudaMemcpyHostToDevice));
     }
@@ -230,6 +236,10 @@ struct Tensors {
         CopyDevice(s.feature, s.hidden);
         std::vector<Data> keys(requests), values(requests);
         auto bindings = Bindings(s, keys, values, false);
+        if (qkv.dataType == FP8_E4M3) {
+            Init(scratch, {1, rows, 1856}, rank);
+            Require(VerifyMxLinearReference(s.normed, qkv, bias, scratch, rows, 4096, 1856), "MXFP8 QKV");
+        }
         for (int first = 0; first < rows; first += 8) {
             const int count = std::min(8, rows - first);
             Data n, q, p, l;
@@ -242,10 +252,10 @@ struct Tensors {
             std::vector<FastllmNaiveRopeCacheRow> chunk(bindings.begin() + first,
                                                         bindings.begin() + first + count);
             if (qkv.dataType == FP8_E4M3) {
-                Init(scratch,{1,count,1856},rank);
-                Require(VerifyMxLinearReference(n,qkv,bias,scratch,count,4096,1856),"MXFP8 QKV");
+                Data raw;
+                View(raw, scratch, size_t(first) * 1856, {1, count, 1856});
                 Require(FastllmCudaNaiveBatchRopeAppendCache(q,kTemp,vTemp,p,chunk,l,8,1,192,128,64,
-                    config.theta,config.valueScale,128,&scratch,false),"MXFP8 reference RoPE");
+                    config.theta,config.valueScale,128,&raw,false),"MXFP8 reference RoPE");
             } else
             Require(FastllmCudaNaiveBatchQkvRopeAppendCache(n, qkv, bias, q, kTemp, vTemp, p, chunk, l, 8, 1,
                                                             192, 128, 64, config.theta, config.valueScale,
@@ -255,7 +265,7 @@ struct Tensors {
         std::vector<FastllmNaiveSWARow> attention;
         for (auto &b : bindings)
             attention.push_back(
-                {b.key->cudaData, b.value->cudaData, nullptr, false, true, 0, b.verifyOffset});
+                {b.key->cudaData, b.value->cudaData, nullptr, b.key->dataType == FP8_E4M3, true, 0, b.verifyOffset});
         FastllmCudaNaiveBatchSWADecode(s.q, hasSink ? sink : bias, attention, live, 8, 1, s.attn);
         Require((o.dataType == FP8_E4M3 ? VerifyMxLinearReference : FastllmCudaBFloat16MatMulBFloat16)(s.attn, o, bias, s.projected, rows, 1024, 4096),
                 "reference projection failed");
@@ -326,13 +336,15 @@ struct Tensors {
             a[6] = &alternate.value;
         }
         const auto liveBytes = Read(live);
-        for (size_t kind = 0; kind < 8; ++kind) {
+        for (size_t kind : {5, 6, 2, 3, 4, 0, 1, 7}) {
             auto av = Read(*a[kind]), bv = Read(*b[kind]);
             const bool cache = kind == 5 || kind == 6;
             // Native MXFP8 QKV and BF16 attention retain both rounding boundaries.
-            if (testMxProjection && (kind == 2 || kind == 3 || cache) && av != bv)
+            // FP8 standalone attention can use a different reduction order. Q, K and V still match byte for byte.
+            if (testMxProjection && (kind == 2 || (kind == 3 && !testFp8KV) || cache) && av != bv)
                 throw std::runtime_error(std::string(names[kind]) + " differs from native MXFP8 reference");
 
+            if (cache && testFp8KV) { Require(av == bv, "FP8 KV byte mismatch"); continue; }
             const size_t width = cache ? (kind == 5 ? 192 : 128) : a[kind]->Count(0) / rows;
             for (int row = 0; row < rows; ++row) {
                 int length;
@@ -356,6 +368,7 @@ struct Tensors {
 } // namespace
 int main(int argc, char **argv) {
     try {
+        testFp8KV = argc > 2 && std::strcmp(argv[2],"--fp8-kv")==0;
         const bool mx = argc > 1 && std::strcmp(argv[1],"--mxfp8")==0;
         testMxProjection = mx;
         const bool fusionDisabled = argc > 1 && std::strcmp(argv[1], "--disabled") == 0;
@@ -379,7 +392,7 @@ int main(int argc, char **argv) {
             return 77;
         int cases = 0;
         std::array<double, 8> maximum{};
-        for (int rows : mx ? std::vector<int>{2, 3, 4, 5, 6, 7, 8} : std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 36, 48, 63, 64, 8}) {
+        for (int rows : testFp8KV ? std::vector<int>{2, 5, 8, 9, 16, 31, 36, 64} : mx ? std::vector<int>{2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64} : std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 36, 48, 63, 64, 8}) {
             std::array<std::unique_ptr<Tensors>, 8> data;
             std::array<int, 8> accepted{};
             Parallel([&](int r) {

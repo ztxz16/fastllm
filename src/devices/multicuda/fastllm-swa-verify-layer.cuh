@@ -4,7 +4,9 @@
 // Borrow original BF16 weights and existing graph-owned output/mailbox storage.
 // Rows are flattened queries, with per-request candidate offsets in [0,7].
 #include <cooperative_groups.h>
+#include "devices/cuda/naive-n05-kv.cuh"
 #include "../cuda/models/naive-n05-mxfp8-projection.cuh"
+#include "../cuda/models/naive-n05-attention-bulk.cuh"
 #include "fastllm-swa-output.cuh"
 #include "../cuda/models/naive-n05-swa-mma.cuh"
 #include "../cuda/models/naive-n05-swa-ready.cuh"
@@ -40,7 +42,7 @@ struct Args {
     const __nv_bfloat162 *rotary = nullptr;
     float eps, theta, scale;
     int rows, rank;
-    bool overlapRouter = false;
+    bool overlapRouter = false, fp8Cache = false;
     BatchSwaKeys bindings;
     Peers peers;
     uint64_t *epochs;
@@ -548,7 +550,8 @@ __global__ __launch_bounds__(Threads, 1) void Layer(
 }
 // Packed native QKV needs no cross-CTA projection reduction. Stage the
 // current head locally, and publish all candidate KV slots once per layer.
-__device__ __forceinline__ void RotatePair(const BF16 *src, BF16 *dst, int d, const Args &a, int row) {
+template<class Destination>
+__device__ __forceinline__ void RotatePair(const BF16 *src, Destination dst, int d, const Args &a, int row) {
     float cosine, sine;
     if (a.rotary) {
         const float2 pair = __bfloat1622float2(a.rotary[row * 32 + d]);
@@ -567,7 +570,7 @@ __device__ __forceinline__ void RotatePair(const BF16 *src, BF16 *dst, int d, co
 // The QKV producer updates projected, hidden and the rotary table. Its
 // ordinary-stream preparation has already ordered the request descriptors
 // and committed ring. Only the candidate slots depend on this layer's QKV.
-template<int Tile>
+template<int Tile, bool FP8>
 __device__ __forceinline__ void StageHistory(const Args &a, int row, int valueTile) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (row >= a.rows) return;
@@ -585,23 +588,51 @@ __device__ __forceinline__ void StageHistory(const Args &a, int row, int valueTi
         const int physical = (first + slot) & 127;
         const int col = (vector ^ (slot & (Tile / 8 - 1))) * 8;
         unsigned dst = __cvta_generic_to_shared(values + slot * Tile + col);
-        asm volatile("cp.async.cg.shared.global [%0],[%1],16;" :: "r"(dst),
-                     "l"(v + physical * 128 + valueTile * Tile + vector * 8) : "memory");
+        const int offset = physical * 128 + valueTile * Tile + vector * 8;
+        if constexpr (FP8)
+            *reinterpret_cast<uint4 *>(values + slot * Tile + col) =
+                FastllmNaiveKVRow(reinterpret_cast<const uint8_t *>(v) + offset, true).Load8();
+        else
+            asm volatile("cp.async.cg.shared.global [%0],[%1],16;" :: "r"(dst), "l"(v + offset) : "memory");
     }
     if (committed >= PackedSwaStagedKeys) {
         auto *keys = values + 128 * Tile;
         const auto *k = binding.cache ? static_cast<const BF16 *>(binding.cache[0]) : binding.key;
-        for (int i = threadIdx.x; i < committed * 24; i += blockDim.x) {
-            const int slot = i / 24, col = i % 24 * 8;
-            unsigned dst = __cvta_generic_to_shared(keys + i * 8);
-            asm volatile("cp.async.cg.shared.global [%0],[%1],16;" :: "r"(dst),
-                         "l"(k + ((first + slot) & 127) * 192 + col) : "memory");
+        constexpr int vectors = 192 / 8;
+        for (int i = threadIdx.x; i < committed * vectors; i += blockDim.x) {
+            const int slot = i / vectors, word = i % vectors;
+            unsigned dst = __cvta_generic_to_shared(reinterpret_cast<uint4 *>(keys) + i);
+            const int index = ((first + slot) & 127) * vectors + word;
+            if constexpr (FP8) {
+                *reinterpret_cast<uint4 *>(keys + i * 8) =
+                    FastllmNaiveKVRow(reinterpret_cast<const uint8_t *>(k) + index * 8, true).Load8();
+            } else {
+                auto *src = reinterpret_cast<const uint4 *>(k) + index;
+                asm volatile("cp.async.cg.shared.global [%0],[%1],16;" :: "r"(dst), "l"(src) : "memory");
+            }
         }
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
 #endif
 }
-template<int Threads>
+template<bool FP8>
+__device__ __forceinline__ void WritePackedKV(const Args &a, int row, int kvLane) {
+    if (kvLane >= 0 && kvLane < 288 && a.bindings.length[row] > 0) {
+        const auto &binding = a.bindings.rows[row];
+        const int slot = 128 + binding.verifyOffset;
+        const BF16 *kv = a.projected + row * 1856 + 1536;
+        if (kvLane < 160) {
+            auto key = FastllmNaiveKVWriteRow{binding.cache ? const_cast<void *>(binding.cache[0]) : binding.key, FP8} + slot * 192;
+            if (kvLane < 32) RotatePair(kv, key, kvLane, a, row);
+            else key[kvLane + 32] = kv[kvLane + 32];
+        } else {
+            const int col = kvLane - 160;
+            auto value = FastllmNaiveKVWriteRow{binding.cache ? const_cast<void *>(binding.cache[1]) : binding.value, FP8};
+            value[slot * 128 + col] = __float2bfloat16_rn(float(kv[192 + col]) * RoundBF16(a.scale));
+        }
+    }
+}
+template<int Threads, bool FP8 = false, bool Wide = false>
 __global__ __launch_bounds__(Threads, 1) void PackedLayer(
 #if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
     __grid_constant__
@@ -609,8 +640,10 @@ __global__ __launch_bounds__(Threads, 1) void PackedLayer(
         const Args a) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const int t = threadIdx.x, task = blockIdx.x;
-    const int row = task / 16, head = task / 2 % 8, valueTile = task % 2;
-    StageHistory<64>(a, row, valueTile);
+    constexpr int Tile = FP8 ? 128 : 64;
+    constexpr int TasksPerRow = 8 * (128 / Tile);
+    const int head = task / (128 / Tile) % 8, valueTile = task % (128 / Tile);
+    if constexpr (!Wide) StageHistory<Tile, FP8>(a, task / TasksPerRow, valueTile);
     constexpr int KWarps = Threads / 64;
     constexpr int Parts = 1024 / (KWarps * 32);
     fastllm_mxfp8_projection::WeightFragment weights[Parts];
@@ -623,59 +656,97 @@ __global__ __launch_bounds__(Threads, 1) void PackedLayer(
     }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if (a.rotary) cudaGridDependencySynchronize();
+#if CUDART_VERSION >= 12000
+    // The router may preload weights while attention runs. Its dependency wait
+    // still orders reads of the normalized TP result after this grid completes.
+    if constexpr (FP8) if (a.overlapRouter) cudaTriggerProgrammaticLaunchCompletion();
+#endif
 #endif
     auto flag = [&](int r) { return reinterpret_cast<unsigned *>(a.epochs + 1 + r) + 1; };
     __shared__ __align__(16) BF16 query[192];
-    if (row < a.rows) {
-        // The first head publishes this row's candidate KV. Separate warps
-        // rotate Q and write KV, then share the barrier before the ready flag.
-        const bool writesKV = head == 0 && valueTile == 0;
-        const int kvLane = t - 192;
-        if (writesKV && kvLane >= 0 && kvLane < 288 && a.bindings.length[row] > 0) {
-            const auto &binding = a.bindings.rows[row];
-            const int slot = 128 + binding.verifyOffset;
-            const BF16 *kv = a.projected + row * 1856 + 1536;
-            if (kvLane < 160) {
-                auto *key = (binding.cache ? (BF16 *)binding.cache[0] : binding.key) + slot * 192;
-                if (kvLane < 32) RotatePair(kv, key, kvLane, a, row);
-                else key[kvLane + 32] = kv[kvLane + 32];
-            } else {
-                const int col = kvLane - 160;
-                auto *value = binding.cache ? (BF16 *)binding.cache[1] : binding.value;
-                value[slot * 128 + col] = __float2bfloat16_rn(float(kv[192 + col]) * RoundBF16(a.scale));
+    if constexpr (FP8 && !Wide) {
+        // At most 8x8 CTAs read ring history. Let spare projection CTAs
+        // publish the candidates as soon as the QKV dependency is satisfied.
+        constexpr int WriterBase = 8 * TasksPerRow;
+        const int row = task - WriterBase;
+        if (row >= 0 && row < a.rows) {
+            WritePackedKV<true>(a, row, t);
+            __syncthreads();
+            if (t == 0) fastllm_swa::PublishReady(flag(row));
+        }
+    }
+    if constexpr (Wide) {
+        // Candidates may belong to any request, in any order. Publish all
+        // rows before consuming the first tile or reusing projected for O.
+        if (task < a.rows) {
+            for (int i = t; i < 288; i += Threads) WritePackedKV<FP8>(a, task, i);
+            if constexpr (Threads == 256) {
+                for (int i = t; i < 8 * 192; i += Threads) {
+                    const int head = i / 192, col = i % 192;
+                    const BF16 *src = a.projected + task * 1856 + head * 192;
+                    BF16 *dst = a.q + (task * 8 + head) * 192;
+                    if (a.bindings.Live(task) <= 0) dst[col] = __float2bfloat16_rn(0.f);
+                    else if (col < 32) RotatePair(src, dst, col, a, task);
+                    else if (col >= 64) dst[col] = src[col];
+                }
             }
         }
-        const BF16 *src = a.projected + row * 1856 + head * 192;
-        if (t < 192) {
-            if (a.bindings.length[row] <= 0) query[t] = __float2bfloat16_rn(0.f);
-            else if (t < 32) RotatePair(src, query, t, a, row);
-            else if (t >= 64) query[t] = src[t];
+        cooperative_groups::this_grid().sync();
+    }
+    if constexpr (Wide && Threads == 256) {
+        // Match the standalone BF16 bulk QK, softmax and PV reduction order.
+        if (task < a.rows) {
+            const auto &binding = a.bindings.rows[task];
+            FastllmNaiveDSARow row{};
+            row.key = binding.key; row.value = binding.value; row.cache = binding.cache;
+            row.keyStride = 192; row.verifyOffset = binding.verifyOffset;
+            row.liveKeys = a.bindings.length + task;
+            naive_attention_bulk::DecodeRow<128, true, false>(a.q, FastllmNaiveResolveDSARow(row), a.sink, a.attn, 8, 1, task, 0);
         }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-        asm volatile("cp.async.wait_group 0;" ::: "memory");
-#endif
-        __syncthreads();
-        if (writesKV && t == 0)
-            fastllm_swa::PublishReady(flag(row));
-        if (!valueTile && t < 24)
-            reinterpret_cast<uint4 *>(a.q + (row * 8 + head) * 192)[t] = reinterpret_cast<const uint4 *>(query)[t];
-        SwaAttentionBf16Body<Threads, 64, true, BatchSwaKeys, true, true, false, true>(
-            a.q, nullptr, nullptr, a.sink, a.attn, a.bindings.length, 8, 1, a.bindings, row, head, valueTile, query, a.epochs, a.rows);
+    } else for (int first = 0; first < (Wide ? a.rows : 8); first += 128 / TasksPerRow) {
+        const int row = first + task / TasksPerRow;
+        if constexpr (Wide) StageHistory<Tile, FP8>(a, row, valueTile);
+        if (row < a.rows) {
+            // The first head publishes this row's candidate KV. Separate warps
+            // rotate Q and write KV, then share the barrier before the ready flag.
+            const bool writesKV = head == 0 && valueTile == 0;
+            const int kvLane = t - 192;
+            if constexpr (!Wide && !FP8) if (writesKV) WritePackedKV<false>(a, row, kvLane);
+            const BF16 *src = a.projected + row * 1856 + head * 192;
+            if (t < 192) {
+                if (a.bindings.length[row] <= 0) query[t] = __float2bfloat16_rn(0.f);
+                else if (t < 32) RotatePair(src, query, t, a, row);
+                else if (t >= 64) query[t] = src[t];
+            }
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+    #endif
+            __syncthreads();
+            if (!Wide && !FP8 && writesKV && t == 0)
+                fastllm_swa::PublishReady(flag(row));
+            if (!valueTile && t < 24)
+                reinterpret_cast<uint4 *>(a.q + (row * 8 + head) * 192)[t] = reinterpret_cast<const uint4 *>(query)[t];
+            SwaAttentionBf16Body<Threads, Tile, true, BatchSwaKeys, true, true, false, true, FP8>(
+                a.q, nullptr, nullptr, a.sink, a.attn, a.bindings.length, 8, 1, a.bindings, row, head, valueTile, query, a.epochs, Wide ? 0 : a.rows);
+            if constexpr (Wide) __syncthreads();
+        }
     }
     // All candidate KV and QKV reads finish before Tail reuses projected.
     cooperative_groups::this_grid().sync();
 #if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    if (a.overlapRouter) cudaTriggerProgrammaticLaunchCompletion();
+    if constexpr (!FP8) if (a.overlapRouter) cudaTriggerProgrammaticLaunchCompletion();
 #endif
-    if (task == 127 && t < a.rows) *flag(t) = 0;
-    Tail<Threads, 1, true, true>(a, 0, weights);
+    if (!Wide && task == 127 && t < a.rows) *flag(t) = 0;
+    for (int first = 0; first < (Wide ? a.rows : 8); first += 8)
+        Tail<Threads, 1, true, true>(a, first, weights);
 #endif
 }
 inline int Threads(int rows) {
     return rows <= 8 ? 1024 : 512;
 }
-inline int SharedBytes(int rows, bool wide = false, bool mx = false) {
-    if (mx) return 128 * (64 + 192) * sizeof(BF16);
+inline int PackedThreads(int rows, bool fp8) { return !fp8 && rows >= 32 ? 256 : 1024; }
+inline int SharedBytes(int rows, bool wide = false, bool mx = false, bool fp8 = false) {
+    if (mx) return 128 * ((fp8 ? 128 : 64) + 192) * sizeof(BF16);
     if (wide && rows > 8) {
         // Direct QKV/O reads only need reduction scratch; attention reuses the
         // same storage for its 128x128 BF16 value tile.
@@ -685,7 +756,11 @@ inline int SharedBytes(int rows, bool wide = false, bool mx = false) {
     }
     return InputBytes + Threads(rows) / 32 * 16 * 8 * sizeof(float);
 }
-inline const void *Kernel(int rows, bool wide = false, bool mx = false) {
+inline const void *Kernel(int rows, bool wide = false, bool mx = false, bool fp8Cache = false) {
+    if (mx && PackedThreads(rows, fp8Cache) == 256) return (const void *)PackedLayer<256, false, true>;
+    if (mx && rows > 8) return fp8Cache ? (const void *)PackedLayer<1024, true, true>
+                                        : (const void *)PackedLayer<1024, false, true>;
+    if (mx && fp8Cache) return (const void *)PackedLayer<1024, true>;
     if (mx) return (const void *)PackedLayer<1024>;
     // Two N8 tiles share QKV/O weight loads and read graph-owned inputs directly.
     // The original staging schedule remains available when admission fails.
@@ -693,5 +768,6 @@ inline const void *Kernel(int rows, bool wide = false, bool mx = false) {
         return (const void *)Layer<512, 128, false, 2, true, true>;
     return rows <= 8 ? (const void *)Layer<1024, 128, true> : (const void *)Layer<512, 128, false>;
 }
+static_assert(sizeof(naive_attention_bulk::Storage<128, false>) <= 128 * (64 + 192) * sizeof(BF16));
 static_assert(128 + RowLimit <= MaxRows * MaxBlocks, "readiness flags must fit existing epochs");
 } // namespace fastllm_swa_verify

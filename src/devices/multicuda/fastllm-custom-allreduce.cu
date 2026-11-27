@@ -4504,7 +4504,7 @@ bool FastllmCudaSwaVerifyLayerSupported(int deviceId, int rows) {
         state.swaOutput && state.swaOutput->VerifySupported(rows);
 }
 
-static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden,
+static bool RunSwaVerifyLayer(const fastllm::Data *branch, fastllm::Data &hidden,
         const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
         const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
         const fastllm::Data &postNorm, const fastllm::Data &sink,
@@ -4514,7 +4514,7 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
         fastllm::Data &normed, fastllm::Data *feature,
         const fastllm::Data *routerWeight, fastllm::Data *router,
         FastllmSwaLayerConfig c, int deviceId,
-        const FastllmMoePreparedInput *prepared, bool afterExpertReduce) {
+        const FastllmMoePreparedInput *prepared, bool afterExpertReduce, bool packedWideOnly = false) {
     using namespace fastllm;
     CustomArState &state = GetCustomArState();
     CustomArCallLease lease; int rank = -1;
@@ -4539,10 +4539,12 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
         }
         return stride == count;
     };
+    const bool fp8Cache = !caches.empty() && caches.front().key && caches.front().key->dataType == FP8_E4M3;
+    const auto cacheType = fp8Cache ? FP8_E4M3 : BFLOAT16;
     auto ring = [&](const Data &x, int width) {
         const int capacity = x.expansionDims.size() == 3 ? x.expansionDims[1]
             : x.dims.size() == 3 ? x.dims[1] : 0;
-        return located(x, BFLOAT16) && !x.isPagedKVCache && x.dims.size() == 3 &&
+        return located(x, cacheType) && !x.isPagedKVCache && x.dims.size() == 3 &&
             x.dims[0] == 1 && x.dims[2] == width && capacity >= 136 &&
             x.strides[2] == 1 && x.strides[1] == size_t(width);
     };
@@ -4557,14 +4559,15 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
     const auto *qkvScales = mx ? FastllmCudaVerifyMxfp8Scales(qkvWeight,1856,4096,deviceId) : nullptr;
     const auto *outputScales = mx ? FastllmCudaVerifyMxfp8Scales(oWeight,4096,1024,deviceId) : nullptr;
     const auto weightType = mx ? FP8_E4M3 : BFLOAT16;
-    bool eligible = state.swaOutput->VerifySupported(rows, mx) &&
+    bool eligible = (!packedWideOnly || rows <= 16 || mx) && (!fp8Cache || mx) && state.swaOutput->VerifySupported(rows, mx, fp8Cache) &&
         (!mx || (qkvScales && outputScales)) &&
         (!prepared || (withRouter && state.swaOutput->PreparedRouterSupported(prepared->routed, rows) && prepared->Valid(rows))) &&
         c.heads == 8 && c.kvHeads == 1 && c.headDim == 192 && c.valueDim == 128 &&
         c.rotaryDim == 64 && c.window == 128 && std::isfinite(c.eps) && c.eps > 0 &&
         std::isfinite(c.theta) && c.theta > 0 && std::isfinite(c.valueScale) &&
         tensor(hidden, BFLOAT16, elements) && hidden.dims.back() == 4096 &&
-        tensor(branch, BFLOAT16, elements) && branch.dims == hidden.dims &&
+        (branch ? tensor(*branch, BFLOAT16, elements) && branch->dims == hidden.dims
+                : mx && tensor(normed, BFLOAT16, elements) && normed.dims == hidden.dims) &&
         tensor(inputNorm, FLOAT32, 4096) && tensor(postNorm, FLOAT32, 4096) &&
         tensor(qkvWeight, weightType, 1856 * 4096) && qkvBias.dims.empty() &&
         qkvWeight.dims == std::vector<int>({1856, 4096}) &&
@@ -4576,7 +4579,7 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
         (!withRouter || ((rows == 1 || rows < FastllmCudaGetLinearExactBatchThreshold()) &&
             tensor(*routerWeight, FLOAT32, 256 * 4096) &&
             routerWeight->dims == std::vector<int>({256, 4096})));
-    std::vector<const Data *> sources{&branch, &hidden, &inputNorm, &qkvWeight, &qkvBias,
+    std::vector<const Data *> sources{branch, &hidden, &inputNorm, &qkvWeight, &qkvBias,
         &oWeight, &postNorm, &sink, &position, &live};
     if (routerWeight) sources.push_back(routerWeight);
     if (feature) sources.push_back(feature);
@@ -4584,9 +4587,10 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
     std::vector<int> widths{1536, 1024, 4096, 4096};
     if (withRouter) { outputs.push_back(router); widths.push_back(256); }
     fastllm_swa_verify::Args args{};
+    args.fp8Cache = fp8Cache;
     std::vector<Range> keys, values;
     std::vector<Range> reads{
-        {branch.cudaData, elements * 2}, {inputNorm.cudaData, 4096 * 4},
+        {branch ? branch->cudaData : nullptr, branch ? elements * 2 : 0}, {inputNorm.cudaData, 4096 * 4},
         {qkvWeight.cudaData, qkvWeight.GetBytes()}, {oWeight.cudaData, oWeight.GetBytes()},
         {postNorm.cudaData, 4096 * 4}, {sink.cudaData, sink.dims.empty() ? 0u : 32u},
         {position.cudaData, size_t(std::max(0, rows)) * 4},
@@ -4603,8 +4607,8 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
             r.cacheOffset >= 0 || r.verifyOffset < 0 || r.verifyOffset >= 8 ||
             (r.cache && uintptr_t(r.cache) % alignof(void *))) { eligible = false; break; }
         sources.push_back(r.key); sources.push_back(r.value);
-        keys.push_back({r.key->cudaData, 136 * 192 * 2});
-        values.push_back({r.value->cudaData, 136 * 128 * 2});
+        keys.push_back({r.key->cudaData, 136u * 192 * r.key->unitSize});
+        values.push_back({r.value->cudaData, 136u * 128 * r.value->unitSize});
         if (r.cache) reads.push_back({r.cache, 2 * sizeof(void *)});
         args.bindings.rows[i] = {(fastllm_swa_output::BF16 *)r.key->cudaData,
             (fastllm_swa_output::BF16 *)r.value->cudaData, r.cache, r.verifyOffset};
@@ -4662,7 +4666,7 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
             BFLOAT16, eligible, registered)) return false;
     using BF16Value = fastllm_swa_output::BF16;
     args.outputScales = outputScales;
-    args.branch = (const BF16Value *)branch.cudaData;
+    args.branch = branch ? (const BF16Value *)branch->cudaData : nullptr;
     args.weight = (const BF16Value *)qkvWeight.cudaData;
     args.oWeight = (const BF16Value *)oWeight.cudaData;
     args.hidden = (BF16Value *)hidden.cudaData; args.q = (BF16Value *)q.cudaData;
@@ -4677,7 +4681,7 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
     if (mx) {
         // Preserve native QKV rounding before attention and O re-quantize
         // its result. Borrow the larger projected buffer until the fused tail.
-        if (!FastllmCudaMxfp8SwaQkv(hidden.cudaData, branch.cudaData, args.gamma, c.eps,
+        if (!branch || !FastllmCudaMxfp8SwaQkv(hidden.cudaData, args.branch, args.gamma, c.eps,
                                     qkvWeight, qkvScales, projected.cudaData, rows, args.positions, c.theta, normed.cudaData,
                                     afterExpertReduce)) {
             Data packed(BFLOAT16);
@@ -4685,7 +4689,7 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
             dims.back() = 1856;
             packed.Resize(dims);
             packed.FakeFrom(projected, 0);
-            FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, inputNorm, c.eps, normed);
+            if (branch) FastllmCudaNaiveAddDecodeRMSNorm(hidden, *branch, inputNorm, c.eps, normed);
             if (!FastllmCudaBFloat16MatMulFP8E4M3(normed, const_cast<Data &>(qkvWeight), qkvBias,
                                                    packed, rows, 4096, 1856))
                 throw std::runtime_error("SWA MXFP8 QKV projection failed after collective admission");
@@ -4916,11 +4920,11 @@ FastllmVerifyOutput FastllmCudaVerifyAttention(const FastllmNaiveVerifyAttention
     }
 #endif
     bool launched = false;
-    if (x.sliding && x.branch) {
-        launched = RunSwaVerifyLayer(*x.branch, *x.hidden, *x.inputNorm, *x.qkvWeight, *x.qkvBias,
+    if (x.sliding && (x.branch || !x.packedTp)) {
+        launched = RunSwaVerifyLayer(x.branch, *x.hidden, *x.inputNorm, *x.qkvWeight, *x.qkvBias,
                 *x.outputWeight, *x.postNorm, *x.sink, *x.positions, *x.live, x.caches, *x.query,
                 *x.attention, *x.projected, *x.normed, x.feature, x.routerWeight, x.router,
-                x.config, device, prepared, x.afterExpertReduce);
+                x.config, device, prepared, x.afterExpertReduce, true);
     }
 #ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
     else if (!x.sliding)
@@ -4940,7 +4944,7 @@ bool FastllmCudaSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidde
         fastllm::Data &normed, fastllm::Data *feature,
         const fastllm::Data *routerWeight, fastllm::Data *router,
         FastllmSwaLayerConfig c, int deviceId) {
-    return RunSwaVerifyLayer(branch, hidden, inputNorm, qkvWeight, qkvBias,
+    return RunSwaVerifyLayer(&branch, hidden, inputNorm, qkvWeight, qkvBias,
         oWeight, postNorm, sink, position, live, caches, q, attn, projected, normed,
         feature, routerWeight, router, c, deviceId, nullptr, false);
 }
@@ -4956,7 +4960,7 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
         const fastllm::Data *routerWeight, fastllm::Data *router,
         FastllmSwaLayerConfig c, int deviceId,
         const FastllmMoePreparedInput *prepared) {
-    return RunSwaVerifyLayer(branch, hidden, inputNorm, qkvWeight, qkvBias, oWeight,
+    return RunSwaVerifyLayer(&branch, hidden, inputNorm, qkvWeight, qkvBias, oWeight,
         postNorm, sink, position, live, caches, q, attn, projected, normed,
         feature, routerWeight, router, c, deviceId, prepared, false);
 }
@@ -4972,7 +4976,7 @@ bool FastllmCudaSwaVerifyLayerAfterExpertReduce(const fastllm::Data &branch, fas
         const fastllm::Data *routerWeight, fastllm::Data *router,
         FastllmSwaLayerConfig c, int deviceId,
         const FastllmMoePreparedInput *prepared) {
-    return RunSwaVerifyLayer(branch, hidden, inputNorm, qkvWeight, qkvBias, oWeight,
+    return RunSwaVerifyLayer(&branch, hidden, inputNorm, qkvWeight, qkvBias, oWeight,
         postNorm, sink, position, live, caches, q, attn, projected, normed,
         feature, routerWeight, router, c, deviceId, prepared, true);
 }

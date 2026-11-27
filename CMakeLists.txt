@@ -3028,7 +3028,8 @@ if (UNIT_TEST)
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 480)
             if (TARGET fastllm_mxfp8_linear_sm103)
                 add_test(NAME naive_n05_swa_verify_mxfp8 COMMAND naive_n05_swa_verify_layer_test --mxfp8)
-                set_tests_properties(naive_n05_swa_verify_mxfp8 PROPERTIES
+                add_test(NAME naive_n05_swa_verify_fp8_kv COMMAND naive_n05_swa_verify_layer_test --mxfp8 --fp8-kv)
+                set_tests_properties(naive_n05_swa_verify_mxfp8 naive_n05_swa_verify_fp8_kv PROPERTIES
                     LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
             endif()
             add_executable(naive_n05_swa_layer_test test/basic/test_cuda_naive_swa_layer.cpp)

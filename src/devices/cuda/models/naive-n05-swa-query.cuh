@@ -125,6 +125,133 @@ __device__ __forceinline__ void SwaQueryValues(SwaQueryStorage<Queries> &s, cons
     }
 #endif
 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+// Each warp owns 16 tokens (or output columns) by eight query heads.
+// Publish an MMA fragment in head-major order in a single transposed store.
+__device__ __forceinline__ void SwaStoreFragment(BF *dst, int pitch, int tile, int lane, float (&v)[4]) {
+    unsigned pairs[2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        auto pair = __floats2bfloat162_rn(v[2*i], v[2*i+1]);
+        memcpy(&pairs[i], &pair, sizeof(pair));
+    }
+    const unsigned addr = __cvta_generic_to_shared(dst + (lane & 7) * pitch + tile * 16 + ((lane >> 3) & 1) * 8);
+    asm volatile("stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1,%2};"
+                 :: "r"(addr), "r"(pairs[0]), "r"(pairs[1]) : "memory");
+}
+#endif
+// Exactly four keys per lane for the 128-token sliding window.
+__device__ __forceinline__ void NormalizeSwaWindow(BF *prob, const float *sink, int head, int n, int lane) {
+    float value[4], mx = sink ? sink[head] : -INFINITY;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        value[j] = lane + j*32 < n ? float(prob[lane + j*32]) : -INFINITY;
+        mx = fmaxf(mx, value[j]);
+    }
+    #pragma unroll
+    for (int d = 16; d; d >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, d));
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) value[j] = lane + j*32 < n ? __expf(value[j] - mx) : 0.f;
+    float first = value[0];
+    if (lane == 0 && sink) first += __expf(sink[head] - mx);
+    float den = naive_dsa_decode::WarpSum((first + value[2]) + (value[1] + value[3]));
+    den = __shfl_sync(0xffffffff, den, 0);
+    const float inv = den > 0.f ? __fdividef(1.f, den) : 0.f;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) prob[lane + j*32] = __float2bfloat16(den > 0.f ? value[j] * inv : 0.f);
+}
+template <bool Window = false, bool Partial = false, int Queries>
+__device__ __forceinline__ void SwaWindowScores(SwaQueryStorage<Queries> &s, const int *offsets,
+        const int *lengths, int count, const float *sink, int head, int w, int l) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace naive_attention_bulk;
+    const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
+#pragma unroll
+    for (int r = 0; r < Queries; ++r) if (r < count) {
+        float scores[4] = {};
+#pragma unroll
+        for (int d = 0; d < 192; d += 16) {
+            uint32_t a[4], b[2];
+            ld4(a, &s.tile.k[offsets[r] + w * 16 + ar][d + ac]);
+            ld2(b, &s.q[r][l & 7][d + ((l >> 3) & 1) * 8]);
+            mma(scores, a, b);
+        }
+#if __CUDA_ARCH__ >= 900
+        if constexpr (Window) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int k = w * 16 + l / 4 + (i / 2) * 8;
+                scores[i] = k < lengths[r] ? naive_dsa_decode::Round(scores[i]) * rsqrtf(192.f) : -INFINITY;
+            }
+            SwaStoreFragment(&s.prob[r][0][0], 136, w, l, scores);
+        } else
+#endif
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int h = (l % 4) * 2 + i % 2, k = w * 16 + l / 4 + (i / 2) * 8;
+            s.prob[r][h][k] = __float2bfloat16(
+                k < lengths[r] && s.selected[offsets[r] + k] >= 0 ? naive_dsa_decode::Round(naive_dsa_decode::Round(scores[i]) * rsqrtf(192.f))
+                                       : -INFINITY);
+        }
+    }
+    if constexpr (Partial) asm volatile("bar.sync 2, 512;" ::: "memory");
+    else __syncthreads();
+#pragma unroll
+    for (int r = 0; r < Queries; ++r) if (r < count) {
+        if constexpr (Window) NormalizeSwaWindow(&s.prob[r][w][0], sink, head + w, lengths[r], l);
+        else Normalize<128, false>(&s.prob[r][0][0], sink, head, lengths[r], w, l);
+    }
+    if constexpr (!Partial) __syncthreads();
+#endif
+}
+template <bool Pack = false, bool Window = false, int Queries>
+__device__ __forceinline__ void SwaWindowValues(SwaQueryStorage<Queries> &s, const int *offsets,
+        BF *out, int row, int count, int heads, int head, int w, int l, const int *lengths = nullptr,
+        FastllmMxfp8Activation packed = {}, BF (*valueTile)[136] = nullptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace naive_attention_bulk;
+    const auto values = valueTile ? valueTile : s.tile.v;
+    float acc[Queries][4] = {};
+#pragma unroll
+    for (int k = 0; k < 128; k += 16) {
+#pragma unroll
+        for (int r = 0; r < Queries; ++r) if (r < count) {
+            uint32_t a[4], b[2];
+            ldt4(a, &values[offsets[r] + k + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
+            ld2(b, &s.prob[r][l & 7][k + ((l >> 3) & 1) * 8]);
+            mma(acc[r], a, b);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Queries; ++r)
+        if (r < count) {
+#if __CUDA_ARCH__ >= 900
+            if constexpr (Window) {
+                SwaStoreFragment(out, 128, w, l, acc[r]);
+            } else
+#endif
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int h = (l % 4) * 2 + i % 2, col = w * 16 + l / 4 + (i / 2) * 8;
+                const BF value = __float2bfloat16(lengths && !lengths[r] ? 0.f : acc[r][i]);
+                if constexpr (Pack) s.q[r][h][col] = value;
+                else out[((size_t)(row + r) * heads + head + h) * 128 + col] = value;
+            }
+        }
+    if constexpr (Pack) {
+        // Q is dead after the score MMA. Transpose the PV fragments there so
+        // adjacent lanes can write BF16 and quantize the same rounded values.
+        __syncthreads();
+        for (int i = threadIdx.x; i < count * 128; i += 256) {
+            const int r = i / 128, h = i / 16 % 8, col = i % 16 * 8;
+            const uint4 value = *reinterpret_cast<const uint4 *>(&s.q[r][h][col]);
+            const int offset = (head + h) * 128 + col;
+            *reinterpret_cast<uint4 *>(out + size_t(row + r) * heads * 128 + offset) = value;
+            fastllm_mxfp8::Store8(packed, row + r, offset, value);
+        }
+    }
+#endif
+}
 template <int Queries>
 __global__ __launch_bounds__(256) void SwaQueryTile(const BF *q, FastllmNaiveKV key, FastllmNaiveKV value,
                                                     const float *sink, BF *out, int rows, int heads, int kvHeads,
@@ -422,36 +549,36 @@ struct SwaRingKV {
         return SwaVerifyPhysicalRow(logical, prefix);
     }
 };
-// Each pair of warps handles one query. All four queries share the BF16 KV
+// Each pair of warps handles one query. The queries share the BF16 KV
 // tiles. Packed FP8 values are staged while the warps compute QK.
-struct SwaFP8VerifyStorage {
+template<int Queries> struct SwaFP8VerifyStorage {
     union {
-        BF key[131][200];
-        BF value[131][136];
+        BF key[128 + Queries - 1][200];
+        BF value[128 + Queries - 1][136];
     };
     union {
-        __align__(16) unsigned char packedValue[131][128];
-        BF output[4][8][136];
+        __align__(16) unsigned char packedValue[128 + Queries - 1][128];
+        BF output[Queries][8][136];
     };
-    BF prob[4][8][136];
+    BF prob[Queries][8][136];
 };
 
-template<bool Pack>
+template<bool Pack, int Queries>
 __device__ __forceinline__ void SwaVerifyFP8(const BF *q, const FastllmNaiveDSARow &row,
         int startRow, int count, const int *lengths, const int *offsets, int first, int end,
         int prefix, const float *sink, BF *out, int heads, int kvHeads, int blockHead, FastllmMxfp8Activation packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && CUDART_VERSION >= 12080
     using namespace naive_attention_bulk;
     extern __shared__ __align__(16) char buffer[];
-    auto &s = *reinterpret_cast<SwaFP8VerifyStorage *>(buffer);
+    auto &s = *reinterpret_cast<SwaFP8VerifyStorage<Queries> *>(buffer);
     const int t = threadIdx.x, warp = t / 32, lane = t % 32;
     const int query = warp / 2, half = warp % 2;
     const int head = blockHead * 8, kvHead = head / (heads / kvHeads);
     const int used = end - first;
     // An MMA reads a full 16-row tile. At the window limit it can start
-    // up to three positions later for subsequent queries in the group.
-    const int loadRows = used > 112 ? 131 : ((used + 15) & ~15);
-    for (int i = t; i < loadRows * 8; i += 256) {
+    // up to Queries - 1 positions later for subsequent queries in the group.
+    const int loadRows = used > 112 ? (128 + Queries - 1) : ((used + 15) & ~15);
+    for (int i = t; i < loadRows * 8; i += Queries * 64) {
         const int pos = first + i / 8;
         const int physical = SwaVerifyPhysicalRow(pos, prefix);
         const auto *src = reinterpret_cast<const unsigned char *>(row.value) +
@@ -460,15 +587,14 @@ __device__ __forceinline__ void SwaVerifyFP8(const BF *q, const FastllmNaiveDSAR
         naive_dsa_decode::Copy<true>(&s.packedValue[i / 8][col], src + col, pos < end);
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
-    for (int i = t; i < loadRows * 24; i += 256) {
-        const int pos = first + i / 24;
+    for (int i = t; i < loadRows * 12; i += Queries * 64) {
+        const int pos = first + i / 12, col = (i % 12) * 16;
         const int physical = SwaVerifyPhysicalRow(pos, prefix);
-        const int col = (i % 24) * 8;
         const auto *src = reinterpret_cast<const unsigned char *>(row.key) +
             size_t(pos < end ? physical : 0) * row.keyStride + kvHead * 192 + col;
-        *reinterpret_cast<uint4 *>(&s.key[i / 24][col]) =
-            pos < end ? FastllmNaiveKVRow(src, true).Load8() : make_uint4(0, 0, 0, 0);
+        naive_dsa_decode::Copy<true>(&s.key[i / 12][col], src, pos < end);
     }
+    asm volatile("cp.async.commit_group;" ::: "memory");
     const BF *srcQ = q + (size_t(startRow + min(query, count - 1)) * heads + head + lane / 4) * 192 +
         2 * (lane % 4);
     uint32_t queryFragment[12][2];
@@ -476,6 +602,15 @@ __device__ __forceinline__ void SwaVerifyFP8(const BF *q, const FastllmNaiveDSAR
     for (int k = 0; k < 12; ++k) {
         queryFragment[k][0] = *reinterpret_cast<const uint32_t *>(srcQ + k * 16);
         queryFragment[k][1] = *reinterpret_cast<const uint32_t *>(srcQ + k * 16 + 8);
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    for (int i = t; i < loadRows * 12; i += Queries * 64) {
+        auto *dst = reinterpret_cast<uint4 *>(&s.key[i / 12][(i % 12) * 16]);
+        const uint4 raw = dst[0];
+        dst[0] = make_uint4(FastllmNaiveKVRow::ConvertPair(raw.x), FastllmNaiveKVRow::ConvertPair(raw.x >> 16),
+                            FastllmNaiveKVRow::ConvertPair(raw.y), FastllmNaiveKVRow::ConvertPair(raw.y >> 16));
+        dst[1] = make_uint4(FastllmNaiveKVRow::ConvertPair(raw.z), FastllmNaiveKVRow::ConvertPair(raw.z >> 16),
+                            FastllmNaiveKVRow::ConvertPair(raw.w), FastllmNaiveKVRow::ConvertPair(raw.w >> 16));
     }
     __syncthreads();
     const int mmaRow = (lane & 7) + ((lane >> 3) & 1) * 8, mmaCol = (lane >> 4) * 8;
@@ -494,21 +629,20 @@ __device__ __forceinline__ void SwaVerifyFP8(const BF *q, const FastllmNaiveDSAR
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int slot = key + lane / 4 + (i / 2) * 8;
-                s.prob[query][(lane % 4) * 2 + i % 2][slot] = __float2bfloat16(slot < lengths[query] ?
-                    naive_dsa_decode::Round(naive_dsa_decode::Round(dot[i]) * rsqrtf(192.f)) : -INFINITY);
+                dot[i] = slot < lengths[query] ? naive_dsa_decode::Round(dot[i]) * rsqrtf(192.f) : -INFINITY;
             }
+            SwaStoreFragment(&s.prob[query][0][0], 136, key / 16, lane, dot);
         }
     }
-    asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
-    for (int i = t; i < loadRows * 16; i += 256) {
+    for (int i = t; i < loadRows * 16; i += Queries * 64) {
         const int col = (i % 16) * 8;
         *reinterpret_cast<uint4 *>(&s.value[i / 16][col]) =
             FastllmNaiveKVRow(&s.packedValue[i / 16][col], true).Load8();
     }
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        if (r < count) Normalize<128, false>(&s.prob[r][0][0], sink, head, lengths[r], warp, lane);
+    for (int r = warp / 8; r < Queries; r += Queries / 4) {
+        if (r < count) NormalizeSwaWindow(&s.prob[r][warp % 8][0], sink, head + warp % 8, lengths[r], lane);
     }
     __syncthreads();
     if (query >= count) return;
@@ -555,13 +689,13 @@ __device__ __forceinline__ void SwaVerifyFP8(const BF *q, const FastllmNaiveDSAR
 // The large descriptor argument and grid-constant ABI require SM70.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 template <int Queries, bool FP8, bool BlackwellFP8 = false, bool Pack = false>
-__global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
+__global__ __launch_bounds__(BlackwellFP8 ? Queries * 64 : 256) void SwaVerifyQueries(const BF *q,
 #if CUDART_VERSION >= 12010
         const __grid_constant__
 #endif
         SwaVerifyBatch batch, const float *sink, BF *out, int heads, int kvHeads, FastllmMxfp8Activation packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    static_assert(!BlackwellFP8 || (FP8 && Queries == 4));
+    static_assert(!BlackwellFP8 || (FP8 && (Queries == 4 || Queries == 8)));
     const auto &group = batch.groups[blockIdx.x];
     auto row = FastllmNaiveResolveDSARow(group.row);
     int prefix = -1, end = 0, lengths[Queries]{}, offsets[Queries]{};
@@ -597,6 +731,16 @@ __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
             auto single = row;
             if (single.liveKeys) single.liveKeys += r;
             single.length += r; single.verifyOffset += r;
+            if constexpr (BlackwellFP8 && Queries == 8) {
+                // Independently rebound lengths still use the same captured grid.
+                const int len = max(0, single.liveKeys ? *single.liveKeys : single.length);
+                const int keys = min(len, 128), offset = 0;
+                SwaVerifyFP8<Pack, Queries>(q, single, group.first + r, 1, &keys, &offset,
+                    len - keys, len, len - single.verifyOffset - 1, sink, out, heads, kvHeads,
+                    blockIdx.y, packed);
+                __syncthreads();
+                continue;
+            }
             naive_attention_bulk::DecodeRow<128, true, FP8>(q, single, sink, out,
                 heads, kvHeads, group.first + r, blockIdx.y);
             __syncthreads();
@@ -616,7 +760,7 @@ __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
     for (int r = 0; r < Queries; ++r)
         offsets[r] = max(0, prefix + row.verifyOffset + r + 1 - 128) - first;
     if constexpr (BlackwellFP8) {
-        SwaVerifyFP8<Pack>(q, row, group.first, group.count, lengths, offsets, first, end,
+        SwaVerifyFP8<Pack, Queries>(q, row, group.first, group.count, lengths, offsets, first, end,
                      prefix, sink, out, heads, kvHeads, blockIdx.y, packed);
     } else {
         extern __shared__ __align__(16) char memory[];

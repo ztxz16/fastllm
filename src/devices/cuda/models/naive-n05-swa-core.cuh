@@ -6,7 +6,7 @@
 constexpr int PackedSwaStagedKeys = 96;
 
 template <int Threads = 1024, int Tile = 32, bool Dynamic = false, typename Binding = const void *const *,
-          bool MmaPV = false, bool ReuseShared = false, bool TensorQK = false, bool PackedVerify = false>
+          bool MmaPV = false, bool ReuseShared = false, bool TensorQK = false, bool PackedVerify = false, bool FP8 = false>
 __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *k, const BF16 *v,
                                                      const float *sink, BF16 *out, const int *live, int heads,
                                                      int kvHeads, const Binding &cache, int row, int head,
@@ -76,8 +76,9 @@ __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *
                 *dst = make_uint4(0, 0, 0, 0);
                 continue;
             }
-            const BF16 *src = v + physical(slot) * kvHeads * 128 + kh * 128 + dim0 + col;
-            *dst = *reinterpret_cast<const uint4 *>(src);
+            const int index = (physical(slot) * kvHeads + kh) * 128 + dim0 + col;
+            if constexpr (FP8) *dst = FastllmNaiveKVRow((const uint8_t *)v + index, true).Load8();
+            else *dst = *reinterpret_cast<const uint4 *>(v + index);
         }
     };
     if constexpr (!PackedVerify) loadValues(0, TensorPV ? 128 : keys);
@@ -113,7 +114,8 @@ __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *
                 float dot = 0.f;
 #pragma unroll
                 for (int j = 0; j < 6; ++j)
-                    dot += query[j] * float(k[physical(slot) * kvHeads * 192 + kh * 192 + lane + j * 32]);
+                    if constexpr (FP8) dot += query[j] * float(reinterpret_cast<const __nv_fp8_e4m3 *>(k)[(physical(slot) * kvHeads + kh) * 192 + lane + j * 32]);
+                    else dot += query[j] * float(k[(physical(slot) * kvHeads + kh) * 192 + lane + j * 32]);
                 dot = WarpSum(dot);
                 if (lane == 0)
                     score[slot] = RoundBF16(RoundBF16(dot) * rsqrtf(192.f));

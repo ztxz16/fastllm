@@ -18,11 +18,14 @@ class SwaOutputState {
     fastllm_swa_output::Peers peers;
     uint64_t *epochs[8]{};
     const void *const kernel = (const void *)fastllm_swa_output::OutputNorm<32>;
-    bool verifySupported[4]{};
+    enum VerifyVariant { Narrow, StagedWide, DirectWide, MxNarrow, MxFp8Narrow,
+                         MxFp8Wide, MxWide, MxBulk, VerifyVariants };
+    bool verifySupported[VerifyVariants]{};
     bool layerSupported = false, mxLayerSupported = false, mxOutputSupported = false, outputRouterSupported = false, rowsSupported = false;
     bool rowsRouterExpertsSupported = false, rowsMmaSupported = false;
     bool preparedRouterSupported = false, routedRouterSupported = false;
     bool swaRouterPdlSupported = false, unpreparedRouterPdlSupported = false;
+    bool wideRouterPdlSupported[2][2]{}; // [FP8 KV][prepared MoE input]
     bool preparedVectorRouterSupported = false, rowsDirectRouterSupported = false;
     bool widePreparedRouterSupported = false;
     // A registered output tuple alone does not establish that the eight-row
@@ -113,9 +116,17 @@ public:
             const FastllmMoePreparedInput *prepared = nullptr, bool afterSwa = false) {
         using namespace fastllm_swa_output;
 #if CUDART_VERSION >= 12000
+        if (afterSwa && prepared && rows > 8)
+            return fastllm::cuda_launch::LaunchProgrammatic<NormRowsRouterDirect<8, 4, true, 16, false, true>>(
+                dim3(32, 4), 256, 0, cudaStreamPerThread, (const BF16 *)hidden, routerWeight, router,
+                normWeight, (BF16 *)normed, eps, rows, *prepared, (const BF16 *)nullptr, (BF16 *)nullptr);
+        if (afterSwa && !prepared && rows > 8)
+            return fastllm::cuda_launch::LaunchProgrammatic<NormRowsRouterDirect<8, 4, false, 16, false, true>>(
+                dim3(32, (rows + 3) / 4), 256, 0, cudaStreamPerThread, (const BF16 *)hidden, routerWeight,
+                router, normWeight, (BF16 *)normed, eps, rows, FastllmMoePreparedInput{}, (const BF16 *)nullptr, (BF16 *)nullptr);
         if (afterSwa && !prepared)
             return fastllm::cuda_launch::LaunchProgrammatic<NormRowsRouterExperts<8, false, true>>(
-                dim3(32, 4), 256, 0, cudaStreamPerThread, (const BF16 *)hidden, routerWeight,
+                dim3(32, (rows + 1) / 2), 256, 0, cudaStreamPerThread, (const BF16 *)hidden, routerWeight,
                 router, normWeight, (BF16 *)normed, eps, rows, FastllmMoePreparedInput{});
 #endif
         if (prepared && prepared->epRank>=0) {
@@ -176,24 +187,29 @@ public:
         }
         return cudaGetLastError();
     }
-    bool VerifySupported(int rows, bool mx = false) const {
-        if (mx) return rows >= 2 && rows <= 8 && verifySupported[3];
+    bool VerifySupported(int rows, bool mx = false, bool fp8Cache = false) const {
+        if (mx && rows > 8) return rows <= fastllm_swa_verify::RowLimit && verifySupported[fp8Cache ? MxFp8Wide : (fastllm_swa_verify::PackedThreads(rows, false) == 256 ? MxBulk : MxWide)];
+        if (mx) return rows >= 2 && rows <= 8 && verifySupported[fp8Cache ? MxFp8Narrow : MxNarrow];
         return rows >= 1 && rows <= fastllm_swa_verify::RowLimit &&
-            (rows <= 8 ? verifySupported[0] : verifySupported[1] || verifySupported[2]);
+            (rows <= 8 ? verifySupported[Narrow] : verifySupported[StagedWide] || verifySupported[DirectWide]);
     }
     cudaError_t LaunchVerify(fastllm_swa_verify::Args args, int rank,
             const float *normWeight, const float *routerWeight, float *router,
             const FastllmMoePreparedInput *prepared = nullptr) {
         args.peers = peers; args.epochs = epochs[rank]; args.rank = rank;
-        args.overlapRouter = args.rotary && args.rows == 8 && routerWeight &&
+        args.overlapRouter = args.rotary && args.rows >= 2 && args.rows <= 8 && routerWeight &&
             (prepared ? swaRouterPdlSupported && prepared->overlapVerifyGate && (!prepared->routed || prepared->epRank>=0)
                       : unpreparedRouterPdlSupported);
+        if (args.rotary && args.rows > 8 && args.rows <= 16 && routerWeight &&
+            (!prepared || (!prepared->routed && prepared->Valid(args.rows))))
+            args.overlapRouter = wideRouterPdlSupported[args.fp8Cache][prepared != nullptr] &&
+                UseRowsDirectRouter(args.hidden, normWeight, args.normed, routerWeight, args.rows);
         void *params[] = {&args};
-        const bool wide = args.rows > 8 && verifySupported[2];
+        const bool wide = args.rows > 8 && verifySupported[DirectWide];
         const bool mx = args.outputScales != nullptr;
-        const auto *kernel = fastllm_swa_verify::Kernel(args.rows, wide, mx);
-        const int threads = fastllm_swa_verify::Threads(args.rows);
-        const int shared = fastllm_swa_verify::SharedBytes(args.rows, wide, mx);
+        const auto *kernel = fastllm_swa_verify::Kernel(args.rows, wide, mx, args.fp8Cache);
+        const int threads = mx ? fastllm_swa_verify::PackedThreads(args.rows, args.fp8Cache) : fastllm_swa_verify::Threads(args.rows);
+        const int shared = fastllm_swa_verify::SharedBytes(args.rows, wide, mx, args.fp8Cache);
         cudaError_t status;
 #if CUDART_VERSION >= 12000
         if (args.rotary) {
@@ -299,20 +315,21 @@ private:
         // Every schedule reuses the established mailbox and must be resident
         // on all ranks. The direct-input query tile falls back to the original
         // N8 staging schedule when its required resources are unavailable.
-        for (int variant = 0; variant < 4; ++variant) {
+        for (int variant = 0; variant < VerifyVariants; ++variant) {
             verifySupported[variant] = stagesEnabled;
             if (!stagesEnabled) continue;
-            const int rows = variant == 1 || variant == 2 ? 64 : 8;
-            const void *entry = fastllm_swa_verify::Kernel(rows, variant == 2, variant == 3);
-            const int threads = fastllm_swa_verify::Threads(rows);
-            const int shared = fastllm_swa_verify::SharedBytes(rows, variant == 2, variant == 3);
+            const int rows = variant == MxWide ? 16 : (variant == StagedWide || variant == DirectWide || variant >= MxFp8Wide ? 64 : 8);
+            const bool fp8Cache = variant == MxFp8Narrow || variant == MxFp8Wide;
+            const void *entry = fastllm_swa_verify::Kernel(rows, variant == DirectWide, variant >= MxNarrow, fp8Cache);
+            const int threads = variant >= MxNarrow ? fastllm_swa_verify::PackedThreads(rows, fp8Cache) : fastllm_swa_verify::Threads(rows);
+            const int shared = fastllm_swa_verify::SharedBytes(rows, variant == DirectWide, variant >= MxNarrow, fp8Cache);
             for (int device : requested) {
                 cudaDeviceProp p{}; cudaFuncAttributes a{}; int active = 0;
                 if (cudaSetDevice(device) != cudaSuccess ||
                     cudaGetDeviceProperties(&p, device) != cudaSuccess ||
                     cudaFuncSetAttribute(entry, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) != cudaSuccess ||
                     cudaFuncGetAttributes(&a, entry) != cudaSuccess || a.ptxVersion < 80 ||
-                    (variant == 3 && (p.major != 10 || p.minor != 3 || a.ptxVersion < 89)) ||
+                    (variant >= MxNarrow && (p.major != 10 || p.minor != 3 || a.ptxVersion < 89)) ||
                     a.maxThreadsPerBlock < threads ||
                     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, entry, threads, shared) != cudaSuccess ||
                     active * p.multiProcessorCount < 128) {
@@ -454,8 +471,21 @@ private:
             }
             return attr.binaryVersion >= 90 && attr.ptxVersion >= 90 && attr.maxThreadsPerBlock >= threads;
         };
-        swaRouterPdlSupported = verifySupported[3] && preparedVectorRouterSupported;
-        unpreparedRouterPdlSupported = verifySupported[3] && rowsRouterExpertsSupported;
+        swaRouterPdlSupported = verifySupported[MxNarrow] && preparedVectorRouterSupported;
+        for (bool fp8 : {false, true}) for (bool prepare : {false, true}) {
+            const auto *producer = fastllm_swa_verify::Kernel(16, true, true, fp8);
+            const void *consumer = prepare ? (const void *)fastllm_swa_output::NormRowsRouterDirect<8, 4, true, 16, false, true>
+                                           : (const void *)fastllm_swa_output::NormRowsRouterDirect<8, 4, false, 16, false, true>;
+            bool &supported = wideRouterPdlSupported[fp8][prepare];
+            supported = verifySupported[fp8 ? MxFp8Wide : MxWide] && rowsDirectRouterSupported &&
+                (!prepare || widePreparedRouterSupported);
+            for (int device : requested) {
+                if (!supported) break;
+                supported = cudaSetDevice(device) == cudaSuccess && pdlKernel(producer, 1024) && pdlKernel(consumer, 256);
+                if (!supported) cudaGetLastError();
+            }
+        }
+        unpreparedRouterPdlSupported = verifySupported[MxNarrow] && rowsRouterExpertsSupported;
         for (int device : requested) {
             if (!swaRouterPdlSupported && !unpreparedRouterPdlSupported) break;
             if (cudaSetDevice(device) != cudaSuccess ||
