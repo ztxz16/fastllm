@@ -60,17 +60,24 @@ Qwen3DeviceWeights::Qwen3DeviceWeights(const Qwen3ShardLoader &loader, cudaStrea
         const uint64_t width = tensor.dtype == "F32" ? 4 : 2;
         const uint64_t bytes = (tensor.bytes / width) * 2;
         if (tensor.bytes > maxTensorBytes) {
-            throw std::runtime_error("Qwen3 source tensor limit: " + tensor.name);
+            throw std::runtime_error("Qwen3 source tensor limit: " + tensor.name +
+                "; tensor_bytes=" + std::to_string(tensor.bytes) +
+                "; limit_bytes=" + std::to_string(maxTensorBytes));
         }
         if (bytes > maxDeviceBytes - deviceBytes || bytes > std::numeric_limits<size_t>::max()) {
-            throw std::runtime_error("Qwen3 device weight limit: " + tensor.name);
+            throw std::runtime_error("Qwen3 device weight limit: " + tensor.name +
+                "; planned_bytes=" + std::to_string(deviceBytes) +
+                "; tensor_bytes=" + std::to_string(bytes) +
+                "; limit_bytes=" + std::to_string(maxDeviceBytes));
         }
         deviceBytes += bytes;
     }
     size_t freeBytes = 0, totalBytes = 0;
     CheckCuda(cudaMemGetInfo(&freeBytes, &totalBytes));
     if (deviceBytes > freeBytes) {
-        throw std::runtime_error("Qwen3 device weights exceed free GPU memory");
+        throw std::runtime_error("Qwen3 device weights exceed free GPU memory: required_bytes=" +
+            std::to_string(deviceBytes) + "; free_bytes=" + std::to_string(freeBytes) +
+            "; total_bytes=" + std::to_string(totalBytes));
     }
 
     tensors.reserve(plan.tensors.size());

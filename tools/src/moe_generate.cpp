@@ -10,6 +10,7 @@
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <random>
 #include <set>
@@ -227,7 +228,8 @@ int main(int argc, char **argv) {
         }
         if (options.devices.size() != 1 && options.devices.size() != 2 && options.devices.size() != 4) throw std::runtime_error("MoE requires 1/2/4 ranks");
         group.Start(options);
-        auto loaded = group.LoadQwenMoe(std::filesystem::absolute(args.at("--model")).string(), 1ULL<<30, 12ULL<<30, timeout);
+        auto loaded = group.LoadQwenMoe(std::filesystem::absolute(args.at("--model")).string(),
+            1ULL << 30, std::numeric_limits<uint64_t>::max(), timeout);
         Json::array workers;
         for (const auto &w : group.Workers()) {
             const auto &info = loaded.at(w.rank);
