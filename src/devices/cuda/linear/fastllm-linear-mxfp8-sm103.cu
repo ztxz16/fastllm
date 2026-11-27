@@ -48,8 +48,8 @@ __global__ void PrepareOperands(const float4 *src, uint32_t *dst, const __nv_bfl
 
 using Desc = cute::TmaDescriptor;
 bool Descriptor(Desc &d, void *ptr, CUtensorMapDataType type, int inner, int outer, int bytes, int boxX,
-                int boxY, bool swizzle) {
-    const cuuint64_t dims[] = {uint64_t(inner), uint64_t(outer)}, stride[] = {uint64_t(inner) * bytes};
+                int boxY, bool swizzle, int pitch = 0) {
+    const cuuint64_t dims[] = {uint64_t(inner), uint64_t(outer)}, stride[] = {uint64_t(pitch ? pitch : inner) * bytes};
     const cuuint32_t box[] = {uint32_t(boxX), uint32_t(boxY)}, step[] = {1, 1};
     return cuTensorMapEncodeTiled(
                reinterpret_cast<CUtensorMap *>(&d), type, 2, ptr, dims, stride, box, step,
@@ -93,7 +93,7 @@ template <int M, int Cluster, int N = 128> struct Projection {
         Desc a, b, as, bs, c;
         if (!Descriptor(a, q, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, rows, 1, 128, LoadM, true) ||
             !Descriptor(b, w, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, n, 1, 128, LoadN, true) ||
-            !Descriptor(as, sa, CU_TENSOR_MAP_DATA_TYPE_INT32, pitch, k / 128, 4, 128, 1, false) ||
+            !Descriptor(as, sa, CU_TENSOR_MAP_DATA_TYPE_INT32, (rows + 3) / 4 * 4, k / 128, 4, 128, 1, false, pitch) ||
             !Descriptor(bs, sw, CU_TENSOR_MAP_DATA_TYPE_INT32, n, k / 128, 4, ScaleN, 1, false) ||
             !Descriptor(c, y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, n, rows, 2, 64, LargeTile ? M : 16, true))
             return false;
@@ -114,14 +114,14 @@ template <int M, int Cluster, int N = 128> struct Projection {
         cfg.stream = cudaStreamPerThread;
         cfg.attrs = attrs;
         cfg.numAttrs = Overlap ? 2 : 1;
-        prepare();
+        if (!prepare()) return false;
         auto status = cudaLaunchKernelEx(&cfg, Kernel<Overlap>(), (int *)nullptr, (uint32_t)rows, (uint32_t)n,
                                          (uint32_t)k, dg::EpilogueOperatorArgs{}, a, b, as, bs, c);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         return true;
     }
     static bool Run(void *q, void *w, void *sa, void *sw, void *y, int rows, int n, int k, int pitch) {
-        return RunPrepared(q, w, sa, sw, y, rows, n, k, pitch, [] {});
+        return RunPrepared(q, w, sa, sw, y, rows, n, k, pitch, [] { return true; });
     }
 
 };
@@ -266,8 +266,8 @@ bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma
                             const float *positions, float theta, void *rotary, bool afterExpertReduce) {
     constexpr int k = 4096, n = 1856;
     constexpr size_t scaleBytes = size_t(n) * k / 32;
-    static_assert(scaleBytes + 8 * (k + k / 32) <= kWorkspace);
-    if (rows < 2 || rows > 8 || !scales || !positions || !rotary) return false;
+    static_assert(scaleBytes + 16 * (k + k / 32) <= kWorkspace);
+    if (rows < 2 || rows > 16 || !scales || !positions || !rotary) return false;
     const int device = FastllmCudaGetDevice();
     const bool capture = FastllmCudaGraphIsCapturing();
     auto *state = fastllm_bf16_lt::GetState(device, true);
@@ -299,6 +299,7 @@ bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma
             qx, sx, rows, pitch, positions, theta, static_cast<__nv_bfloat162 *>(rotary),
             static_cast<const __nv_bfloat16 *>(nullptr), static_cast<__nv_bfloat16 *>(nullptr));
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        return true;
     });
 }
 
@@ -448,10 +449,7 @@ int PreparedProjectionRows(const fastllm::Data &w, bool verifying) {
 
 bool CanPackPrefill(const fastllm::Data &w, int rows) {
     if (!FastllmCudaCompactMxfp8(w) || FastllmCudaGraphIsCapturingFast()) return false;
-    const auto support = GetProjectionSupport(FastllmCudaGetDevice(), false);
-    int count = rows;
-    SelectProjection(count, rows, w.dims[0], false, support);
-    return support.smallRows && count == rows;
+    return rows > 0 && GetProjectionSupport(FastllmCudaGetDevice(), false).smallRows;
 }
 
 bool ProjectPrepared(FastllmMxfp8Activation input, const fastllm::Data &w, void *output) {
@@ -462,17 +460,27 @@ bool ProjectPrepared(FastllmMxfp8Activation input, const fastllm::Data &w, void 
     const auto support = GetProjectionSupport(FastllmCudaGetDevice(), capturing);
     if (!support.smallRows) return false;
     auto run = SelectProjection(count, input.rows, w.dims[0], capturing, support);
-    if (count != input.rows) return false; // Linear handles a separate trailing tile.
-    return run(input.values, w.cudaData, input.scales, scales, output,
-               input.rows, w.dims[0], input.width, input.pitch);
+    const int n = w.dims[0], k = input.width, tail = input.rows - count;
+    auto prefix = [&] {
+        return run(input.values, w.cudaData, input.scales, scales, output, count, n, k, input.pitch);
+    };
+    if (!tail) return prefix();
+    // SelectProjection splits only the N256 bulk cluster, on a complete M pair.
+    // Encode the tail first so an unavailable descriptor cannot leave a partial output.
+    auto *q = input.values + size_t(count) * k;
+    auto *s = input.scales + size_t(count) * sizeof(uint32_t);
+    auto *y = static_cast<__nv_bfloat16 *>(output) + size_t(count) * n;
+    if (tail <= 16)
+        return Projection<16, 2>::RunPrepared(q, w.cudaData, s, scales, y, tail, n, k, input.pitch, prefix);
+    return Projection<32, 2>::RunPrepared(q, w.cudaData, s, scales, y, tail, n, k, input.pitch, prefix);
 }
 bool ProjectPreparedPdl(FastllmMxfp8Activation input, const fastllm::Data &weight, void *output) {
     auto *scales = const_cast<void *>(FastllmCudaCompactMxfp8(weight));
-    if (!scales || input.rows < 2 || input.rows > 8 ||
+    if (!scales || input.rows < 1 || input.rows > 16 ||
         !GetProjectionSupport(FastllmCudaGetDevice(), FastllmCudaGraphIsCapturing()).swaSignal)
         return false;
     return Projection<16, 1>::RunPrepared<true>(input.values, weight.cudaData, input.scales, scales,
-        output, input.rows, weight.dims[0], input.width, input.pitch, [] {});
+        output, input.rows, weight.dims[0], input.width, input.pitch, [] { return true; });
 }
 
 } // namespace

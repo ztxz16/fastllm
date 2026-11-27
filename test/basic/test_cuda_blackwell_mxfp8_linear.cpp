@@ -155,6 +155,24 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
         Check(cudaMemcpy(a.data(), y.cudaData, y.GetBytes(), cudaMemcpyDeviceToHost));
         Check(cudaMemcpy(b.data(), projected.cudaData, projected.GetBytes(), cudaMemcpyDeviceToHost));
         Require(a == b, "verification prepared GEMM changed BF16 output");
+        if (m > 1024 && n == 8192) {
+            cudaGraph_t graph;
+            cudaGraphExec_t exec;
+            Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+            Require(backend->TryProject(view, x, w, bias, projected), "capture prepared bulk/tail");
+            Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+            size_t nodes = 0;
+            Check(cudaGraphGetNodes(graph, nullptr, &nodes));
+            Require(nodes == 2, "expected bulk and tail projections without requantization");
+            Check(cudaGraphInstantiateWithFlags(&exec, graph, 0));
+            Check(cudaMemsetAsync(projected.cudaData, 0xff, projected.GetBytes(), cudaStreamPerThread));
+            Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+            Check(cudaStreamSynchronize(cudaStreamPerThread));
+            Check(cudaMemcpy(b.data(), projected.cudaData, projected.GetBytes(), cudaMemcpyDeviceToHost));
+            Require(a == b, "captured bulk/tail changed BF16 output");
+            Check(cudaGraphExecDestroy(exec));
+            Check(cudaGraphDestroy(graph));
+        }
     }
     bool supported = block32 ? FastllmCudaTryBlock32Mxfp8Sm103(x, w, y, projectionWorkspace) : FastllmCudaMxfp8LinearSM103(x.cudaData, w, y.cudaData, m, k, n);
     const bool quantized = !invalid && (m > 1 || wideGemv || block32);
@@ -295,7 +313,9 @@ int main() {
         FastllmCudaLinearGraphScope scope(lease);
         for (int rows : {1, 7, 16, 128}) Run(rows, 4096, 1280, false, false, false, true);
 
-        Run(128, 6784, 4096, false, true);
+        for (int rows : {9, 15, 16, 128, 1025}) Run(rows, 6784, 4096, false, true);
+        // N256 bulk clusters plus a short or multi-tile suffix at the parent scale pitch.
+        for (int rows : {1025, 1101}) Run(rows, 8192, 4096, false, true);
         Run(1, 256, 512);
         Run(3, 192, 256);
         Run(8, 1856, 4096);
