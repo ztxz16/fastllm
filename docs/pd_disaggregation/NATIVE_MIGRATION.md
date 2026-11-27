@@ -90,6 +90,18 @@ FT 通过 CMake 接入当前 FlashInfer 上游使用的 CCCL v3.3.2 完整固定
 版本、离线配置与兼容边界见[CCCL 依赖说明](../../tools/third_party/README.md#flashinfer-的-cccl-构建依赖2026-11-27)。
 已完成 Review 和静态检查，未本地运行 CMake、编译或 GPU 验收；服务器复用上方前台构建命令。
 
+### 2026-11-27：Marlin MoE 的 SM70 编译保护
+
+V100 构建在 FT 的 `fastllm-moe-vllm-marlin.cu` 中报 `dequant` 未声明：
+Marlin 解包辅助函数仅在 SM75 及以上架构中声明，FT 的调用此前没有对应的编译保护。
+本次在 FT 的 CUDA C++ 累加辅助函数中补齐条件；SM75 以下不引用该接口，误入时触发设备异常。
+正式 Marlin MoE 后端仍由 C++ 主机侧检查限制在 SM80 及以上，V100 沿用已有其他执行路径，
+不增加低架构 Marlin 支持。原有受支持架构的解包、FP16 累加顺序及缩放方式保持不变。
+
+实现模块为 FT Marlin MoE 适配层（CUDA C++）；不修改 Marlin 头文件或 `third_party/`。
+仅做源码 Review、架构条件文本检查和差异检查，未本地编译或运行 GPU 测试。
+服务器需继续完成四个原生目标构建；本条不代表模型或数值验收通过。
+
 构建后逐阶段后台验收，每次检查运行目录的 `exit_code` 和汇总报告：
 
 ```bash

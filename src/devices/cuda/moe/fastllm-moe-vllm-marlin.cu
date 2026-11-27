@@ -572,9 +572,28 @@ __device__ __forceinline__ half2 AwqDecodeZeroHalf2(int zero) {
     return *reinterpret_cast<const half2 *>(&packed);
 }
 
+/**
+ * 将一个 Marlin 打包权重字中的两组 U4 权重累加到 FP16 向量。
+ *
+ * 保持原有解包、去零点和 half2 FMA 顺序；缩放由调用方处理。
+ * dequant 仅在 SM75 及以上架构中声明，低架构设备编译不得引用它。
+ * 正式 Marlin MoE 入口仅接受 SM80 及以上设备；低架构误入时触发设备异常，
+ * 不以未计算的累加值继续执行。
+ *
+ * @param packed     按 Marlin 布局排列的八个 U4 值，存放于一个 uint32_t。
+ * @param inputLow   FP16 half2 输入，与每组第一个解包向量相乘。
+ * @param inputHigh  FP16 half2 输入，与每组第二个解包向量相乘。
+ * @param zero0      第一组零点的 half2 表示，包含解包保留的 1024 偏移。
+ * @param zero1      第二组零点的 half2 表示，包含同一偏移。
+ * @param sum0       第一组 FP16 half2 累加值，原位更新。
+ * @param sum1       第二组 FP16 half2 累加值，原位更新。
+ */
 __device__ __forceinline__ void AwqMarlinAccumulatePackedPair(
         uint32_t packed, half2 inputLow, half2 inputHigh,
         half2 zero0, half2 zero1, half2 &sum0, half2 &sum1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    asm volatile("trap;");
+#else
     half2 quant0[2];
     half2 quant1[2];
     marlin_kernel::dequant<
@@ -587,6 +606,7 @@ __device__ __forceinline__ void AwqMarlinAccumulatePackedPair(
     sum0 = __hfma2(inputHigh, __hsub2(quant0[1], zero0), sum0);
     sum1 = __hfma2(inputLow, __hsub2(quant1[0], zero1), sum1);
     sum1 = __hfma2(inputHigh, __hsub2(quant1[1], zero1), sum1);
+#endif
 }
 
 __device__ __forceinline__ float AwqHorizontalHalf2(half2 value) {
