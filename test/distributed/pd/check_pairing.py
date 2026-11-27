@@ -89,8 +89,11 @@ def services(p_groups=((0,), (2,)), d_groups=((1,), (3,)), *, policy="load", edg
 
 def body(p, d, mode="pull", request="a", length=2):
     identity = Identity(request, "transfer-" + request, p.peer, d.peer, "p_to_d", mode)
-    return dict(identity=asdict(identity), request=dict(token_ids=[1] * length, max_new_tokens=8,
-                eos_token_ids=[]), peer_url="d-url", source_url="p-url", expires_at=time.time() + 60)
+    # 与正式入口一致，控制用例也须提供完整采样参数，通过服务的请求校验。
+    generation = dict(token_ids=[1] * length, max_new_tokens=8, temperature=0.0,
+                      top_k=0, top_p=1.0, seed=20261126, eos_token_ids=[])
+    return dict(identity=asdict(identity), request=generation, peer_url="d-url",
+                source_url="p-url", expires_at=time.time() + 60)
 
 
 def record(service, payload):
