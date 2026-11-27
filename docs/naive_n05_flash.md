@@ -155,6 +155,16 @@ ctest --test-dir build -R '^naive_n05_(fp4_(kv|vector)|kvmem(_transition|_prefix
 Indexer context parallel，长上下文 prefill/decode 可能变慢，需按负载选择。
 批量 decode 每层只广播一次整批 TopK，支持现有的预捕获 Graph 回放。
 
+### H20 上的 TP8/EP1 MXFP4 解码
+
+Naive Exp18 使用 BF16 激活、TP8/EP1 和 `--max_batch` 1 到 4 时，后端会检查八个
+SM90 设备、专家分片、量化比例和内核驻留条件。检查通过后，启动日志会显示
+`backend=mega-tp/packed-stage`。DSpark 7 显式设置 `FASTLLM_NAIVE_MOE_FUSION=1`
+时可使用最多 8 个请求。长 prefill 需要逐层恢复专家权重，因此 5 到 8 个请求默认沿用原有 TP 后端。
+
+解码和验证直接读取常驻的重排专家权重，再通过 TP all-reduce 合并各卡结果。
+加载时逐层释放原始专家分片。长 prefill 在每卡共享的单层缓冲区还原权重，再执行常规 TP 专家计算。
+
 ### EP8 与内置 MegaMoE
 
 MiMo FP8 在 8 张 H20 上可直接使用 `--tp 8 --ep 8`：Attention 保持 TP8，
@@ -950,3 +960,10 @@ FP8 Tensor Core 计算，输出仍为 BF16。此参数复用已有的 native FP8
 不支持的 CUDA 版本/设备、形状、Graph 捕获及小批量保留原有权重量化实现。
 转换权重和量化激活都会引入数值误差，需要按实际语料评估；关闭激活量化不会还原已量化权重，
 恢复原始精度须移除 dtype 配置后重新加载模型。
+
+### SM90 上的 MXFP4 EP8 专家分布
+
+默认按专家编号连续分到八张卡。对有 256 个专家、每次路由选择 8 个专家的模型，
+可将 `FASTLLM_SM90_EP_PLACEMENT` 设为 JSON 文件路径。以模型层号的十进制字符串为键，
+每个 MoE 层提供 0 到 255 的完整排列。数组下标是逻辑专家编号，值是物理槽位，
+每张卡连续持有 32 个槽位。加载时重排权重，推理时沿用模型原有的逻辑路由编号。

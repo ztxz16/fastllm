@@ -7,6 +7,7 @@
 #include <cutlass/arch/reg_reconfig.h>
 
 #include <cstdint>
+#include <type_traits>
 #include <cute/algorithm/cooperative_gemm.hpp>
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
@@ -155,6 +156,38 @@ constexpr uint32_t sm90_mxfp4_num_threads(const bool swap_ab, const bool use_rs,
   return 64 + 64 + 256 + (sm90_mxfp4_split_decode(swap_ab, use_rs, block_m) ? 256 : 0);
 }
 
+struct Mxfp4ProfileArgument { using Argument = unsigned long long*; };
+
+template <uint32_t Warps, uint32_t kNumSMs, uint32_t kNumExperts, uint32_t kNumRanks, class Prologue>
+CUTLASS_DEVICE void publish_ep_routes(const Prologue& prologue, const layout::Workspace& workspace,
+                                     const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                     uint32_t sm_idx, uint32_t warp_idx, uint32_t lane_idx) {
+  constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
+  // One warp classifies 32 routes at a time for one destination expert.
+  // Lane prefixes keep slots in token order across route tiles.
+  for (uint32_t dest = sm_idx * Warps + warp_idx; dest < kNumExperts;
+       dest += kNumSMs * Warps) {
+    const uint32_t rank = dest / kNumExpertsPerRank, local = dest % kNumExpertsPerRank;
+    uint32_t count = 0;
+#pragma unroll
+    for (uint32_t base = 0; base < Prologue::slots; base += 32) {
+      const bool match = prologue.expert(base + lane_idx) == static_cast<int>(dest);
+      const unsigned mask = __ballot_sync(0xffffffffu, match);
+      if (match) {
+        const uint32_t index = count + __popc(mask & ((1u << lane_idx) - 1u));
+        auto *slot = workspace.get_src_token_topk_idx_ptr(local, sym_buffer.rank_idx, index);
+        *sym_buffer.map(slot, rank) = base + lane_idx;
+      }
+      count += __popc(mask);
+    }
+    if (!lane_idx) {
+      *sym_buffer.map(workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, local), rank) = count;
+      ptx::atomic_add_sys(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(local), rank),
+                          (static_cast<uint64_t>(kNumSMs) << 32) | count);
+    }
+  }
+}
+
 template <uint32_t kNumSMs,
           // Expert-parallel width. SymBuffer<N> has one layout for every N, and the
           // barriers, scheduler and workspace were already templated on it.
@@ -176,7 +209,8 @@ template <uint32_t kNumSMs,
           // on the NVFP4 side when they were runtime-gated -- so the shipped kernel
           // must not contain them at all. Defaulted, so every existing instantiation
           // (and every compile-gate row) keeps its current meaning.
-          bool kPhaseStamps = false>
+          bool kPhaseStamps = false, uint32_t kLocalMaxRows = 0, bool kGroupLocalRows = false,
+          bool kLanePackedWeights = false, typename Prologue = Mxfp4ProfileArgument>
 CUTLASS_GLOBAL __launch_bounds__(
     sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand, BLOCK_M),
     1) void sm90_mxfp4_mega_moe_fused_impl(void* y, int* cumulative_local_expert_recv_stats,
@@ -202,39 +236,8 @@ CUTLASS_GLOBAL __launch_bounds__(
                                            const float* __restrict__ l2_global_scales,
                                            // Only written when kPhaseStamps; see the slot map in
                                            // the body.
-                                           unsigned long long* __restrict__ phase_stamps) {
-  constexpr uint32_t BLOCK_K = 128;
-  constexpr uint32_t kNumDispatchThreads = 64;
-  constexpr uint32_t kNumNonEpilogueThreads = 64;
-  // Decode gets its own warps so it overlaps the WGMMA rather than
-  // serialising with it on the math warps.
-  constexpr bool kSplitDecodeWarps =
-      sm90_mxfp4_split_decode(kSwapABRequested, kUseRSOperand, BLOCK_M);
-  constexpr uint32_t kNumDecodeThreads = kSplitDecodeWarps ? 256 : 0;
-  constexpr uint32_t kNumEpilogueThreads = 256;
-  constexpr uint32_t kNumThreads =
-      kNumDispatchThreads + kNumNonEpilogueThreads + kNumDecodeThreads + kNumEpilogueThreads;
-  FI_MEGAMOE_STATIC_ASSERT(
-      kNumThreads == sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand, BLOCK_M),
-      "Launch bounds and the role partition disagree");
-  FI_MEGAMOE_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Experts must divide evenly across ranks");
-  FI_MEGAMOE_STATIC_ASSERT(kHidden % 128 == 0, "Hidden must be a multiple of BLOCK_K");
-  FI_MEGAMOE_STATIC_ASSERT(kIntermediateHidden % 128 == 0,
-                           "Intermediate hidden must be a multiple of BLOCK_K");
-  constexpr uint32_t L1_SHAPE_N = kIntermediateHidden * 2;
-  constexpr uint32_t L1_SHAPE_K = kHidden;
-  constexpr uint32_t L2_SHAPE_N = kHidden;
-  constexpr uint32_t L2_SHAPE_K = kIntermediateHidden;
-  constexpr uint32_t kNumDispatchWarps = kNumDispatchThreads / 32;
-  constexpr uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32;
-  constexpr uint32_t kNumDecodeWarps = kNumDecodeThreads / 32;
-  constexpr uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32;
-  // Warp map: [dispatch][A loader][B loader][decode][math]
-  constexpr uint32_t kFirstDecodeWarp = kNumDispatchWarps + kNumMMANonEpilogueWarps;
-  constexpr uint32_t kFirstMathWarp = kFirstDecodeWarp + kNumDecodeWarps;
-  constexpr uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4;
-  constexpr uint32_t kNumTokensPerWarp = 32 / kNumTopk;
-  constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
+                                           typename Prologue::Argument prologue) {
+  constexpr bool kRoutesPublished = false;
 #include <flashinfer/megamoe/sm90_mxfp4_mega_moe_fused_body.inl>
 }
 

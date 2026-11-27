@@ -40,7 +40,8 @@ if constexpr (!kBlockIsL2) {
           float u0 = final_accum[accum_offset + 2] * l1_global_scale;
           clamp_gate(g0);
           clamp_up(u0);
-          const float weight_0 = *l1_topk_weights_buffer.get_data_buffer(m_idx + token_0)
+          const float weight_0 = kGroupLocalRows ? localWeightsByExpert[local_expert_idx * kLocalMaxRows + sourceRow(token_0)] :
+              *l1_topk_weights_buffer.get_data_buffer(m_idx + token_0)
                                       .template get_base_ptr<float>();
           v0 = silu(g0) * u0 * weight_0;
           swap_v0[half][i] = v0;
@@ -53,7 +54,8 @@ if constexpr (!kBlockIsL2) {
           float u1 = final_accum[accum_offset + 3] * l1_global_scale;
           clamp_gate(g1);
           clamp_up(u1);
-          const float weight_1 = *l1_topk_weights_buffer.get_data_buffer(m_idx + token_1)
+          const float weight_1 = kGroupLocalRows ? localWeightsByExpert[local_expert_idx * kLocalMaxRows + sourceRow(token_1)] :
+              *l1_topk_weights_buffer.get_data_buffer(m_idx + token_1)
                                       .template get_base_ptr<float>();
           v1 = silu(g1) * u1 * weight_1;
           swap_v1[half][i] = v1;
@@ -327,7 +329,30 @@ if constexpr (!kBlockIsL2) {
   }
 } else {
   // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
-  if constexpr (kSwapABRequested) {
+  if constexpr (kGroupLocalRows && kSwapABRequested) {
+    // Each chunk of eight accumulator rows maps to the original input rows.
+#pragma unroll
+    for (uint32_t chunk = 0; chunk < kSwapABTokenChunks; ++chunk) {
+#pragma unroll
+      for (uint32_t row = 0; row < 2; ++row) {
+        const uint32_t token = chunk * 8 + col_idx * 2 + row;
+        const uint32_t slot = token < valid_m ? localSlotsByExpert[local_expert_idx * kLocalMaxRows + sourceRow(token)] : 0;
+        if (slot == 0) continue;
+        auto dst = combine_token_buffer.get_rank_buffer(slot - 1).get_data_buffer(sourceRow(token))
+                       .template get_base_ptr<nv_bfloat16>() + n_idx;
+#pragma unroll
+        for (uint32_t half = 0; half < kSwapABWeightHalves; ++half) {
+          const uint32_t offset = half * kSwapABHalfAccumPerThread + chunk * 4 + row;
+          dst[half * 64 + r_0] = __float2bfloat16_rn(final_accum[offset] * l2_global_scale);
+          dst[half * 64 + r_1] = __float2bfloat16_rn(final_accum[offset + 2] * l2_global_scale);
+        }
+      }
+    }
+    // Local packed tiles scatter directly to disjoint global slots. The grid
+    // barrier before combine publishes them after all down tiles are done.
+    if constexpr (!kLanePackedWeights)
+      ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+  } else if constexpr (kSwapABRequested) {
     // Each active warp scatters a contiguous group of up to 16 rows.
     constexpr uint32_t kNumRowsPerWarp = BLOCK_M == 8 ? 4u : 8u;
     auto store_swap_bf16 = [&](const uint32_t& token, const uint32_t& col, const float& value) {
@@ -373,7 +398,7 @@ if constexpr (!kBlockIsL2) {
       const uint32_t token = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
       if (token >= valid_m) break;
 
-      const auto src_metadata =
+      const auto src_metadata = kLocalSlots ? layout::TokenSrcMetadata{0, pool_block_idx / kNumTopk, pool_block_idx % kNumTopk} :
           *workspace.get_token_src_metadata_ptr(pool_block_idx * BLOCK_M + token);
       const uint32_t dst_rank_idx = src_metadata.rank_idx;
       const uint32_t dst_token_idx = src_metadata.token_idx;

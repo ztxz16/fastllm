@@ -2754,8 +2754,8 @@ Data NaiveN05FlashModel::RunTarget(
             if (localMoe && !decodeWorkspace) reservePrefillArena();
             if (!localMoe || length) {
                 Data routedInput;
+                const int first = shardRouter ? (int)((int64_t)length * tpRank / epRanks) : -1;
                 if (shardRouter) {
-                    const int first = (int)((int64_t)length * tpRank / epRanks);
                     const int end = (int)((int64_t)length * (tpRank + 1) / epRanks);
                     routedInput.Resize({end - first, embed_dim});
                     routedInput.FakeFrom(normed, (size_t)first * embed_dim * normed.unitSize);
@@ -2764,7 +2764,7 @@ Data NaiveN05FlashModel::RunTarget(
                 Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
                 const bool selected = routes.Project(routerSource, routerWeight, verifying ? prefillScores : nullptr,
                     attentionRouterReady, routerNeedsNorm ? &hidden : nullptr,
-                    routerNeedsNorm ? &postAttentionNorm : nullptr, rms_norm_eps);
+                    routerNeedsNorm ? &postAttentionNorm : nullptr, rms_norm_eps, first);
                 if (routerNeedsNorm && !selected) norm(hidden, postAttentionNorm, normed);
                 if (!selected) {
                     const bool localRouter = localMoe && !decodeWorkspace && !verifying &&

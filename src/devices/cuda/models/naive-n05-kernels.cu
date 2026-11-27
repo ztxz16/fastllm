@@ -7249,26 +7249,37 @@ void FastllmCudaNaiveMergeVerifyIndexer(
 #endif
 }
 
-bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices, bool requireSm120) {
+static bool NaiveIndexerContextSupported(const std::vector<int> &devices, int arch) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
-    struct Capabilities { bool supported, sm120; };
+    struct Capabilities { bool supported, sm120, sm90; };
     static thread_local std::map<std::vector<int>, Capabilities> groups;
     auto it = groups.find(devices);
     if (it == groups.end()) {
-        Capabilities caps{devices.size() > 1, devices.size() == 8};
+        Capabilities caps{devices.size() > 1, devices.size() == 8, devices.size() > 1};
         for (int device : devices) {
             int major = 0, minor = 0;
             caps.supported = caps.supported && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
                 device) == cudaSuccess && major >= 8;
+            caps.sm90 = caps.sm90 && major == 9 && cudaDeviceGetAttribute(&minor,
+                cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess && minor == 0;
             caps.sm120 = caps.sm120 && major == 12 && cudaDeviceGetAttribute(&minor,
                 cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess && minor == 0;
         }
         it = groups.emplace(devices, caps).first;
     }
-    return requireSm120 ? it->second.sm120 : it->second.supported;
+    if (arch == 90) return it->second.sm90;
+    return arch == 120 ? it->second.sm120 : it->second.supported;
 #else
     return false;
 #endif
+}
+
+bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices, bool requireSm120) {
+    return NaiveIndexerContextSupported(devices, requireSm120 ? 120 : 0);
+}
+
+bool FastllmCudaNaiveHopperGroup(const std::vector<int> &devices) {
+    return NaiveIndexerContextSupported(devices, 90);
 }
 
 void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,

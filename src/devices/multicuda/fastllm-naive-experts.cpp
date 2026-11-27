@@ -10,9 +10,29 @@
 #include "devices/cuda/fastllm-cuda-decode-dense.h"
 #include "devices/multicuda/fastllm-naive-verify.h"
 #endif
+#include <cstdlib>
+#include <cstring>
 #include <optional>
+#ifdef FASTLLM_ENABLE_NAIVE_TP_MEGAMOE
+#include "naive-hopper-tp-experts.h"
+#endif
 
 namespace fastllm {
+namespace {
+enum class FusionMode { Automatic, Disabled, Enabled };
+
+FusionMode ReadFusionMode() {
+    const char *value = std::getenv("FASTLLM_NAIVE_MOE_FUSION");
+    if (value && std::strcmp(value, "0") == 0) return FusionMode::Disabled;
+    if (value && std::strcmp(value, "1") == 0) return FusionMode::Enabled;
+    return FusionMode::Automatic;
+}
+}
+
+bool FastllmTpExperts::FusionEnabled() {
+    return ReadFusionMode() != FusionMode::Disabled;
+}
+
 FastllmDenseResult FastllmRunNaiveDense(FastllmExpertHandoff *prepared, bool decode, int rank, int rows,
         Data &hidden, Data &normed, Data &gate, Data &up, Data &down, Data &gamma,
         float eps, Data &scratch, Data &output) {
@@ -40,7 +60,7 @@ NaiveMoeBackend FastllmTpExperts::Plan(const std::vector<int> &devices, int ep, 
 
 std::shared_ptr<FastllmTpExperts> FastllmTpExperts::Prepare(NaiveMoeBackend &layout, bool &packsSources,
         const std::vector<int> &devices, const Weights &weights, int hidden, int experts, int topk,
-        bool allowPackedTp, bool preferVerifyPages, PersistentWorkerGroup &workers, bool &packing,
+        bool allowPackedTp, int maxBatch, bool fixedRouting, bool preferVerifyPages, PersistentWorkerGroup &workers, bool &packing,
         std::shared_ptr<FastllmCudaMimoEp8Mega> &mega) {
     if ((layout == NaiveMoeBackend::FlexTP || layout == NaiveMoeBackend::LegacyFlexTP) &&
         !NaiveSharedFlexMoe::TPWeightsSupported(weights, devices, layout == NaiveMoeBackend::FlexTP)) {
@@ -60,16 +80,29 @@ std::shared_ptr<FastllmTpExperts> FastllmTpExperts::Prepare(NaiveMoeBackend &lay
         state->legacy = std::make_shared<NaiveFlexMoe>(devices, weights);
 #ifndef USE_ROCM
     } else if (layout == NaiveMoeBackend::LegacyTP && allowPackedTp) {
+        const FusionMode fusion = ReadFusionMode();
+        if (fusion == FusionMode::Disabled) return nullptr;
         struct RestoreDevice {
             int device = FastllmCudaGetDevice();
             ~RestoreDevice() { FastllmCudaSetDevice(device); }
         } restore;
+#ifdef FASTLLM_ENABLE_NAIVE_TP_MEGAMOE
+        // Restaging expert weights trades long-prefill throughput for faster verification.
+        const bool twoTiles = preferVerifyPages && fusion == FusionMode::Enabled;
+        const int requests = (kFastllmMxfp4LocalRoutedMaxRows / 8) * (twoTiles ? 2 : 1);
+        if (fixedRouting && hidden == 4096 && experts == 256 && topk == 8 && maxBatch > 0 && maxBatch <= requests &&
+            (state->hopper = HopperTpExperts::Prepare(devices, weights, workers, packing))) {
+            packsSources = true;
+            return state;
+        }
+#endif
         for (size_t r = 0; r < devices.size(); ++r) {
             FastllmCudaSetDevice(devices[r]);
             auto rank = PrepareMxfp4MarlinRank(devices[r], weights[r], hidden, experts, topk);
             if (!rank) return nullptr;
             state->ranks.push_back(std::move(rank));
         }
+        state->wideMarlin = devices.size() == 8 && FastllmCudaNaiveHopperGroup(devices);
         // No source may be retired until every rank has admitted its shards.
         packing = true;
         std::vector<std::exception_ptr> errors(devices.size());
@@ -84,11 +117,12 @@ std::shared_ptr<FastllmTpExperts> FastllmTpExperts::Prepare(NaiveMoeBackend &lay
 }
 
 const char *FastllmTpExperts::Name() const {
+    if (hopper) return "mega-tp/packed-stage";
     if (shared) return NaiveMoeBackendName(shared->ep ? NaiveMoeBackend::FlexEP : NaiveMoeBackend::FlexTP);
     return legacy ? NaiveMoeBackendName(NaiveMoeBackend::LegacyFlexTP) : "marlin-tp/mxfp4-w4a16";
 }
 void FastllmTpExperts::Validate(bool bf16, bool fixedRouting) const {
-    AssertInFastLLM(bf16 && (!(shared || legacy) || fixedRouting),
+    AssertInFastLLM(bf16 && (!(shared || legacy || hopper) || fixedRouting),
                     "Prepared expert configuration changed; reload the model.");
 }
 const FastllmTpExperts *FastllmTpExperts::ForRows(int rows, bool replicated) const {
@@ -104,11 +138,26 @@ bool FastllmTpExperts::PackedVerify(int rows, int count) const {
 }
 
 bool FastllmExpertRouter::CanRouteInExpert(int rows) const {
+    if (experts && experts->hopper)
+        return rows > 1 && rows < FastllmCudaGetLinearExactBatchThreshold() && topk == 8 && normalize && scale == 1.f &&
+               probabilities.dataType == FLOAT32 && !probabilities.dims.empty() && probabilities.dims.back() == 256 &&
+               bias.dataType == FLOAT32 && bias.Count(0) == 256 && bias.cudaData;
     return topk == 8 && experts && experts->shared && experts->shared->CanRoute(rows, probabilities, bias);
 }
 
 bool FastllmExpertRouter::Project(Data &input, Data &weight, Data *verifyScratch,
-        bool probabilitiesReady, const Data *residual, const Data *gamma, float eps) {
+        bool probabilitiesReady, const Data *residual, const Data *gamma, float eps, int firstShardRow) {
+    if (probabilitiesReady && firstShardRow >= 0) {
+        // TP attention produces all router rows. Each EP source dispatches just its own rows.
+        const int rows = input.dims.at(0);
+        const int width = probabilities.dims.back();
+        AssertInFastLLM(width > 0 && (size_t(firstShardRow) + rows) * width <= probabilities.Count(0),
+                        "EP router shard exceeds the fused attention output.");
+        Data local(probabilities.dataType, {rows, width});
+        local.FakeFrom(probabilities, size_t(firstShardRow) * width * probabilities.unitSize);
+        SelectExpert(local, ids, scores, topk, normalize, scale, &bias);
+        return true;
+    }
     if (experts && experts->legacy) {
         if (!probabilitiesReady && !FastllmCudaNaiveRouterSigmoid(input, weight, probabilities)) {
             ToDataType(input, projectionScratch, FLOAT32);
@@ -117,7 +166,7 @@ bool FastllmExpertRouter::Project(Data &input, Data &weight, Data *verifyScratch
         }
         return true;
     }
-    if (!gamma && (!experts || !experts->shared) && verifyScratch &&
+    if (!gamma && (!experts || (!experts->shared && !experts->hopper)) && verifyScratch &&
         FastllmCudaNaiveVerifyRouter(input, weight, bias, *verifyScratch, ids, scores, topk, normalize, scale))
         return true;
 #ifndef USE_ROCM
@@ -153,6 +202,19 @@ FastllmExpertResult FastllmTpExperts::Forward(int layer, int rows, Data &input, 
         Data &scratch, Data &output, const FastllmExpertRouter &router, bool routeInExpert, bool verifyReduce,
         const FastllmMoePreparedInput *prepared, const FastllmExpertNorm *norm) const {
     FastllmExpertResult result;
+#ifdef FASTLLM_ENABLE_NAIVE_TP_MEGAMOE
+    if (hopper) {
+        if (verifyReduce || rows == 1 || rows < FastllmCudaGetLinearExactBatchThreshold()) {
+            hopper->Run(router.rank, layer, input, router.ids, routeInExpert ? router.probabilities : router.scores,
+                        output, routeInExpert ? &router.bias : nullptr);
+        } else {
+            auto &local = hopper->ranks.at(router.rank);
+            MergeMOE(input, router.ids, router.scores, hopper->Stage(router.rank, layer), local.biases,
+                     scratch, local.w2, local.w3, local.tempInput, local.tempOutput, 0.f, output, layer);
+        }
+        return result;
+    }
+#endif
     if (legacy) {
         legacy->Forward(router.rank, layer, rows, input, router.probabilities, router.bias, hidden);
         result.residualUpdated = true;

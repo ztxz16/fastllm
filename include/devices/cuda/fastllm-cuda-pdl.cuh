@@ -36,6 +36,11 @@ inline void Mark(Producer producer) {
 }
 
 // An intervening kernel, a stream join or a different capture keeps its original dependency.
+inline bool Follows(Producer producer) {
+    if (!marked.node || marked.producer != producer) return false;
+    const auto tail = CurrentTail(producer);
+    return tail.id == marked.id && tail.node == marked.node;
+}
 inline bool Prepare(Producer producer) {
     if (!marked.node || marked.producer != producer) return false;
     auto previous = marked;
@@ -55,6 +60,7 @@ inline bool Prepare(Producer producer) {
 }
 #else
 inline void Mark(Producer) {}
+inline bool Follows(Producer) { return false; }
 inline bool Prepare(Producer) { return false; }
 #endif
 

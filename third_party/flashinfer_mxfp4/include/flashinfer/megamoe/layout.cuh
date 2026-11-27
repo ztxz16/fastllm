@@ -346,6 +346,12 @@ struct MegaMoEBuffers {
   Buffer l1_token_buffer, l1_sf_buffer, l1_topk_weights_buffer;
   Buffer l2_token_buffer, l2_sf_buffer, combine_token_buffer;
 
+  // The 32-row TP-local slot and weight tables share the unused EP input buffer.
+  CUTLASS_HOST_DEVICE float* local_routed_weights(uint32_t rows) const {
+    return rows == 32 ? reinterpret_cast<float*>(input_token_buffer.get_base_ptr<uint8_t>() +
+        workspace.num_experts * rows) : input_sf_buffer.get_base_ptr<float>();
+  }
+
   CUTLASS_HOST_DEVICE
   MegaMoEBuffers(void* base, uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
                  uint32_t hidden, uint32_t intermediate, uint32_t pool_tokens,

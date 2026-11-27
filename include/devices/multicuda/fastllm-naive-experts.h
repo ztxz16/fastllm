@@ -9,6 +9,7 @@ struct FastllmCudaMimoEp8Mega;
 
 namespace fastllm {
 class PersistentWorkerGroup;
+struct HopperTpExperts;
 struct NaiveFlexMoe;
 struct NaiveSharedFlexMoe;
 struct Mxfp4MarlinRank;
@@ -48,7 +49,7 @@ struct FastllmExpertRouter {
 
     // A pending gamma means that the producer handed off an unnormalized residual.
     bool Project(Data &input, Data &weight, Data *verifyScratch, bool probabilitiesReady,
-                 const Data *residual, const Data *gamma, float eps);
+                 const Data *residual, const Data *gamma, float eps, int firstShardRow);
     bool Select(const Data &probabilities);
     bool CanRouteInExpert(int rows) const;
 };
@@ -74,15 +75,16 @@ struct FastllmExpertResult {
 
 struct FastllmTpExperts {
     using Weights = std::vector<std::vector<std::vector<Data *>>>;
+    static bool FusionEnabled();
     static NaiveMoeBackend Plan(const std::vector<int> &devices, int ep, bool enabled,
                                 bool flexGeometry, bool attentionReplicated, bool megaAvailable, bool &packsSources);
     static std::shared_ptr<FastllmTpExperts> Prepare(NaiveMoeBackend &layout, bool &packsSources,
             const std::vector<int> &devices, const Weights &weights, int hidden, int experts, int topk,
-            bool allowPackedTp, bool preferVerifyPages, PersistentWorkerGroup &workers, bool &packing,
+            bool allowPackedTp, int maxBatch, bool fixedRouting, bool preferVerifyPages, PersistentWorkerGroup &workers, bool &packing,
             std::shared_ptr<FastllmCudaMimoEp8Mega> &mega);
     const char *Name() const;
     bool UpdatesResidual() const { return bool(legacy); }
-    bool AllowsLargeBatch() const { return bool(shared); }
+    bool AllowsLargeBatch() const { return bool(shared) || wideMarlin; }
     void Validate(bool bf16, bool fixedRouting) const;
     const FastllmTpExperts *ForRows(int rows, bool replicated) const;
     FastllmExpertHandoff *Handoff() const;
@@ -92,6 +94,8 @@ struct FastllmTpExperts {
             const FastllmMoePreparedInput *prepared, const FastllmExpertNorm *norm) const;
 private:
     friend struct FastllmExpertRouter;
+    bool wideMarlin = false;
+    std::shared_ptr<HopperTpExperts> hopper;
     std::shared_ptr<NaiveFlexMoe> legacy;
     std::shared_ptr<NaiveSharedFlexMoe> shared;
     std::vector<std::shared_ptr<Mxfp4MarlinRank>> ranks;

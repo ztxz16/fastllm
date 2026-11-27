@@ -4,7 +4,7 @@ constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
 
 constexpr uint32_t kNumChunkSlots = 3;
 constexpr uint32_t kNumMaxRegistersForBuffer = 128;
-constexpr uint32_t kNumChunks =
+constexpr uint32_t kNumChunks = kCombineStripes > 1 ? kCombineStripes :
     (kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE and
      kHidden <= 32 * kNumMaxRegistersForBuffer)
         ? 1

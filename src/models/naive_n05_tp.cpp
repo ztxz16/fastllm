@@ -41,11 +41,6 @@ bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
 
 namespace {
 #ifdef USE_CUDA
-bool NaiveMoeFusionEnabled() {
-    const char *value = std::getenv("FASTLLM_NAIVE_MOE_FUSION");
-    return !value || std::string(value) != "0";
-}
-
 // One reusable event set per rank worker. Created only for an enabled trace,
 // and never recorded while a CUDA Graph is being captured.
 struct InferenceTimingEvents {
@@ -226,7 +221,7 @@ bool NaiveN05FlashModel::InitTensorParallel() {
     const bool layout = block_cnt > 0 && embed_dim > 0 && embed_dim % 128 == 0 &&
         num_experts >= ranks && num_experts % ranks == 0 &&
         num_experts_per_tok > 0 && num_experts_per_tok <= num_experts;
-    const bool enabled = NaiveMoeFusionEnabled() && ResidentMoePlacement();
+    const bool enabled = FastllmTpExperts::FusionEnabled() && ResidentMoePlacement();
     const bool geometry = NaiveMoeGeometrySupported(embed_dim, num_experts,
         num_experts_per_tok, block_cnt, norm_topk_prob, routed_scaling_factor);
     const bool mega = enabled && layout && norm_topk_prob && routed_scaling_factor == 1.0f && explicitEp &&
@@ -533,7 +528,8 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     tpMoePreparationFailed = releaseSources || (native && mxfp4Only);
     tpExperts = FastllmTpExperts::Prepare(tpMoeBackend, tpPackedMoeSources, tpDevices, tpMoeWeights,
         embed_dim, num_experts, num_experts_per_tok, dataType == BFLOAT16 && moeAtype == BFLOAT16 &&
-        attentionDP == 1 && NaiveMoeFusionEnabled() && ResidentMoePlacement(),
+        attentionDP == 1 && ResidentMoePlacement(),
+        maxBatch, norm_topk_prob && routed_scaling_factor == 1.0f,
         draftEnabled && std::min(draftTokens, draftBlock) == 7, tpWorkers, tpMoePreparationFailed, tpEp8MegaState);
     // Parents retain only names/shapes and ownership of their metadata views.
     // Retire CPU payload/scales after every local source has been consumed.

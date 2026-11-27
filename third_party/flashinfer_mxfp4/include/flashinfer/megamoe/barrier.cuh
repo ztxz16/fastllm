@@ -17,14 +17,15 @@ CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
 
 template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename sync_scope_t>
 CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace, const uint32_t& sm_idx,
-                              const uint32_t& thread_idx, const sync_scope_t& sync_scope) {
+                              const uint32_t& thread_idx, const sync_scope_t& sync_scope,
+                              uint32_t num_ctas = kNumSMs) {
   // NOTES: the implementation idea is from `cooperative_groups::this_grid().sync()`
   static constexpr uint32_t kFinishSumTag = 0x80000000u;
   sync_scope();
   if (thread_idx == 0) {
     const auto count_ptr = workspace.get_grid_sync_count_ptr<kGridSyncIndex>();
     const auto old_value =
-        ptx::atomic_add_rel(count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
+        ptx::atomic_add_rel(count_ptr, sm_idx == 0 ? (kFinishSumTag - (num_ctas - 1)) : 1);
     uint32_t new_value;
     do {
       new_value = ptx::ld_acq(count_ptr);

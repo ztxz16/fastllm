@@ -10,6 +10,10 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-moe-weight-owner.h"
 #include <chrono>
+#include <fstream>
+#include <array>
+#include <iterator>
+#include "json11.hpp"
 #include <condition_variable>
 #include <mutex>
 struct FastllmCudaMimoEp8BuiltinMega {
@@ -82,6 +86,38 @@ bool FastllmCudaMimoEp8BuiltinMegaSupported(const std::vector<int> &devices) {
 size_t FastllmCudaMimoEp8BuiltinPrefillWorkspaceBytes(int rows, int ranks) {
     return fastllm_ep8_mega_moe_prefill_workspace_bytes(rows, ranks);
 }
+struct Sm90EpPlacement {
+    std::array<uint8_t, 256> logicalToPhysical;
+    std::array<uint8_t, 256> physicalToLogical;
+};
+
+static std::vector<Sm90EpPlacement> ReadSm90EpPlacement(
+        const char *path, const std::vector<std::vector<fastllm::Data *>> &layers) {
+    std::ifstream input(path);
+    fastllm::AssertInFastLLM(input.good(), "Cannot open SM90 expert placement.");
+    std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>()), error;
+    const auto json = json11::Json::parse(contents, error);
+    fastllm::AssertInFastLLM(error.empty() && json.is_object(), "Invalid SM90 expert placement JSON.");
+    std::vector<Sm90EpPlacement> placement(layers.size());
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+        if (layers[layer].empty()) continue;
+        const auto &ids = json[std::to_string(layer)].array_items();
+        fastllm::AssertInFastLLM(ids.size() == 256, "Expected 256 expert IDs in each routed layer.");
+        std::array<bool, 256> seen{};
+        for (int logical = 0; logical < 256; ++logical) {
+            const double value = ids[logical].number_value();
+            fastllm::AssertInFastLLM(ids[logical].is_number() && value >= 0 && value < 256,
+                                     "Expert placement ID outside [0, 255].");
+            const int physical = static_cast<int>(value);
+            fastllm::AssertInFastLLM(value == physical && !seen[physical], "Expert placement must be a permutation.");
+            seen[physical] = true;
+            placement[layer].logicalToPhysical[logical] = physical;
+            placement[layer].physicalToLogical[physical] = logical;
+        }
+    }
+    return placement;
+}
+
 std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMega(
         const std::vector<int> &devices,
         const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights, int topk) {
@@ -156,6 +192,11 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
         state->ranks.push_back(std::move(rank));
     }
     const int localExperts = experts / static_cast<int>(devices.size());
+    std::vector<Sm90EpPlacement> placement;
+    if (hopperMxfp4 && experts == 256 && topk == 8 && devices.size() == 8) {
+        const char *path = std::getenv("FASTLLM_SM90_EP_PLACEMENT");
+        if (path && *path) placement = ReadSm90EpPlacement(path, weights.front());
+    }
     for (int r = 0; r < (int)devices.size(); ++r) {
         FastllmCudaSetDevice(devices[r]);
         auto &rank = *state->ranks[r];
@@ -166,10 +207,12 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
             std::vector<const void *> gate, down, gs, ds;
             for (int e = r * localExperts; e < (r + 1) * localExperts; ++e) {
                 for (int part = 0; part < 2; ++part) {
-                    Data *w = weights[r][l][2 + e * 2 + part];
+                    const int src = placement.empty() ? e : placement[l].physicalToLogical[e];
+                    const int owner = src / localExperts;
+                    Data *w = weights[owner][l][2 + src * 2 + part];
                     const std::vector<int> shape = part ? std::vector<int>{4096, 2048} : std::vector<int>{4096, 4096};
                     AssertInFastLLM(w && w->dims == shape && w->cudaData &&
-                        w->dataDeviceIds == std::vector<int>{devices[r]},
+                        w->dataDeviceIds == std::vector<int>{devices[owner]},
                         "MiMo EP requires complete experts on their assigned device.");
                     (part ? down : gate).push_back(w->cudaData);
                     if (mxfp4) continue;
@@ -195,11 +238,18 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
             }
             AssertInFastLLM(rank.layers[l] != nullptr,
                 hopperMxfp4 ? fastllm_mxfp4_ep_error() : fastllm_ep8_mega_moe_error());
+            if (!placement.empty())
+                AssertInFastLLM(fastllm_mxfp4_ep_set_map(rank.layers[l], placement[l].logicalToPhysical.data()),
+                                fastllm_mxfp4_ep_error());
             // create() completes packing before the source layer is retired.
             if (ownsPacked) {
                 for (int e = r * localExperts; e < (r + 1) * localExperts; ++e) {
-                    released += ReleasePackedMoeSource(*weights[r][l][2 + e * 2]);
-                    released += ReleasePackedMoeSource(*weights[r][l][3 + e * 2]);
+                    const int src = placement.empty() ? e : placement[l].physicalToLogical[e];
+                    const int owner = src / localExperts;
+                    if (owner != r) FastllmCudaSetDevice(devices[owner]);
+                    released += ReleasePackedMoeSource(*weights[owner][l][2 + src * 2]);
+                    released += ReleasePackedMoeSource(*weights[owner][l][3 + src * 2]);
+                    if (owner != r) FastllmCudaSetDevice(devices[r]);
                 }
                 rank.scales.clear();
             }

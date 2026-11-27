@@ -11,15 +11,16 @@ auto combine_load_barriers = utils::PatternVisitor(
 
 uint32_t combine_phase = 0;
 uint32_t load_stage_idx = 0;
-for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx; token_idx < num_tokens;
-     token_idx += kNumSMs * kNumEpilogueWarps) {
+for (uint32_t work = sm_idx * kNumEpilogueWarps + epilogue_warp_idx; work < num_tokens * kCombineStripes;
+     work += kNumSMs * kNumEpilogueWarps) {
+  const uint32_t token_idx = work / kCombineStripes;
   const int stored_topk_slot_idx =
       lane_idx < kNumTopk ? static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() +
                                                    token_idx * kNumTopk + lane_idx))
                           : -1;
   const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
-  for (uint32_t chunk = 0; chunk < kNumChunks; ++chunk) {
+  for (uint32_t chunk = work % kCombineStripes; chunk < kNumChunks; chunk += kCombineStripes) {
     const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
 
     uint32_t mask = total_mask;

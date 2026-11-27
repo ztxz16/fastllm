@@ -1,7 +1,52 @@
 // SM90 MXFP4 MegaMoE fused kernel body.
+constexpr bool kPrepareInput = !std::is_same_v<Prologue, Mxfp4ProfileArgument>;
+constexpr bool kWideEpVerify = [] {
+  if constexpr (kNumRanks == 8 && requires { Prologue::slots; })
+    return Prologue::slots == 128 * kNumTopk;
+  return false;
+}();
+static_assert(!kPrepareInput || (!kPhaseStamps && ((kGroupLocalRows && kNumRanks == 1) ||
+              (kNumRanks == 8 && kNumExperts == 256 && kNumTopk == 8 && (BLOCK_M == 8 || BLOCK_M == 32 || (kRoutesPublished && BLOCK_M == 64))))));
+unsigned long long* phase_stamps = nullptr;
+if constexpr (!kPrepareInput) phase_stamps = prologue;
+constexpr uint32_t BLOCK_K = 128;
+constexpr uint32_t kNumDispatchThreads = 64;
+constexpr uint32_t kNumNonEpilogueThreads = 64;
+// Decode gets its own warps so it overlaps the WGMMA rather than
+// serialising with it on the math warps.
+constexpr bool kSplitDecodeWarps =
+    sm90_mxfp4_split_decode(kSwapABRequested, kUseRSOperand, BLOCK_M);
+constexpr uint32_t kNumDecodeThreads = kSplitDecodeWarps ? 256 : 0;
+constexpr uint32_t kNumEpilogueThreads = 256;
+constexpr uint32_t kNumThreads =
+    kNumDispatchThreads + kNumNonEpilogueThreads + kNumDecodeThreads + kNumEpilogueThreads;
+FI_MEGAMOE_STATIC_ASSERT(
+    kNumThreads == sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand, BLOCK_M),
+    "Launch bounds and the role partition disagree");
+FI_MEGAMOE_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Experts must divide evenly across ranks");
+FI_MEGAMOE_STATIC_ASSERT(kHidden % 128 == 0, "Hidden must be a multiple of BLOCK_K");
+FI_MEGAMOE_STATIC_ASSERT(kIntermediateHidden % 128 == 0,
+                         "Intermediate hidden must be a multiple of BLOCK_K");
+constexpr uint32_t L1_SHAPE_N = kIntermediateHidden * 2;
+constexpr uint32_t L1_SHAPE_K = kHidden;
+constexpr uint32_t L2_SHAPE_N = kHidden;
+constexpr uint32_t L2_SHAPE_K = kIntermediateHidden;
+constexpr uint32_t kNumDispatchWarps = kNumDispatchThreads / 32;
+constexpr uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32;
+constexpr uint32_t kNumDecodeWarps = kNumDecodeThreads / 32;
+constexpr uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32;
+// Warp map: [dispatch][A loader][B loader][decode][math]
+constexpr uint32_t kFirstDecodeWarp = kNumDispatchWarps + kNumMMANonEpilogueWarps;
+constexpr uint32_t kFirstMathWarp = kFirstDecodeWarp + kNumDecodeWarps;
+constexpr uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4;
+constexpr uint32_t kNumTokensPerWarp = 32 / kNumTopk;
+constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or \
     defined(__CLION_IDE__)
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
+constexpr bool kLocalSlots = kLocalMaxRows > 0;
+constexpr bool kCompactLocalRows = kGroupLocalRows && kLocalMaxRows == 32;
+const uint32_t localRows = kLocalMaxRows == 1 ? 1u : num_tokens;
 
 // =====================================================================
 // Template checks
@@ -136,7 +181,7 @@ extern __shared__ __align__(kSharedMemoryAlignment)
 uint8_t smem_buffer[];
 
 constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
-    math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
+    math::constexpr_align<uint32_t>((kNumExperts + (kCompactLocalRows ? 1 : 0)) * sizeof(uint32_t), kSharedMemoryAlignment);
 constexpr uint32_t SMEM_SEND_BUFFER_SIZE = math::constexpr_align(
     fp8_token_layout.get_num_bytes() * kNumActiveDispatchWarps, kSharedMemoryAlignment);
 // Scaled-magnitude tables for all 256 E8M0 codes; see kScaledLutSize.
@@ -300,6 +345,8 @@ FI_MEGAMOE_STATIC_ASSERT(kInterleavedSchedulerSMEMBytes ==
                          "Host and device scheduler shared-memory layouts disagree");
 constexpr uint32_t kInterleavedSMEMEnd =
     SMEM_BEFORE_BARRIER_SIZE + kNumBaseBarriers * sizeof(Barrier) + kInterleavedSchedulerSMEMBytes;
+static_assert(!kCompactLocalRows ||
+              SMEM_BEFORE_BARRIER_SIZE + kNumBaseBarriers * sizeof(Barrier) <= 232448);
 FI_MEGAMOE_STATIC_ASSERT(!kUseInterleavedScheduler || kInterleavedSMEMEnd <= 232448,
                          "Interleaved scheduler exceeds the SM90 shared-memory capacity");
 
@@ -419,7 +466,206 @@ FI_MEGAMOE_STATIC_ASSERT(kNumLoaderWarpgroupRegisters * 128 +
 constexpr uint32_t kDispatchGridSyncIndex = 0;
 constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
+// Local TP puts the verification tokens in one WGMMA tile per
+// distinct expert. The route producer encodes slot+1 per expert and row.
+// The EP dispatch counters are unused here and hold the compact schedule.
+if constexpr (kPrepareInput && kNumRanks == 1) {
+  prologue.run(buffers, localRows, smem_send_buffers.get_base_ptr<uint8_t>());
+  comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(workspace, sm_idx, thread_idx,
+      [] { __syncthreads(); }, gridDim.x);
+}
+// The eight-row scan reads a whole expert's slot map in one word. Keep that
+// word in the completed routing prologue's scratch for the Down scatter.
+constexpr bool kCacheExpertSlots = kPrepareInput && kLocalMaxRows == 8;
+const auto* inputSlots = input_token_buffer.get_base_ptr<uint8_t>();
+const auto* localSlotsByExpert = kCacheExpertSlots ?
+    smem_send_buffers.get_base_ptr<uint8_t>() : inputSlots;
+const auto* localWeightsByExpert = buffers.local_routed_weights(kLocalMaxRows);
+auto *compactRows = smem_send_buffers.get_base_ptr<uint8_t>();
+if constexpr (kCompactLocalRows) {
+  constexpr int maxPairs = kLocalMaxRows * kNumTopk;
+  static_assert(kNumExperts == 256 && kLocalMaxRows == 32 && BLOCK_M == 8 && maxPairs == 256);
+  static_assert(SMEM_SEND_BUFFER_SIZE >= maxPairs * BLOCK_M + 8 * sizeof(uint32_t));
+  auto *warpTotals = reinterpret_cast<uint32_t*>(compactRows + maxPairs * BLOCK_M);
+  // The low half of this scan counts actual input rows, the high half counts
+  // BM8 tiles. At most 256 route pairs contribute, so the sums cannot carry.
+  uint32_t mask = 0, prefix = 0;
+  if (thread_idx < kNumExperts) {
+    const auto *slots = reinterpret_cast<const uint32_t*>(localSlotsByExpert + thread_idx * kLocalMaxRows);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      // Extract one occupancy bit from each of the four slot bytes.
+      mask |= (((__vsetne4(__ldcg(slots + i), 0u) * 0x01020408u) >> 24) << (4 * i));
+    }
+    mask &= ~0u >> (32 - localRows);
+    const uint32_t rows = __popc(mask);
+    const uint32_t contribution = rows + (((rows + BLOCK_M - 1) / BLOCK_M) << 16);
+    prefix = contribution;
+#pragma unroll
+    for (int step = 1; step < 32; step *= 2) {
+      const uint32_t prev = __shfl_up_sync(~0u, prefix, step);
+      if (lane_idx >= step) prefix += prev;
+    }
+    if (lane_idx == 31) warpTotals[warp_idx] = prefix;
+    prefix -= contribution;
+  }
+  __syncthreads();
+  if (thread_idx < kNumExperts) {
+    for (uint32_t i = 0; i < warp_idx; ++i) prefix += warpTotals[i];
+    uint32_t tile = prefix >> 16, first = prefix & 0xffffu;
+    while (mask) {
+      const uint32_t count = min(BLOCK_M, static_cast<uint32_t>(__popc(mask)));
+      smem_expert_count[tile] = thread_idx | (first << 8) | (count << 16);
+      for (uint32_t j = 0; j < count; ++j) {
+        compactRows[tile * BLOCK_M + j] = __ffs(mask) - 1;
+        mask &= mask - 1;
+      }
+      ++tile;
+      first += count;
+    }
+    if (thread_idx == kNumExperts - 1) smem_expert_count[maxPairs] = tile;
+  }
+  __syncthreads();
+  // One warp gathers each actual input row. FP8 vectors pack densely, while
+  // scales start on a BM8 boundary to satisfy the inner TMA-axis alignment.
+  for (uint32_t tile = sm_idx; tile < smem_expert_count[maxPairs]; tile += gridDim.x) {
+    const uint32_t entry = smem_expert_count[tile];
+    if (warp_idx < (entry >> 16)) {
+      const uint32_t source = compactRows[tile * BLOCK_M + warp_idx];
+      const uint32_t dest = ((entry >> 8) & 255u) + warp_idx;
+      const auto *src = l2_token_buffer.template get_base_ptr<uint4>() + source * (kHidden / 16);
+      auto *dst = l1_token_buffer.get_data_buffer(dest).template get_base_ptr<uint4>();
+#pragma unroll
+      for (uint32_t i = lane_idx; i < kHidden / 16; i += 32) dst[i] = __ldcg(src + i);
+      l1_sf_buffer.template get_base_ptr<float>()[lane_idx * kNumPaddedSFPoolTokens + tile * BLOCK_M + warp_idx] =
+          __ldcg(input_sf_buffer.template get_base_ptr<float>() + lane_idx * kLocalMaxRows + source);
+    }
+  }
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+  comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(workspace, sm_idx, thread_idx,
+      [] { __syncthreads(); }, gridDim.x);
+} else if constexpr (kGroupLocalRows) {
+  static_assert(kLocalMaxRows == BLOCK_M && (BLOCK_M == 8 || BLOCK_M == 16));
+  static_assert(kNumExperts == 256 && kNumRanks == 1 && kNumTopk == 8);
+  if (threadIdx.x < 32) {
+    // The 16-row variant handles 9..16 rows. Only its final word can
+    // contain stale slots from a preceding replay with a longer input.
+    const uint64_t active = ~uint64_t(0) >> ((BLOCK_M - localRows) * 8);
+    uint32_t count = 0;
+#pragma unroll
+    for (uint32_t first = 0; first < kNumExperts; first += 32) {
+      const uint32_t expert = first + lane_idx;
+      const auto *words = reinterpret_cast<const uint64_t *>(inputSlots) + expert * (BLOCK_M / 8);
+      uint32_t entry = expert;
+      const uint64_t last = words[BLOCK_M / 8 - 1] & active;
+      if constexpr (kCacheExpertSlots) {
+        static_assert(BLOCK_M == 8 && SMEM_SEND_BUFFER_SIZE >= kNumExperts * sizeof(uint64_t));
+        smem_send_buffers.get_base_ptr<uint64_t>()[expert] = last;
+      }
+      bool used = last != 0;
+      if constexpr (BLOCK_M == 16) {
+        const bool low = words[0] != 0;
+        used |= low;
+        const uint32_t firstRow = low ? 0u : 8u;
+        const uint32_t rows = (last ? localRows : 8u) - firstRow;
+        entry |= (firstRow << 8) | (rows << 16);
+      }
+      const uint32_t mask = __ballot_sync(0xffffffffu, used);
+      if (used)
+        smem_expert_count[count + __popc(mask & ((1u << lane_idx)-1u))] = entry;
+      count += __popc(mask);
+    }
+    if (!lane_idx) smem_expert_count[kLocalMaxRows * kNumTopk] = count;
+  }
+  __syncthreads();
+}
 const auto for_each_static_selected_block = [&](auto&& func) {
+  if constexpr (kLocalSlots) {
+    static_assert(kNumRanks == 1 && kSwapABRequested && !kUseInterleavedScheduler && (BLOCK_M == 8 || kGroupLocalRows));
+    // Grouped verification owns one pool block per distinct expert.
+    const auto visit = [&](auto phase, auto tiles, auto k_blocks) {
+      const uint32_t slots = kGroupLocalRows ? smem_expert_count[kLocalMaxRows * kNumTopk] : localRows * kNumTopk;
+      uint32_t tile = sm_idx;
+      uint32_t stride = gridDim.x;
+      uint32_t prefix = 0;
+      if constexpr (kGroupLocalRows && decltype(phase)::value == sched::BlockPhase::Linear2) {
+        // A partial second gate/up wave leaves these CTAs with an extra
+        // K4096 tile. Give the other CTAs a head start on K256 down tiles
+        // for experts already produced, then resume grid-wide striping.
+        const uint32_t tailCTAs = slots * kNumRoutedL1BlockNs % gridDim.x;
+        if (slots * kNumRoutedL1BlockNs > gridDim.x && tailCTAs != 0) {
+          stride = gridDim.x - tailCTAs;
+          constexpr uint32_t downTilesPerEarlyCTA = 12;
+          prefix = stride * downTilesPerEarlyCTA;
+          tile = sm_idx < tailCTAs ? prefix + sm_idx : sm_idx - tailCTAs;
+        }
+      }
+      while (tile < slots * tiles) {
+        const uint32_t slot = tile / tiles;
+        if constexpr (kGroupLocalRows && kLocalMaxRows >= 16) {
+          const uint32_t entry = smem_expert_count[slot];
+          func(phase, entry & 255u, k_blocks, (entry >> 8) & 255u, tile % tiles, slot, entry >> 16);
+        } else {
+          const int expert = kGroupLocalRows ? int(smem_expert_count[slot]) :
+              static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + slot));
+          if (expert >= 0)
+            func(phase, static_cast<uint32_t>(expert), k_blocks, 0u, tile % tiles, slot, kGroupLocalRows ? localRows : 1u);
+        }
+        if (tile < prefix) {
+          tile += stride;
+          if (tile >= prefix) tile = prefix + sm_idx;
+        } else {
+          tile += gridDim.x;
+        }
+      }
+    };
+    visit(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
+          L1_SHAPE_N / BLOCK_N, L1_SHAPE_K / BLOCK_K);
+    visit(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
+          L2_SHAPE_N / BLOCK_N, L2_SHAPE_K / BLOCK_K);
+    return;
+  }
+  if constexpr (!kUseInterleavedScheduler && !kLocalSlots && kNumRanks == 8 &&
+                kNumExpertsPerRank == 32 && BLOCK_M == 8) {
+    if (num_tokens == 1) {
+      // Each source contributes at most one row to an expert. Every nonempty
+      // expert therefore occupies one BM8 pool tile, in expert-index order.
+      scheduler.fetch_expert_recv_count();
+      const uint32_t rows = scheduler.stored_num_tokens_per_expert[0];
+      const uint32_t mask = __ballot_sync(0xffffffffu, rows != 0);
+      const uint32_t experts = __popc(mask);
+      const auto visit = [&](auto phase, auto tiles, auto kBlocks) {
+        uint32_t tile = sm_idx, stride = kNumSMs, early = 0;
+        if constexpr (decltype(phase)::value == sched::BlockPhase::Linear2) {
+          // A gate/up tile spans K4096, a down tile K2048. CTAs with one
+          // fewer gate/up tile start two down tiles before the shared stripe.
+          const uint32_t tail = experts * kNumRoutedL1BlockNs % kNumSMs;
+          if (tail && experts * kNumRoutedL1BlockNs >= kNumSMs) {
+            stride = kNumSMs - tail;
+            early = 2 * stride;
+            tile = sm_idx < tail ? early + sm_idx : sm_idx - tail;
+          }
+        }
+        while (tile < experts * tiles) {
+          const uint32_t slot = tile / tiles;
+          const uint32_t expert = __fns(mask, 0, slot + 1);
+          const uint32_t count = __shfl_sync(0xffffffffu, rows, expert);
+          func(phase, expert, kBlocks, 0u, tile % tiles, slot, count);
+          if (tile < early) {
+            tile += stride;
+            if (tile >= early) tile = early + sm_idx;
+          } else {
+            tile += kNumSMs;
+          }
+        }
+      };
+      visit(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
+            L1_SHAPE_N / BLOCK_N, L1_SHAPE_K / BLOCK_K);
+      visit(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
+            L2_SHAPE_N / BLOCK_N, L2_SHAPE_K / BLOCK_K);
+      return;
+    }
+  }
   scheduler.fetch_expert_recv_count();
   scheduler.set_expert_idx(0);
   while (true) {
@@ -460,6 +706,10 @@ const auto for_each_published_block = [&](auto&& func) {
 
 const auto produce_interleaved_blocks = [&](auto&& func) {
   interleaved_scheduler.fetch_expert_recv_count();
+  // At 128 rows keep the gate/up weight tiles resident before issuing down work.
+  if constexpr (kWideEpVerify)
+    interleaved_scheduler.num_l1_warmup_waves =
+        math::ceil_div(interleaved_scheduler.num_total_m_blocks * kNumRoutedL1BlockNs, kNumSMs);
   while (true) {
     interleaved_scheduler.wait_task_slot_empty();
     const auto task_info = interleaved_scheduler.claim_next_task();
@@ -524,73 +774,122 @@ const auto cleanup_workspace = [&]() {
 if (warp_idx < kNumDispatchWarps) {
   cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
-  FI_MEGAMOE_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
-  constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
-  const auto read_topk_idx = [&](const auto& process) {
-    if (warp_idx < kNumActiveDispatchWarps) {
+  if constexpr (kLocalSlots) return;
+  constexpr bool kPrepareEpSource = kPrepareInput && kNumRanks == 8;
+  if constexpr (kPrepareEpSource && !kRoutesPublished) {
+    if constexpr (Prologue::slots >= 128) {
+      prologue.template prepareSource<kNumDispatchThreads>(buffers);
+      publish_ep_routes<kNumDispatchWarps, kNumSMs, kNumExperts>(prologue, workspace, sym_buffer,
+                                                                    sm_idx, warp_idx, lane_idx);
+    } else if (warp_idx == 0) {
+      prologue.prepareSource(buffers);
+      // One warp per destination publishes its 32 expert counts and the matching slots.
+      if (sm_idx < kNumRanks) {
+        const int destination = sm_idx * kNumExpertsPerRank + lane_idx;
+        uint32_t count = 0;
 #pragma unroll
-      for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
-           i < num_tokens; i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
-        int expert_idx = -1;
-        if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
-          expert_idx = static_cast<int>(
-              __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
-          if (expert_idx >= 0) process(i * kNumTopk + lane_idx, expert_idx);
+        for (uint32_t base = 0; base < Prologue::slots; base += 32) {
+          const int expert = base + lane_idx < Prologue::slots ? prologue.expert(base + lane_idx) : -1;
+#pragma unroll
+          for (uint32_t slot = 0; slot < 32 && base + slot < Prologue::slots; ++slot) {
+            if (__shfl_sync(0xffffffffu, expert, slot) == destination) {
+              auto* source = workspace.get_src_token_topk_idx_ptr(lane_idx, sym_buffer.rank_idx, count++);
+              *sym_buffer.map(source, sm_idx) = base + slot;
+            }
+          }
         }
-        __syncwarp();
+        *sym_buffer.map(workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, lane_idx), sm_idx) = count;
+        ptx::atomic_add_sys(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(lane_idx), sm_idx),
+                            (static_cast<uint64_t>(kNumSMs) << 32) | count);
       }
     }
-  };
-
-  // Count tokens per expert
-  read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-    atomicAdd_block(smem_expert_count + expert_idx, 1);
-  });
-  ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-
-// Stake out per-expert SM offsets via global atomic
+  } else if constexpr (!kPrepareEpSource) {
+    FI_MEGAMOE_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
+    constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
+    const auto read_topk_idx = [&](const auto& process) {
+      if (warp_idx < kNumActiveDispatchWarps) {
 #pragma unroll
-  for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-    const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-    smem_expert_count[i] =
-        static_cast<uint32_t>(ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
-  }
-  ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
+             i < num_tokens; i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
+          int expert_idx = -1;
+          if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
+            expert_idx = static_cast<int>(
+                __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
+            if (expert_idx >= 0) process(i * kNumTopk + lane_idx, expert_idx);
+          }
+          __syncwarp();
+        }
+      }
+    };
 
-  // Write source token-topk indices to remote ranks
-  read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-    const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-    const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
-    const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(expert_idx % kNumExpertsPerRank,
-                                                              sym_buffer.rank_idx, dst_slot_idx);
-    *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-  });
+    // With a single row, CTA 0 can assign every remote slot locally.
+    // The receiver still waits for kNumSMs contributions from each rank.
+    const bool singleHistogram = kNumRanks == 8 && kNumExperts == 256 &&
+        kNumTopk == 8 && BLOCK_M == 8 && num_tokens == 1;
+    if (singleHistogram) {
+      if (sm_idx == 0) {
+        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+          const auto slot = atomicAdd_block(smem_expert_count + expert_idx, 1);
+          const auto ptr = workspace.get_src_token_topk_idx_ptr(expert_idx % kNumExpertsPerRank,
+                                                                sym_buffer.rank_idx, slot);
+          *sym_buffer.map(ptr, expert_idx / kNumExpertsPerRank) = token_topk_idx;
+        });
+      }
+    } else {
+      // Count tokens per expert
+      read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+        atomicAdd_block(smem_expert_count + expert_idx, 1);
+      });
+      ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-  comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(workspace, sm_idx, thread_idx, [=]() {
-    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-  });
-
-  if (sm_idx == 0 and thread_idx < kNumActiveDispatchThreads) {
+    // Stake out per-expert SM offsets via global atomic
 #pragma unroll
-    for (uint32_t i = thread_idx; i < kNumExperts; i += kNumActiveDispatchThreads) {
-      const auto dst_rank_idx = i / kNumExpertsPerRank;
-      const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-      const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-      *sym_buffer.map(
-          workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-          dst_rank_idx) = expert_status & 0xffffffff;
-      ptx::atomic_add_sys(
-          sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx),
-                         dst_rank_idx),
-          expert_status);
+      for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+        const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
+        smem_expert_count[i] =
+            static_cast<uint32_t>(ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+      }
+      ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+      // Write source token-topk indices to remote ranks
+      read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+        const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+        const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
+        const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(expert_idx % kNumExpertsPerRank,
+                                                                  sym_buffer.rank_idx, dst_slot_idx);
+        *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+      });
     }
-  }
-  ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-  comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
-                       kBeforeDispatchPullBarrierTag>(
-      workspace, sym_buffer, sm_idx, thread_idx,
-      [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, false, true);
+    comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(workspace, sm_idx, thread_idx, [=]() {
+      ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+    });
+
+    if (sm_idx == 0 and thread_idx < kNumActiveDispatchThreads) {
+#pragma unroll
+      for (uint32_t i = thread_idx; i < kNumExperts; i += kNumActiveDispatchThreads) {
+        const auto dst_rank_idx = i / kNumExpertsPerRank;
+        const auto dst_local_expert_idx = i % kNumExpertsPerRank;
+        const uint64_t expert_status = singleHistogram
+            ? (static_cast<uint64_t>(kNumSMs) << 32) | smem_expert_count[i]
+            : *workspace.get_expert_send_count_ptr(i);
+        *sym_buffer.map(
+            workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+            dst_rank_idx) = expert_status & 0xffffffff;
+        ptx::atomic_add_sys(
+            sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx),
+                           dst_rank_idx),
+            expert_status);
+      }
+    }
+    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+  }
+  if constexpr (!kRoutesPublished) {
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
+                         kBeforeDispatchPullBarrierTag>(
+        workspace, sym_buffer, sm_idx, thread_idx,
+        [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, kPrepareEpSource, true);
+  }
   if (thread_idx == 0) stamp_max(1);
 
   // Sync with epilogue warps before pulling tokens
@@ -727,11 +1026,11 @@ if (warp_idx < kNumDispatchWarps) {
 
     // Wait for the pool to be ready.
     if (has_valid_m) {
-      if constexpr (!kBlockIsL2) {
+      if constexpr (!kBlockIsL2 && !kLocalSlots) {
         const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
         while (ptx::ld_acq(ptr) != valid_m) {
         }
-      } else {
+      } else if constexpr (kBlockIsL2) {
         const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
         const uint64_t expected =
             (kNumRoutedL1BlockNs >= 64) ? ~0ull : ((1ull << kNumRoutedL1BlockNs) - 1ull);
@@ -744,7 +1043,11 @@ if (warp_idx < kNumDispatchWarps) {
 
       if (cute::elect_one_sync()) {
         if (has_valid_m) {
-          const uint32_t m_idx = pool_block_idx * BLOCK_M;
+          const uint32_t m_idx = kLocalSlots && !kBlockIsL2 ? (kGroupLocalRows ? m_block_idx : pool_block_idx / kNumTopk) : pool_block_idx * BLOCK_M;
+          // The FP32 scale is on the inner TMA axis. Give each local input
+          // an aligned tile of scales even though only row zero is consumed.
+          const uint32_t sf_row = kCompactLocalRows && !kBlockIsL2 ? pool_block_idx * BLOCK_M :
+                                  kLocalSlots && !kGroupLocalRows && !kBlockIsL2 ? m_idx * BLOCK_M : m_idx;
           const uint32_t k_idx = k_block_idx * BLOCK_K;
 
           // TMA load A
@@ -753,7 +1056,7 @@ if (warp_idx < kNumDispatchWarps) {
 
           if constexpr (!kBlockIsL2 || !kSplitMDecodedWeightReuse) {
             tma::copy<BLOCK_M, 1, 0, float>(tensor_map_sfa_ptr, full_barriers[stage_idx],
-                                            smem_sfa[stage_idx], m_idx, k_block_idx, 1);
+                                            smem_sfa[stage_idx], sf_row, k_block_idx, 1);
             full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE +
                                                            BLOCK_M * sizeof(float));
           } else {
@@ -804,12 +1107,13 @@ if (warp_idx < kNumDispatchWarps) {
         for (uint32_t i = 0; i < kNumTileLoads; ++i) {
           const uint64_t tile_idx =
               static_cast<uint64_t>(n_tile_idx + i) * num_k_blocks + k_block_idx;
-          // EVICT_NORMAL, not tma_load_1d's streaming default:
-          // above the swapAB tiers an expert spans several
-          // m-blocks, and those CTAs share these tiles via L2.
+          // Both small verification plans read each distinct expert tile once. Prefer
+          // keeping reusable activations in L2; larger plans share weight tiles.
+          constexpr auto hint = kPrepareInput && (kLocalMaxRows == 8 || (kNumRanks == 8 && BLOCK_M == 8)) ?
+              cute::TMA::CacheHintSm90::EVICT_FIRST : cute::TMA::CacheHintSm90::EVICT_NORMAL;
           ptx::tma_load_1d(smem_packed_b[stage_idx] + i * kBTileBytes,
                            b_base + tile_idx * kBTileBytes, full_barriers[stage_idx], kBTileBytes,
-                           cute::TMA::CacheHintSm90::EVICT_NORMAL);
+                           hint);
         }
         full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_PACKED_B_SIZE_PER_STAGE);
       }
@@ -901,14 +1205,18 @@ if (warp_idx < kNumDispatchWarps) {
       "Split-N WGs must each run one M64N128 WGMMA per K-block");
 
   // Sync with dispatch
-  ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+  if constexpr (!kLocalSlots) ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-  const auto run_math_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
+  const auto run_math_width = [&]<uint32_t FixedM>(const auto& block_phase, const uint32_t& local_expert_idx,
                                  const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
                                  const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
                                  const uint32_t& valid_m) {
     const unsigned long long task_t0 = stamp_now();
     if (epilogue_thread_idx == 0) stamp_min(3);
+    const auto sourceRow = [&](uint32_t token) -> uint32_t {
+      if constexpr (kCompactLocalRows) return compactRows[pool_block_idx * BLOCK_M + token];
+      return m_block_idx + token;
+    };
     const uint32_t m_idx = pool_block_idx * BLOCK_M;
     const uint32_t wg_n_idx = kSplitMDecodedWeightReuse ? 0u : epilogue_wg_idx * WG_BLOCK_N;
     const uint32_t wg_l1_out_n_idx =
@@ -962,6 +1270,34 @@ if (warp_idx < kNumDispatchWarps) {
     const auto decode_rs_half = [&](const uint32_t& rs_stage, const uint32_t& half,
                                     uint32_t(&a_frag)[4][4]) {
       const uint32_t frag_row0 = wg_n_idx + half * 64u + warp_idx_in_wg * 16u + row_idx;
+      if constexpr (kLanePackedWeights) {
+        static_assert(kLocalMaxRows > 0 && kUseRSOperand);
+        const auto *packed = reinterpret_cast<const uint8_t*>(smem_packed_b[rs_stage]);
+        const auto *base = packed + (frag_row0 / mxfp4::kBTileRows) * mxfp4::kBTileBytes;
+        const auto *tile = reinterpret_cast<const uint4*>(base);
+        const auto *scalePairs = reinterpret_cast<const uint2*>(
+            base + mxfp4::kBTileRows * (BLOCK_K / 2));
+        const uint2 scales = scalePairs[(frag_row0 % mxfp4::kBTileRows / 16) * 8 + frag_row0 % 8];
+        const uint32_t low_scales = scales.x, high_scales = scales.y;
+        // Each vector carries two K32 slices, alternating lower and upper WGMMA rows.
+        const uint32_t word = (frag_row0 % mxfp4::kBTileRows / 16) * 64 + lane_idx;
+        const uint4 first = ptx::ld_shared(tile + word);
+        const uint4 last = ptx::ld_shared(tile + word + 32);
+        const uint32_t low_words[] = {first.x, first.z, last.x, last.z};
+        const uint32_t high_words[] = {first.y, first.w, last.y, last.w};
+#pragma unroll
+        for (uint32_t slice = 0; slice < 4; ++slice) {
+          const uint2 lo = mxfp4::dequant_word(low_words[slice], mxfp4::load_scaled_lut(smem_mxfp4_lut, low_scales >> (8 * slice)));
+          const uint2 hi = mxfp4::dequant_word(high_words[slice], mxfp4::load_scaled_lut(smem_mxfp4_lut, high_scales >> (8 * slice)));
+          a_frag[slice][0] = lo.x;
+          a_frag[slice][1] = hi.x;
+          a_frag[slice][2] = lo.y;
+          a_frag[slice][3] = hi.y;
+#pragma unroll
+          for (uint32_t i = 0; i < 4; ++i) mma::sm90::warpgroup_fence_operand(a_frag[slice][i]);
+        }
+        return;
+      }
       const uint32_t decode_row = frag_row0 + ((lane_idx & 1u) << 3);
       const uint32_t word_sel = (lane_idx >> 1) & 1u;
       const bool keep_hi = (lane_idx & 1u) == 0;
@@ -983,6 +1319,69 @@ if (warp_idx < kNumDispatchWarps) {
       }
     };
     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+      if constexpr (kPrepareInput && kLocalMaxRows == 8 && kNumStages >= 4) {
+        // Each K128 produces two independent RS WGMMA groups. Queue up to the
+        // hardware limit of eight, then release each stage in original K order.
+        using RS = typename mma::sm90::FP8RSMMASelector<8>::type;
+        constexpr int groups = kBlockIsL2 ? 2 : 4;
+        static_assert(kLanePackedWeights && kUseRSOperand && BLOCK_M == 8 &&
+                      BLOCK_K == 4 * RS::K && RS::kNumAccum == 4 &&
+                      (kBlockIsL2 ? L2_SHAPE_K : L1_SHAPE_K) % (groups * BLOCK_K) == 0);
+        struct Stage {
+          uint32_t fragment[2][4][4];
+          float acc[2][4] = {};
+          float scale[2];
+          uint32_t index;
+        };
+        Stage staged[groups];
+#pragma unroll
+        for (int i = 0; i < groups; ++i) {
+          auto &tile = staged[i];
+          tile.index = stage_idx;
+          full_barriers[stage_idx]->wait(phase);
+#pragma unroll
+          for (int r = 0; r < 2; ++r)
+            tile.scale[r] = ptx::ld_shared(smem_sfa[stage_idx] + col_idx * 2 + r);
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            decode_rs_half(stage_idx, h, tile.fragment[h]);
+#pragma unroll
+            for (float &value : tile.acc[h]) ptx::warpgroup_fence_operand(value);
+            ptx::warpgroup_arrive();
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+              auto desc = mma::sm90::make_smem_desc(smem_a[stage_idx] + k * RS::K, 1);
+              RS::wgmma(tile.fragment[h][k], desc, tile.acc[h], k != 0);
+            }
+            ptx::warpgroup_commit_batch();
+#pragma unroll
+            for (float &value : tile.acc[h]) ptx::warpgroup_fence_operand(value);
+          }
+          if (i + 1 < groups) advance_pipeline(k_block_idx);
+        }
+        const auto retire = [&]<int Pending>(Stage &tile) {
+          ptx::warpgroup_wait<Pending>();
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+#pragma unroll
+              for (uint32_t &reg : tile.fragment[h][j]) mma::sm90::warpgroup_fence_operand(reg);
+              ptx::warpgroup_fence_operand(tile.acc[h][j]);
+              // The epilogue already masks inactive WGMMA output columns.
+              final_accum[h * kSwapABHalfAccumPerThread + j] += tile.scale[j % 2] * tile.acc[h][j];
+            }
+          }
+          arrive_empty_barrier(tile.index);
+        };
+        if constexpr (groups == 4) {
+          retire.template operator()<6>(staged[0]);
+          retire.template operator()<4>(staged[1]);
+        }
+        retire.template operator()<2>(staged[groups - 2]);
+        retire.template operator()<0>(staged[groups - 1]);
+        continue;
+      }
       // BM128 split-M alternates two decoded slots keyed by the
       // pipeline stage, because its paired warpgroups share the same
       // N range and one must not overwrite a tile the other is still
@@ -1116,7 +1515,9 @@ if (warp_idx < kNumDispatchWarps) {
             arrive_empty_barrier(stage_idx);
           };
 
-          if constexpr (BLOCK_M == 8) {
+          if constexpr (FixedM != 0) {
+            run_swap_ab_l1.template operator()<FixedM>();
+          } else if constexpr (BLOCK_M == 8) {
             run_swap_ab_l1.template operator()<8>();
           } else if constexpr (BLOCK_M == 16) {
             const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
@@ -1284,7 +1685,9 @@ if (warp_idx < kNumDispatchWarps) {
             arrive_empty_barrier(stage_idx);
           };
 
-          if constexpr (BLOCK_M == 8) {
+          if constexpr (FixedM != 0) {
+            run_swap_ab_l2.template operator()<FixedM>();
+          } else if constexpr (BLOCK_M == 8) {
             run_swap_ab_l2.template operator()<8>();
           } else if constexpr (BLOCK_M == 16) {
             const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
@@ -1398,11 +1801,61 @@ if (warp_idx < kNumDispatchWarps) {
       stamp_max(kBlockIsL2 ? 5u : 4u);
     }
   };
+  const auto run_math_task = [&](auto phase, uint32_t expert, uint32_t kBlocks,
+                                 uint32_t mBlock, uint32_t nBlock, uint32_t pool, uint32_t rows) {
+    if constexpr (kLanePackedWeights && BLOCK_M == 16) {
+      if (rows <= 8)
+        run_math_width.template operator()<8>(phase, expert, kBlocks, mBlock, nBlock, pool, rows);
+      else
+        run_math_width.template operator()<16>(phase, expert, kBlocks, mBlock, nBlock, pool, rows);
+    } else {
+      run_math_width.template operator()<0>(phase, expert, kBlocks, mBlock, nBlock, pool, rows);
+    }
+  };
   if constexpr (kUseInterleavedScheduler)
     for_each_published_block(run_math_task);
   else
     for_each_static_selected_block(run_math_task);
 
+  if constexpr (kGroupLocalRows && kLocalMaxRows <= 16) {
+    // The tagged TP consumer can prefetch its RMSNorm weights while all
+    // ranks finish the local combine. The consumer waits before reading y.
+    if (epilogue_thread_idx == 0) cudaTriggerProgrammaticLaunchCompletion();
+  }
+  if constexpr (kLocalSlots) {
+    // All L2 stores are local. Once the grid has published them, each warp
+    // reduces a different slice of the output rows in original slot order.
+    comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(workspace, sm_idx, epilogue_thread_idx,
+        [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }, gridDim.x);
+    if (epilogue_thread_idx == 0)
+      for (uint32_t slot = sm_idx; slot < localRows * kNumTopk; slot += gridDim.x)
+        *workspace.get_l2_arrival_mask_ptr(slot) = 0;
+    constexpr uint32_t combineLanes = kGroupLocalRows ? (kLanePackedWeights ? 128 : 64) : 32;
+    if (epilogue_thread_idx < combineLanes) {
+      for (uint32_t vec = sm_idx * combineLanes + epilogue_thread_idx;
+           vec < localRows * (kHidden / 8); vec += gridDim.x * combineLanes) {
+        const uint32_t row = kLocalMaxRows == 1 ? 0 : vec / (kHidden / 8);
+        const uint32_t col = vec % (kHidden / 8);
+        float2 sums[4] = {};
+        for (uint32_t s = 0; s < kNumTopk; ++s) {
+          // The fused eight-row router publishes exactly kNumTopk valid experts per row.
+          if constexpr (!(kPrepareInput && kLocalMaxRows == 8)) {
+            if (__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + row * kNumTopk + s) < 0) continue;
+          }
+          uint4 v = combine_token_buffer.get_rank_buffer(s).get_data_buffer(row).get_base_ptr<uint4>()[col];
+          const auto* pairs = reinterpret_cast<const nv_bfloat162*>(&v);
+#pragma unroll
+          for (uint32_t i = 0; i < 4; ++i) ptx::accumulate(sums[i], pairs[i]);
+        }
+        uint4 result;
+        auto* pairs = reinterpret_cast<nv_bfloat162*>(&result);
+#pragma unroll
+        for (uint32_t i = 0; i < 4; ++i) pairs[i] = __float22bfloat162_rn(sums[i]);
+        static_cast<uint4*>(y)[vec] = result;
+      }
+    }
+    return;
+  }
   // ---------------- COMBINE ----------------
   // NVLink barrier first: signals remote ranks that this rank's GEMM
   // outputs (NVLink scatter targets) are fully written.
@@ -1415,6 +1868,9 @@ if (warp_idx < kNumDispatchWarps) {
   // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
   // dispatch may now safely clean workspace state.
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+// A wide EP rank divides each output row across four independent combine warps.
+constexpr uint32_t kCombineStripes = kWideEpVerify ? 4 : 1;
 
 // These are function fragments: sizing declarations must precede the combine body.
 // clang-format off

@@ -174,6 +174,7 @@ extern "C" void *fastllm_mxfp4_ep_create(const void *const *, const void *const 
     const void *const *, int, int) { return nullptr; }
 extern "C" void *fastllm_mxfp4_ep_create_shape(const void *const *, const void *const *, void *, size_t,
     const void *const *, int, int, int, int) { return nullptr; }
+extern "C" int fastllm_mxfp4_ep_set_map(void *, const uint8_t *) { return 0; }
 extern "C" int fastllm_mxfp4_ep_run(void *, const void *, void *, const int32_t *, const float *, int, int, const int *) { return 0; }
 extern "C" void fastllm_mxfp4_ep_destroy(void *) {}
 #endif
