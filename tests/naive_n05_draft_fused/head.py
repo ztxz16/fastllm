@@ -149,7 +149,7 @@ lib.FastllmDraftFusedVerificationCreate.restype=P
 lib.FastllmDraftFusedVerificationUpload.argtypes=[P,P,C.c_int,P];lib.FastllmDraftFusedVerificationUpload.restype=C.c_bool
 lib.FastllmDraftFusedVerificationExec.argtypes=[P,C.c_bool];lib.FastllmDraftFusedVerificationExec.restype=P
 lib.FastllmDraftFusedVerificationDestroy.argtypes=[P]
-cuda=C.CDLL('/usr/local/cuda-12.9/lib64/libcudart.so')
+cuda=C.CDLL('libcudart.so')
 cuda.cudaGraphCreate.argtypes=[C.POINTER(P),C.c_uint]
 cuda.cudaGraphDestroy.argtypes=[P];cuda.cudaGraphLaunch.argtypes=[P,P]
 cuda.cudaEventCreateWithFlags.argtypes=[C.POINTER(P),C.c_uint]

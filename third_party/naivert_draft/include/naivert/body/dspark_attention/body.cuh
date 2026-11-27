@@ -307,10 +307,13 @@ __device__ void attn_project_requests(const Args* requests, unsigned char* memor
 }
 
 template<int Ctas = kAttnCtas, int Requests = 1> struct AttnRowsBody {
-  static_assert(Ctas == 64 || Ctas == 128 || (Ctas == 32 && Requests == 4));
+  static_assert(Ctas == 64 || Ctas == 128 || (Ctas == 32 && (Requests == 2 || Requests == 4)) ||
+                (Ctas == 16 && Requests == 4));
   static_assert(Requests == 1 || Requests == 2 || Requests == 4);
-  static constexpr int kOutputCtas = Requests == 1 ? Ctas : 128;
-  static constexpr int kAttnSplits = Ctas / kAttnQHeads;
+  static constexpr int kOutputCtas = Requests * Ctas;
+  // The 64-CTA batched grids retain the scalar Hopper partition of history.
+  static constexpr int kSplitPasses = Requests > 1 && kOutputCtas == 64 ? 64 / Ctas : 1;
+  static constexpr int kAttnSplits = Ctas / kAttnQHeads * kSplitPasses;
   static constexpr int kColsPerCtaD3 = kAttnHidden / kOutputCtas;
   static constexpr int kPairsD3 = kColsPerCtaD3 / 4;
   static constexpr int kOWeightOffset = Ctas == 128 ? fastllm_draft_ops::kOWeightOffset : kAttnSmem;
@@ -338,7 +341,7 @@ template<int Ctas = kAttnCtas, int Requests = 1> struct AttnRowsBody {
     const int projection_row0 = (tid / kAttnWorkThreads) * kRowsPerGroup;
     const int cta = Requests == 1 ? int(blockIdx.x) : int(blockIdx.x) % Ctas;
     const int output_cta = Requests == 1 ? cta : int(blockIdx.x);
-    const int cta_head = cta / kAttnSplits;
+    const int cta_head = cta / (Ctas / kAttnQHeads);
     const int ncache = args.ncache;
     const int total = args.total_cols;
     // Prefetch exactly this producer's packed16-column tile while the
@@ -508,266 +511,269 @@ template<int Ctas = kAttnCtas, int Requests = 1> struct AttnRowsBody {
       return q_ready & k_ready & v_ready;
     }, 0xD310u + args.generation_salt);
 
-    // ================================================ phase 2: head norm + RoPE, then the scores
-    auto* sq = reinterpret_cast<__nv_bfloat16*>(smem_raw + kAttnWindow * kQkRaw * 2);   // [8][520]
-    auto* sk = sq + kAttnWindow * kSharedQStride;                                      // [8][136]
-    // The acquired Q/K producers are immutable for this phase. Each head
-    // warp loads its own four BF16 values directly, with no shared staging.
+    for (int pass = 0; pass < kSplitPasses; ++pass) {
+      const int logicalCta = cta_head * kAttnSplits + cta % (Ctas / kAttnQHeads) + pass * (Ctas / kAttnQHeads);
+      // ================================================ phase 2: head norm + RoPE, then the scores
+      auto* sq = reinterpret_cast<__nv_bfloat16*>(smem_raw + kAttnWindow * kQkRaw * 2);   // [8][520]
+      auto* sk = sq + kAttnWindow * kSharedQStride;                                      // [8][136]
+      // The acquired Q/K producers are immutable for this phase. Each head
+      // warp loads its own four BF16 values directly, with no shared staging.
 
-    // Distribute the 16 independent head tasks over all 16 warps. A task is 128 elements held four to a lane, which is what makes
-    // RoPE's element e <-> e + 64 partner exactly lane l <-> l ^ 16.
+      // Distribute the 16 independent head tasks over all 16 warps. A task is 128 elements held four to a lane, which is what makes
+      // RoPE's element e <-> e + 64 partner exactly lane l <-> l ^ 16.
   #pragma unroll
-    for (int task = warp; task < kHeadTasks;
-         task += kAttnThreads / 32) {
-      const bool is_k = task >= kAttnWindow;
-      const int m = is_k ? task - kAttnWindow : task;
-      const int head = is_k ? 0 : cta_head;
-      const __nv_bfloat16* src = args.qk_raw + std::size_t(m) * kQkRaw +
-                                 (is_k ? kAttnQRows : head * kAttnHeadDim);
-      const float* gamma = is_k ? args.k_norm : args.q_norm;
-      __nv_bfloat16* dst = is_k ? (sk + std::size_t(m) * kSharedKStride)
-                                : (sq + std::size_t(m) * kSharedQStride + head * kAttnHeadDim);
+      for (int task = warp; task < kHeadTasks;
+           task += kAttnThreads / 32) {
+        const bool is_k = task >= kAttnWindow;
+        const int m = is_k ? task - kAttnWindow : task;
+        const int head = is_k ? 0 : cta_head;
+        const __nv_bfloat16* src = args.qk_raw + std::size_t(m) * kQkRaw +
+                                   (is_k ? kAttnQRows : head * kAttnHeadDim);
+        const float* gamma = is_k ? args.k_norm : args.q_norm;
+        __nv_bfloat16* dst = is_k ? (sk + std::size_t(m) * kSharedKStride)
+                                  : (sq + std::size_t(m) * kSharedQStride + head * kAttnHeadDim);
 
-      const int e0 = lane * kPerLane;
-      static_assert(kPerLane == 4);
-      const uint2 raw = *reinterpret_cast<const uint2*>(src + e0);
-      const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
-      const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
-      const float v[kPerLane] = {lo.x, lo.y, hi.x, hi.y};
-      float ssq = 0.0f;
+        const int e0 = lane * kPerLane;
+        static_assert(kPerLane == 4);
+        const uint2 raw = *reinterpret_cast<const uint2*>(src + e0);
+        const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+        const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+        const float v[kPerLane] = {lo.x, lo.y, hi.x, hi.y};
+        float ssq = 0.0f;
   #pragma unroll
-      for (int j = 0; j < kPerLane; ++j) {
-        ssq = fmaf(v[j], v[j], ssq);          // bf16 x bf16 is exact in fp32, so this is a + b*b
-      }
+        for (int j = 0; j < kPerLane; ++j) {
+          ssq = fmaf(v[j], v[j], ssq);          // bf16 x bf16 is exact in fp32, so this is a + b*b
+        }
   #pragma unroll
-      for (int off = 16; off > 0; off >>= 1) {
-        ssq += __shfl_xor_sync(0xffffffffu, ssq, off);
-      }
-      const float scale = rsqrtf(ssq / float(kAttnHeadDim) + rms_epsilon);
-      // Round once here: `_head_rmsnorm` writes bf16 and `_rope_dev` reads that bf16 back, so RoPE's
-      // input -- and its half-split partner -- are the ROUNDED values, not the fp32 ones.
-      float f[kPerLane];
+        for (int off = 16; off > 0; off >>= 1) {
+          ssq += __shfl_xor_sync(0xffffffffu, ssq, off);
+        }
+        const float scale = rsqrtf(ssq / float(kAttnHeadDim) + rms_epsilon);
+        // Round once here: `_head_rmsnorm` writes bf16 and `_rope_dev` reads that bf16 back, so RoPE's
+        // input -- and its half-split partner -- are the ROUNDED values, not the fp32 ones.
+        float f[kPerLane];
   #pragma unroll
-      for (int j = 0; j < kPerLane; ++j) {
-        f[j] = __bfloat162float(__float2bfloat16_rn(float(__float2bfloat16_rn(v[j] * scale)) * gamma[e0 + j]));
-      }
-      const std::size_t rp = std::size_t(m) * kAttnHeadDim + e0;
+        for (int j = 0; j < kPerLane; ++j) {
+          f[j] = __bfloat162float(__float2bfloat16_rn(float(__float2bfloat16_rn(v[j] * scale)) * gamma[e0 + j]));
+        }
+        const std::size_t rp = std::size_t(m) * kAttnHeadDim + e0;
   #pragma unroll
-      for (int j = 0; j < kPerLane; ++j) {
-        const float partner = __shfl_xor_sync(0xffffffffu, f[j], 16);
-        const float rot = (lane < 16) ? -partner : partner;
-        // Not fmaf: the stand-in multiplies twice and adds once, and contraction would move a ulp.
-        const float roped = __fadd_rn(float(__float2bfloat16_rn(__fmul_rn(f[j], args.rope_cos[rp + j]))),
-                                      float(__float2bfloat16_rn(__fmul_rn(rot, args.rope_sin[rp + j]))));
-        dst[e0 + j] = __float2bfloat16_rn(roped);
+        for (int j = 0; j < kPerLane; ++j) {
+          const float partner = __shfl_xor_sync(0xffffffffu, f[j], 16);
+          const float rot = (lane < 16) ? -partner : partner;
+          // Not fmaf: the stand-in multiplies twice and adds once, and contraction would move a ulp.
+          const float roped = __fadd_rn(float(__float2bfloat16_rn(__fmul_rn(f[j], args.rope_cos[rp + j]))),
+                                        float(__float2bfloat16_rn(__fmul_rn(rot, args.rope_sin[rp + j]))));
+          dst[e0 + j] = __float2bfloat16_rn(roped);
+        }
       }
-    }
-    __syncthreads();
+      __syncthreads();
 
-    // Each head's first split publishes its query diagnostics. Every CTA
-    // computes only this head's eight Q norms and the eight fresh K norms.
-    if (kExportDiagnostics && cta % kAttnSplits == 0) {
-      for (int i = tid; i < kAttnWindow * kAttnHeadDim; i += kAttnThreads) {
-        const int row = i / kAttnHeadDim, dim = i % kAttnHeadDim;
-        args.q_out[row * kAttnQRows + cta_head * kAttnHeadDim + dim] =
-            sq[row * kSharedQStride + cta_head * kAttnHeadDim + dim];
+      // Each head's first split publishes its query diagnostics. Every CTA
+      // computes only this head's eight Q norms and the eight fresh K norms.
+      if (kExportDiagnostics && logicalCta % kAttnSplits == 0) {
+        for (int i = tid; i < kAttnWindow * kAttnHeadDim; i += kAttnThreads) {
+          const int row = i / kAttnHeadDim, dim = i % kAttnHeadDim;
+          args.q_out[row * kAttnQRows + cta_head * kAttnHeadDim + dim] =
+              sq[row * kSharedQStride + cta_head * kAttnHeadDim + dim];
+        }
       }
-    }
-    if (cta == 0) { // Preserve speculative KV output for the FastLLM caller.
-      for (int i = tid; i < kAttnWindow * kAttnHeadDim; i += kAttnThreads) {
-        args.k_blk[i] = sk[(i / kAttnHeadDim) * kSharedKStride + i % kAttnHeadDim];
+      if (logicalCta == 0) { // Preserve speculative KV output for the FastLLM caller.
+        for (int i = tid; i < kAttnWindow * kAttnHeadDim; i += kAttnThreads) {
+          args.k_blk[i] = sk[(i / kAttnHeadDim) * kSharedKStride + i % kAttnHeadDim];
+        }
       }
-    }
 
-    // The padded query rows must not alias the MMA partials: a faster
-    // warp can publish its partials while another is still reading queries.
-    constexpr int kQueryOffset = kPvTileOffset + (kAttnThreads / 32) * 128 * sizeof(float);
-    static_assert(kQueryOffset + kAttnWindow * kSharedKStride * sizeof(__nv_bfloat16) <= kAttnSmem);
-    auto* queries = reinterpret_cast<__nv_bfloat16*>(smem_raw + kQueryOffset);
-    if (tid < kAttnWindow * kAttnHeadDim / 8) {
-      const int row = tid / (kAttnHeadDim / 8), k = tid % (kAttnHeadDim / 8) * 8;
-      *reinterpret_cast<uint4*>(queries + row * kSharedKStride + k) =
-          *reinterpret_cast<const uint4*>(sq + row * kSharedQStride + cta_head * kAttnHeadDim + k);
-    }
-    auto* local_scores = reinterpret_cast<float*>(smem_raw);
-    auto* tile_scores = reinterpret_cast<float*>(smem_raw + 32768);
-    float* running_max = tile_scores + kAttnWindow * kScoreStride;
-    float* running_den = running_max + kAttnWindow;
-    float* rescale = running_den + kAttnWindow;
-    if (tid < kAttnWindow) {
-      running_max[tid] = -INFINITY;
-      running_den[tid] = 0.0f;
-    }
-    __syncthreads();
+      // The padded query rows must not alias the MMA partials: a faster
+      // warp can publish its partials while another is still reading queries.
+      constexpr int kQueryOffset = kPvTileOffset + (kAttnThreads / 32) * 128 * sizeof(float);
+      static_assert(kQueryOffset + kAttnWindow * kSharedKStride * sizeof(__nv_bfloat16) <= kAttnSmem);
+      auto* queries = reinterpret_cast<__nv_bfloat16*>(smem_raw + kQueryOffset);
+      if (tid < kAttnWindow * kAttnHeadDim / 8) {
+        const int row = tid / (kAttnHeadDim / 8), k = tid % (kAttnHeadDim / 8) * 8;
+        *reinterpret_cast<uint4*>(queries + row * kSharedKStride + k) =
+            *reinterpret_cast<const uint4*>(sq + row * kSharedQStride + cta_head * kAttnHeadDim + k);
+      }
+      auto* local_scores = reinterpret_cast<float*>(smem_raw);
+      auto* tile_scores = reinterpret_cast<float*>(smem_raw + 32768);
+      float* running_max = tile_scores + kAttnWindow * kScoreStride;
+      float* running_den = running_max + kAttnWindow;
+      float* rescale = running_den + kAttnWindow;
+      if (tid < kAttnWindow) {
+        running_max[tid] = -INFINITY;
+        running_den[tid] = 0.0f;
+      }
+      __syncthreads();
 
-    const int key_split = cta % kAttnSplits;
-    constexpr int kTilesPerBatch = 8;
-    constexpr int kKeyStride = kAttnSplits * kSplitTile;
-    const int key_tiles = (ncache - key_split * kSplitTile + kKeyStride - 1) / kKeyStride;
-    // The fresh keys are already normalized/rotated in this CTA's shared memory.
-    // Repeat them in the unused second half of M; only eight key rows are stored.
-    if (key_split == 0 && warp == 0) {
-      const int key = lane >> 2;
-      const int query_pair = lane & 3;
-      float dot[4] = {0.f, 0.f, 0.f, 0.f};
+      const int key_split = logicalCta % kAttnSplits;
+      constexpr int kTilesPerBatch = 8;
+      constexpr int kKeyStride = kAttnSplits * kSplitTile;
+      const int key_tiles = (ncache - key_split * kSplitTile + kKeyStride - 1) / kKeyStride;
+      // The fresh keys are already normalized/rotated in this CTA's shared memory.
+      // Repeat them in the unused second half of M; only eight key rows are stored.
+      if (key_split == 0 && warp == 0) {
+        const int key = lane >> 2;
+        const int query_pair = lane & 3;
+        float dot[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-      for (int k0 = 0; k0 < kAttnHeadDim; k0 += 32) {
-        const int k = k0 + query_pair * 8;
-        const uint4 a = *reinterpret_cast<const uint4*>(sk + key * kSharedKStride + k);
-        const uint4 b = *reinterpret_cast<const uint4*>(queries + key * kSharedKStride + k);
-        naivert::attn_rows::mma_bf16_16816(dot, a.x, a.x, a.y, a.y, b.x, b.y);
-        naivert::attn_rows::mma_bf16_16816(dot, a.z, a.z, a.w, a.w, b.z, b.w);
+        for (int k0 = 0; k0 < kAttnHeadDim; k0 += 32) {
+          const int k = k0 + query_pair * 8;
+          const uint4 a = *reinterpret_cast<const uint4*>(sk + key * kSharedKStride + k);
+          const uint4 b = *reinterpret_cast<const uint4*>(queries + key * kSharedKStride + k);
+          naivert::attn_rows::mma_bf16_16816(dot, a.x, a.x, a.y, a.y, b.x, b.y);
+          naivert::attn_rows::mma_bf16_16816(dot, a.z, a.z, a.w, a.w, b.z, b.w);
+        }
+        local_scores[(kMaxSplitKeys + key) * kAttnWindow + 2 * query_pair] =
+            score_value(dot[0], 2 * query_pair, key, true);
+        local_scores[(kMaxSplitKeys + key) * kAttnWindow + 2 * query_pair + 1] =
+            score_value(dot[1], 2 * query_pair + 1, key, true);
       }
-      local_scores[(kMaxSplitKeys + key) * kAttnWindow + 2 * query_pair] =
-          score_value(dot[0], 2 * query_pair, key, true);
-      local_scores[(kMaxSplitKeys + key) * kAttnWindow + 2 * query_pair + 1] =
-          score_value(dot[1], 2 * query_pair + 1, key, true);
-    }
 
-    // Cache MMA's existing final CTA barrier publishes the fresh scores too.
-    // Split zero always has a cache tile (bindings require ncache > 0).
-    // Empty nonzero splits produce neither cached nor fresh scores.
-    for (int batch = 0; batch < key_tiles; batch += kTilesPerBatch) {
-      const int tiles_in_batch = min(kTilesPerBatch, key_tiles - batch);
-      auto column = [&](int local) {
-        return key_split * kSplitTile + (batch + local / kSplitTile) * kKeyStride + local % kSplitTile;
-      };
-      // Cache scores do not alias queries or fresh K; direct output is safe.
-      naivert::attn_rows::project_strided_rows_mma<kAttnWindow, kAttnHeadDim, 1, kTilesPerBatch, kAttnThreads / 32, kSharedKStride, true>(
-          0, tiles_in_batch,
-          [&](int local) {
-            const int key = min(column(local), ncache - 1);
-            return args.kv_k + cached_position(key) * kAttnHeadDim;
-          }, queries, mma_partials,
-          [&](int local, int row, float value) {
-            const int key = column(local);
-            if (key < ncache)
-              local_scores[(batch * kSplitTile + local) * kAttnWindow + row] =
-                  score_value(value, row, key, false);
-          }, 0);
-    }
-
-    // Correctness-only export. Online attention consumes the CTA-local copy.
-    if constexpr (kExportDiagnostics) {
-      const int tiles = (ncache + kAttnSplits * kSplitTile - 1 - key_split * kSplitTile) /
-                        (kAttnSplits * kSplitTile);
-      const int owned_keys = tiles * kSplitTile;
-      for (int item = tid; item < owned_keys * kAttnWindow; item += kAttnThreads) {
-        const int row = item / owned_keys, local = item % owned_keys;
-        const int c = key_split * kSplitTile + (local / kSplitTile) * kAttnSplits * kSplitTile + local % kSplitTile;
-        if (c < ncache) args.scores[(std::size_t(cta_head) * kAttnWindow + row) * total + c] =
-            local_scores[local * kAttnWindow + row];
+      // Cache MMA's existing final CTA barrier publishes the fresh scores too.
+      // Split zero always has a cache tile (bindings require ncache > 0).
+      // Empty nonzero splits produce neither cached nor fresh scores.
+      for (int batch = 0; batch < key_tiles; batch += kTilesPerBatch) {
+        const int tiles_in_batch = min(kTilesPerBatch, key_tiles - batch);
+        auto column = [&](int local) {
+          return key_split * kSplitTile + (batch + local / kSplitTile) * kKeyStride + local % kSplitTile;
+        };
+        // Cache scores do not alias queries or fresh K; direct output is safe.
+        naivert::attn_rows::project_strided_rows_mma<kAttnWindow, kAttnHeadDim, 1, kTilesPerBatch, kAttnThreads / 32, kSharedKStride, true>(
+            0, tiles_in_batch,
+            [&](int local) {
+              const int key = min(column(local), ncache - 1);
+              return args.kv_k + cached_position(key) * kAttnHeadDim;
+            }, queries, mma_partials,
+            [&](int local, int row, float value) {
+              const int key = column(local);
+              if (key < ncache)
+                local_scores[(batch * kSplitTile + local) * kAttnWindow + row] =
+                    score_value(value, row, key, false);
+            }, 0);
       }
-      if (key_split == 0 && tid < kAttnWindow * kAttnWindow) {
-        const int row = tid / kAttnWindow, key = tid % kAttnWindow;
-        args.scores[(std::size_t(cta_head) * kAttnWindow + row) * total + ncache + key] =
-            local_scores[(kMaxSplitKeys + key) * kAttnWindow + row];
+
+      // Correctness-only export. Online attention consumes the CTA-local copy.
+      if constexpr (kExportDiagnostics) {
+        const int tiles = (ncache + kAttnSplits * kSplitTile - 1 - key_split * kSplitTile) /
+                          (kAttnSplits * kSplitTile);
+        const int owned_keys = tiles * kSplitTile;
+        for (int item = tid; item < owned_keys * kAttnWindow; item += kAttnThreads) {
+          const int row = item / owned_keys, local = item % owned_keys;
+          const int c = key_split * kSplitTile + (local / kSplitTile) * kAttnSplits * kSplitTile + local % kSplitTile;
+          if (c < ncache) args.scores[(std::size_t(cta_head) * kAttnWindow + row) * total + c] =
+              local_scores[local * kAttnWindow + row];
+        }
+        if (key_split == 0 && tid < kAttnWindow * kAttnWindow) {
+          const int row = tid / kAttnWindow, key = tid % kAttnWindow;
+          args.scores[(std::size_t(cta_head) * kAttnWindow + row) * total + ncache + key] =
+              local_scores[(kMaxSplitKeys + key) * kAttnWindow + row];
+        }
       }
-    }
 
-    float accum[kAttnWindow] = {};
-    const int split = cta % kAttnSplits;
-    const int stream = tid / kAttnHeadDim;
-    const int dimension = tid % kAttnHeadDim;
-    const int live = Sliding ? history_count : min(int(args.blk_pos[0]), ncache);
-    auto* values = reinterpret_cast<__nv_bfloat16*>(smem_raw + kPvTileOffset);
+      float accum[kAttnWindow] = {};
+      const int split = logicalCta % kAttnSplits;
+      const int stream = tid / kAttnHeadDim;
+      const int dimension = tid % kAttnHeadDim;
+      const int live = Sliding ? history_count : min(int(args.blk_pos[0]), ncache);
+      auto* values = reinterpret_cast<__nv_bfloat16*>(smem_raw + kPvTileOffset);
 
-    // Flatten this split's live cache tiles, followed by its fresh keys.
-    // Clip the final cache tile to the allocated cache extent, retaining
-    // masked columns inside a live tile just as the original loop does.
-    constexpr int cache_stride = kAttnSplits * kSplitTile;
-    const int first_cache = split * kSplitTile;
-    const int live_tiles = live > first_cache
-        ? (live - first_cache + cache_stride - 1) / cache_stride : 0;
-    const int cache_count = live_tiles == 0 ? 0 : (live_tiles - 1) * kSplitTile +
-        min(kSplitTile, ncache - (first_cache + (live_tiles - 1) * cache_stride));
-    const int pv_count = cache_count + (split == 0 ? kAttnWindow : 0);
-    for (int first = 0; first < pv_count; first += kPvBatchKeys) {
-      const int count = min(kPvBatchKeys, pv_count - first);
-      if (tid < kAttnWindow * kPvBatchKeys) {
-        const int row = tid % kAttnWindow, column = tid / kAttnWindow;
-        const int key = first + column;
-        float score = -INFINITY;
-        if (column < count) {
+      // Flatten this split's live cache tiles, followed by its fresh keys.
+      // Clip the final cache tile to the allocated cache extent, retaining
+      // masked columns inside a live tile just as the original loop does.
+      constexpr int cache_stride = kAttnSplits * kSplitTile;
+      const int first_cache = split * kSplitTile;
+      const int live_tiles = live > first_cache
+          ? (live - first_cache + cache_stride - 1) / cache_stride : 0;
+      const int cache_count = live_tiles == 0 ? 0 : (live_tiles - 1) * kSplitTile +
+          min(kSplitTile, ncache - (first_cache + (live_tiles - 1) * cache_stride));
+      const int pv_count = cache_count + (split == 0 ? kAttnWindow : 0);
+      for (int first = 0; first < pv_count; first += kPvBatchKeys) {
+        const int count = min(kPvBatchKeys, pv_count - first);
+        if (tid < kAttnWindow * kPvBatchKeys) {
+          const int row = tid % kAttnWindow, column = tid / kAttnWindow;
+          const int key = first + column;
+          float score = -INFINITY;
+          if (column < count) {
+            const bool cached = key < cache_count;
+            const int physical = cached
+                ? first_cache + (key / kSplitTile) * cache_stride + key % kSplitTile
+                : ncache + key - cache_count;
+            const int local = cached ? key : kMaxSplitKeys + key - cache_count;
+            if constexpr (Sliding) {
+              score = local_scores[local * kAttnWindow + row];
+            } else if (args.key_add[physical] == 0.0f) {
+              score = local_scores[local * kAttnWindow + row];
+            }
+          }
+          tile_scores[row * kScoreStride + column] = score;
+        }
+        __syncthreads();
+        if (warp < kAttnWindow) {
+          const float score0 = tile_scores[warp * kScoreStride + lane];
+          const float score1 = tile_scores[warp * kScoreStride + lane + 32];
+          float maximum = fmaxf(score0, score1);
+#pragma unroll
+          for (int off = 16; off > 0; off >>= 1)
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, off));
+          const float old_max = running_max[warp];
+          maximum = fmaxf(old_max, maximum);
+          const float alpha = old_max == -INFINITY ? 0.0f : expf(old_max - maximum);
+          const float probability0 = score0 == -INFINITY ? 0.0f : expf(score0 - maximum);
+          const float probability1 = score1 == -INFINITY ? 0.0f : expf(score1 - maximum);
+          const float denominator = naivert::attn_rows::warp_sum_f32(probability0 + probability1);
+          tile_scores[warp * kScoreStride + lane] = probability0;
+          tile_scores[warp * kScoreStride + lane + 32] = probability1;
+          if (lane == 0) {
+            running_max[warp] = maximum;
+            running_den[warp] = __fadd_rn(__fmul_rn(running_den[warp], alpha), denominator);
+            rescale[warp] = alpha;
+          }
+        }
+        for (int piece = tid; piece < count * kAttnHeadDim / 8; piece += kAttnThreads) {
+          const int key = first + piece / (kAttnHeadDim / 8);
+          const int dimension8 = (piece % (kAttnHeadDim / 8)) * 8;
           const bool cached = key < cache_count;
           const int physical = cached
               ? first_cache + (key / kSplitTile) * cache_stride + key % kSplitTile
-              : ncache + key - cache_count;
-          const int local = cached ? key : kMaxSplitKeys + key - cache_count;
-          if constexpr (Sliding) {
-            score = local_scores[local * kAttnWindow + row];
-          } else if (args.key_add[physical] == 0.0f) {
-            score = local_scores[local * kAttnWindow + row];
-          }
+              : key - cache_count;
+          const auto* source = cached
+              ? args.kv_v + cached_position(physical) * kAttnHeadDim
+              : args.v_blk + physical * kAttnHeadDim;
+          reinterpret_cast<uint4*>(values)[piece] =
+              *reinterpret_cast<const uint4*>(source + dimension8);
         }
-        tile_scores[row * kScoreStride + column] = score;
-      }
-      __syncthreads();
-      if (warp < kAttnWindow) {
-        const float score0 = tile_scores[warp * kScoreStride + lane];
-        const float score1 = tile_scores[warp * kScoreStride + lane + 32];
-        float maximum = fmaxf(score0, score1);
+        __syncthreads();
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-          maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, off));
-        const float old_max = running_max[warp];
-        maximum = fmaxf(old_max, maximum);
-        const float alpha = old_max == -INFINITY ? 0.0f : expf(old_max - maximum);
-        const float probability0 = score0 == -INFINITY ? 0.0f : expf(score0 - maximum);
-        const float probability1 = score1 == -INFINITY ? 0.0f : expf(score1 - maximum);
-        const float denominator = naivert::attn_rows::warp_sum_f32(probability0 + probability1);
-        tile_scores[warp * kScoreStride + lane] = probability0;
-        tile_scores[warp * kScoreStride + lane + 32] = probability1;
-        if (lane == 0) {
-          running_max[warp] = maximum;
-          running_den[warp] = __fadd_rn(__fmul_rn(running_den[warp], alpha), denominator);
-          rescale[warp] = alpha;
+        for (int row = 0; row < kAttnWindow; ++row) accum[row] *= rescale[row];
+        for (int key = stream; key < count; key += 4) {
+          const float value = attn_bf16_at(values, key * kAttnHeadDim + dimension);
+#pragma unroll
+          for (int row = 0; row < kAttnWindow; ++row)
+            accum[row] = fmaf(tile_scores[row * kScoreStride + key], value, accum[row]);
+        }
+        __syncthreads();
+      }
+      auto* sums = reinterpret_cast<float*>(values);
+#pragma unroll
+      for (int row = 0; row < kAttnWindow; ++row)
+        sums[row * kAttnThreads + tid] = accum[row];
+      __syncthreads();
+      if (tid < kAttnHeadDim) {
+#pragma unroll
+        for (int row = 0; row < kAttnWindow; ++row) {
+          const float* src = sums + row * kAttnThreads + tid;
+          args.split_scratch[(logicalCta * kAttnWindow + row) * kSplitRowStride + tid] =
+              __fadd_rn(__fadd_rn(__fadd_rn(src[0], src[kAttnHeadDim]),
+                                           src[2 * kAttnHeadDim]), src[3 * kAttnHeadDim]);
         }
       }
-      for (int piece = tid; piece < count * kAttnHeadDim / 8; piece += kAttnThreads) {
-        const int key = first + piece / (kAttnHeadDim / 8);
-        const int dimension8 = (piece % (kAttnHeadDim / 8)) * 8;
-        const bool cached = key < cache_count;
-        const int physical = cached
-            ? first_cache + (key / kSplitTile) * cache_stride + key % kSplitTile
-            : key - cache_count;
-        const auto* source = cached
-            ? args.kv_v + cached_position(physical) * kAttnHeadDim
-            : args.v_blk + physical * kAttnHeadDim;
-        reinterpret_cast<uint4*>(values)[piece] =
-            *reinterpret_cast<const uint4*>(source + dimension8);
+      if (tid < kAttnWindow) {
+        float* out = args.split_scratch + (logicalCta * kAttnWindow + tid) * kSplitRowStride;
+        out[kAttnHeadDim] = running_max[tid];
+        out[kAttnHeadDim + 1] = running_den[tid];
       }
-      __syncthreads();
-#pragma unroll
-      for (int row = 0; row < kAttnWindow; ++row) accum[row] *= rescale[row];
-      for (int key = stream; key < count; key += 4) {
-        const float value = attn_bf16_at(values, key * kAttnHeadDim + dimension);
-#pragma unroll
-        for (int row = 0; row < kAttnWindow; ++row)
-          accum[row] = fmaf(tile_scores[row * kScoreStride + key], value, accum[row]);
-      }
-      __syncthreads();
+      attn_publish_ready(args, kReadyPv + cta_head);
     }
-    auto* sums = reinterpret_cast<float*>(values);
-#pragma unroll
-    for (int row = 0; row < kAttnWindow; ++row)
-      sums[row * kAttnThreads + tid] = accum[row];
-    __syncthreads();
-    if (tid < kAttnHeadDim) {
-#pragma unroll
-      for (int row = 0; row < kAttnWindow; ++row) {
-        const float* src = sums + row * kAttnThreads + tid;
-        args.split_scratch[(cta * kAttnWindow + row) * kSplitRowStride + tid] =
-            __fadd_rn(__fadd_rn(__fadd_rn(src[0], src[kAttnHeadDim]),
-                                         src[2 * kAttnHeadDim]), src[3 * kAttnHeadDim]);
-      }
-    }
-    if (tid < kAttnWindow) {
-      float* out = args.split_scratch + (cta * kAttnWindow + tid) * kSplitRowStride;
-      out[kAttnHeadDim] = running_max[tid];
-      out[kAttnHeadDim + 1] = running_den[tid];
-    }
-    attn_publish_ready(args, kReadyPv + cta_head);
     // The publication barrier ended all generic accesses to the old scores.
     auto* o_ready = reinterpret_cast<std::uint64_t*>(smem_raw + kOReadyOffset);
     auto* o_failed = reinterpret_cast<unsigned*>(smem_raw + kOFailedOffset);
@@ -783,9 +789,11 @@ template<int Ctas = kAttnCtas, int Requests = 1> struct AttnRowsBody {
     }
 
 
-    // Merge independently normalized splits for one (head, query) per CTA.
-    if (cta < kAttnRowTasks) {
-      const int head = cta / kAttnWindow, row = cta % kAttnWindow;
+    // Each CTA merges its assigned (head, query) rows, then publishes all of them.
+    unsigned merged_increment = 0;
+    for (int task = cta; task < kAttnRowTasks; task += Ctas) {
+      const int head = task / kAttnWindow, row = task % kAttnWindow;
+      merged_increment += 1u << (head * kMergedHeadBits);
       attn_wait_ready(args, [&] {
         return attn_ready_count(args, kReadyPv + head) == kAttnSplits;
       }, 0xD320u + args.generation_salt);
@@ -824,8 +832,6 @@ template<int Ctas = kAttnCtas, int Requests = 1> struct AttnRowsBody {
     }
     // One nibble per head: eight row producers fit without carrying into
     // another head. Each release RMW publishes the same row payload as before.
-    const unsigned merged_increment = cta < kAttnRowTasks
-        ? 1u << ((cta / kAttnWindow) * kMergedHeadBits) : 0u;
     attn_publish_ready(args, cta < kAttnRowTasks ? kReadyMerged : -1, merged_increment);
 
     // ================================================ phase 4: o_proj + all-reduce + residual

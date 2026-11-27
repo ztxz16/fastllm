@@ -23,6 +23,25 @@
 namespace fastllm_draft_fused {
 using namespace fastllm_draft_ops;
 using B = __nv_bfloat16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+constexpr bool HopperImage = true;
+#else
+constexpr bool HopperImage = false;
+#endif
+constexpr HeadGrid Sm103HeadGrid = HeadGrid::forCtas(kHeadCtas);
+constexpr int HeadMarkovTiles = 16;
+constexpr int HeadBytes(HeadGrid grid, int requests) {
+    return kHeadSmem + requests * 7 * grid.rowStride * sizeof(float);
+}
+__device__ __forceinline__ HeadGrid DeviceHeadGrid(HeadGrid launchGrid) {
+    if constexpr (HopperImage) return launchGrid;
+    return Sm103HeadGrid;
+}
+constexpr int ContextBytes(bool hopper) {
+    return (hopper ? kD12CompactOffset : kD12WeightOffset) + kD12WeightBytes;
+}
+static_assert(ContextBytes(true) >= kD12Scratch);
+
 thread_local std::string error;
 void Check(cudaError_t result) {
     if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
@@ -129,6 +148,7 @@ struct Blas {
     ~Blas(){if(handle){cudaSetDevice(device);cublasDestroy(handle);}}
 };
 struct Rank {
+    HeadGrid headGrid = Sm103HeadGrid;
     std::vector<std::unique_ptr<Allocation>> allocations;
     std::vector<Weights> weights;
     std::vector<Lane> lanes;
@@ -158,9 +178,10 @@ struct State {
     std::vector<Rank> ranks;
     int layers, rows, window, prepared = 0; float eps, theta;
     bool contextReady = false, headReady = false;
-    bool programmatic = false;
+    bool programmatic = false, hopper = false;
+    bool hopperBodyPdl = false;
     bool batchMlp = true, batchMlp4 = true;
-    bool batchAttention = true, batchAttention4 = true;
+    bool batchAttention = true, batchAttention4 = true, compactAttentionPair = false;
     bool batchHead = true, batchHead4 = true;
     bool batchContext = true, batchContext4 = true;
 };
@@ -222,9 +243,15 @@ __global__ void ContextTrim(const void *const *table, int count, int request, in
     ContextTrimBody(table,count,request,keep,drop,values);
 }
 constexpr int ContextSmem = kD12WeightOffset + kD12WeightBytes;
-__global__ __launch_bounds__(kThreads, 1) void FusedDraftContext(const __grid_constant__ FcCtxKvArgs a) {
+constexpr int ContextQuadBytes(bool hopper) {
+    static_assert(kD12QuadBytes >= ContextBytes(true));
+    return hopper ? kD12QuadBytes : ContextSmem;
+}
+struct WatchdogTile { const unsigned *lanes[4]; };
+
+__global__ __launch_bounds__(kThreads, HopperImage ? 2 : 1) void FusedDraftContext(const __grid_constant__ FcCtxKvArgs a) {
     extern __shared__ __align__(128) unsigned char memory[];
-    __syncthreads(); FcCtxKvBody::run(memory, a);
+    __syncthreads(); FcCtxKvBody::run<false,false,HopperImage>(memory, a);
 }
 template<bool GridTrim = false>
 __device__ void ContextPreparedBody(unsigned char *memory, const FcCtxKvArgs &base, const PreparedContextRequest *request,
@@ -268,7 +295,7 @@ __device__ void ContextPreparedBody(unsigned char *memory, const FcCtxKvArgs &ba
     a.fc.target_hidden=static_cast<const B*>(d.features);
     a.kv.cache_table = request->cacheTable;
     a.kv.table_requests = request->tableRequests; a.kv.table_request = request->tableRequest;
-    FcCtxKvBody::run<true,false,GridTrim>(memory,a,{rows,d.position,keep,window,theta});
+    FcCtxKvBody::run<true,false,HopperImage,GridTrim>(memory,a,{rows,d.position,keep,window,theta});
     if constexpr (GridTrim) {
 #pragma unroll
         for (int i = 0; i < chunks; ++i) {
@@ -277,7 +304,7 @@ __device__ void ContextPreparedBody(unsigned char *memory, const FcCtxKvArgs &ba
         }
     }
 }
-__global__ __launch_bounds__(kThreads, 1) void FusedDraftContextPrepared(
+__global__ __launch_bounds__(kThreads, HopperImage ? 2 : 1) void FusedDraftContextPrepared(
         const __grid_constant__ FcCtxKvArgs base, const PreparedContextRequest *request,
         int window, float theta,const unsigned *fallback=nullptr) {
     if(fallback && !*fallback)return;
@@ -286,7 +313,7 @@ __global__ __launch_bounds__(kThreads, 1) void FusedDraftContextPrepared(
 }
 // Stage attention weights while context computes KV. Its dependency wait covers
 // both the KV writes and retirement of this rank's previous mailbox readers.
-__global__ __launch_bounds__(kThreads,1) void ContinuationContext(
+__global__ __launch_bounds__(kThreads,HopperImage ? 2 : 1) void ContinuationContext(
         const __grid_constant__ FcCtxKvArgs base,const PreparedContextRequest *request,int window,float theta) {
     extern __shared__ __align__(128) unsigned char memory[];
     naivert::pdl::trigger_dependents<true>();
@@ -388,7 +415,7 @@ __global__ __launch_bounds__(kThreads,1) void FusedDraftContextTile(
 
 template<int Requests> struct ContextRequests { FcCtxKvArgs lanes[Requests]; };
 template<int Requests>
-__global__ __launch_bounds__(kThreads,1) void FusedDraftContextRequests(
+__global__ __launch_bounds__(kThreads,HopperImage ? 2 : 1) void FusedDraftContextRequests(
         const __grid_constant__ ContextRequests<Requests> tile,const PreparedContextRequest* requests,
         int window,float theta,const unsigned *fallback=nullptr) {
     if(fallback && !*fallback)return;
@@ -430,7 +457,7 @@ __global__ __launch_bounds__(kThreads,1) void FusedDraftContextRequests(
         if(!blockIdx.x && !tid){const auto &a=tile.lanes[request].fc;
             rendezvous_announce(a.mailbox_peers,a.rank,unsigned(*a.replay_generation));}
     }
-    FcCtxKvBody::run_requests<Requests>(memory,tile.lanes,requests,window,theta);
+    FcCtxKvBody::run_requests<Requests,HopperImage>(memory,tile.lanes,requests,window,theta);
 }
 
 struct BeginArgs {
@@ -520,6 +547,19 @@ __global__ void PrepareAcceptedEmbedding(BeginArgs a,EmbeddedInput input,
     PrepareBodyPositions(a,request->position+accepted+2,blockIdx.x*blockDim.x+threadIdx.x,gridDim.x*blockDim.x);
 }
 __global__ void Begin(BeginArgs a) { BeginBody<true>(a); }
+struct BeginTile { BeginArgs lanes[4]; };
+
+__global__ void BeginRequests(const __grid_constant__ BeginTile tile,
+        const FastllmDraftHeadRequest *requests) {
+    auto a = tile.lanes[blockIdx.x];
+    if (requests) {
+        const auto &request = requests[blockIdx.x];
+        a.anchor = request.anchor;
+        a.seed = request.seed;
+        a.inverseTemperature = __fdiv_rn(1.f, request.temperature);
+    }
+    BeginBody(a);
+}
 __global__ void BeginHeadPrepared(BeginArgs a,const FastllmDraftHeadRequest *request) {
     a.anchor=request->anchor; a.seed=request->seed; a.inverseTemperature=__fdiv_rn(1.f,request->temperature);
     BeginBody(a);
@@ -546,7 +586,7 @@ struct ShardedAttention {
     static constexpr int Threads = kAttnThreads, MinBlocks = 1;
     __device__ static void Run(const Args &a, unsigned char *memory, const void *const *table,
             const int *live, int request, int requests) {
-        DraftAttentionBody<128>(a, table, live, request, requests, memory);
+        DraftAttentionBody<HopperImage ? 64 : 128>(a, table, live, request, requests, memory);
     }
 };
 constexpr auto ShardedAttentionKernel =
@@ -560,19 +600,19 @@ __global__ __launch_bounds__(kAttnThreads, 1) void FusedDraftAttentionTile(
     DraftAttentionBody<64>(tile.requests[blockIdx.y],table,live+request,request,requests,memory);
 }
 template<int Requests> struct AttentionRequests { SwaAttnArgs lanes[Requests]; };
-template<int Requests>
+template<int Requests, int TotalCtas = 128>
 __global__ __launch_bounds__(kAttnThreads,1) void FusedDraftAttentionRequests(
         const __grid_constant__ AttentionRequests<Requests> tile,const void *const *table,
         const int *live,int first,int count) {
     extern __shared__ __align__(128) unsigned char memory[];
-    const int local=blockIdx.x/(128/Requests),request=first+local;
+    const int local=blockIdx.x/(TotalCtas/Requests),request=first+local;
     SwaAttnArgs a=tile.lanes[local];
     a.kv_k=static_cast<const B*>(table[(a.layer*count+request)*2]);
     a.kv_v=static_cast<const B*>(table[(a.layer*count+request)*2+1]);
     a.ncache=max(1,min(live[request]-1,a.window_left));
     a.total_cols=a.ncache+a.valid_rows;a.padded_cols=(a.total_cols+255)/256*256;
-    AttnRowsBody<128/Requests,Requests>::template run<true>(a,memory,tile.lanes);
-    if(blockIdx.x%(128/Requests)==0){
+    AttnRowsBody<TotalCtas/Requests,Requests>::template run<true>(a,memory,tile.lanes);
+    if(blockIdx.x%(TotalCtas/Requests)==0){
         for(int i=threadIdx.x;i<a.valid_rows*128;i+=blockDim.x){
             int at=min(live[request]-1,a.window_left)*128+i;
             const_cast<B*>(a.kv_k)[at]=a.k_blk[i];const_cast<B*>(a.kv_v)[at]=a.v_blk[i];
@@ -582,19 +622,19 @@ __global__ __launch_bounds__(kAttnThreads,1) void FusedDraftAttentionRequests(
 struct ShardedMlp {
     static constexpr int Threads = kMlpThreads, MinBlocks = 1;
     using Args = MlpArgs;
-    __device__ static void Run(const Args &a, unsigned char *memory) { MlpBody::run(a, memory); }
+    __device__ static void Run(const Args &a, unsigned char *memory) { MlpRowsBody<1, HopperImage>::run(a, memory); }
 };
 struct MlpTileArgs { MlpArgs requests[2]; };
-__global__ __launch_bounds__(kMlpThreads, 1) void FusedDraftMlpTile(
+__global__ __launch_bounds__(kMlpThreads, HopperImage ? 2 : 1) void FusedDraftMlpTile(
         const __grid_constant__ MlpTileArgs tile) {
     extern __shared__ __align__(128) unsigned char memory[];
-    MlpRowsBody<2>::run(tile.requests[0], memory, tile.requests + 1);
+    MlpRowsBody<2,HopperImage>::run(tile.requests[0], memory, tile.requests + 1);
 }
 struct MlpQuadArgs { MlpArgs requests[4]; };
-__global__ __launch_bounds__(kMlpThreads, 1) void FusedDraftMlpQuad(
+__global__ __launch_bounds__(kMlpThreads, HopperImage ? 2 : 1) void FusedDraftMlpQuad(
         const __grid_constant__ MlpQuadArgs tile) {
     extern __shared__ __align__(128) unsigned char memory[];
-    MlpRowsBody<4>::run(tile.requests[0],memory,tile.requests+1);
+    MlpRowsBody<4,HopperImage>::run(tile.requests[0],memory,tile.requests+1);
 }
 __global__ void FinishResult(const B *input, B *output, int count, const unsigned *watchdog) {
     // A timed-out peer exchange cannot fall back after partial writes. Surface
@@ -667,6 +707,12 @@ __global__ void FinishPipelinedNormalized(const B *input,B *output,B *normalized
     naivert::pdl::wait_for_primary<true>();
     NormalizeDraftOutput(input,output,normalized,gamma,eps,watchdog);
 }
+__global__ void FinishNormalizedRequests(const __grid_constant__ BeginTile tile,
+        B *output,B *normalized,const float *gamma,float eps) {
+    const auto &a = tile.lanes[blockIdx.y];
+    const size_t offset = size_t(blockIdx.y) * a.rows * 4096;
+    NormalizeDraftOutput(a.output,output+offset,normalized+offset,gamma,eps,a.watchdog);
+}
 template<class Kernel,class... Args>
 void LaunchDependent(bool enabled,Kernel kernel,dim3 grid,dim3 block,int shared,
         cudaStream_t stream,Args... args) {
@@ -683,19 +729,8 @@ void LaunchDependent(bool enabled,Kernel kernel,dim3 grid,dim3 block,int shared,
     void *parameters[]={static_cast<void*>(&args)...};
     Check(cudaLaunchKernel(reinterpret_cast<const void*>(kernel),grid,block,parameters,shared,stream));
 }
-void Configure(int device) {
-    Check(cudaSetDevice(device));
-    Check(cudaFuncSetAttribute(ShardedAttentionKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kAttnSmem));
-    Check(cudaFuncSetAttribute(FusedDraftMlp<ShardedMlp>, cudaFuncAttributeMaxDynamicSharedMemorySize, kMlpSmem));
-    int sms, attn, mlp;
-    Check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&attn, ShardedAttentionKernel, kAttnThreads, kAttnSmem));
-    Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mlp, FusedDraftMlp<ShardedMlp>, kMlpThreads, kMlpSmem));
-    if (attn * sms < kAttnCtas || mlp * sms < kMlpCtas)
-        throw std::runtime_error("fused draft requires a fully resident grid");
-}
 template <class Kernel>
-bool ConfigureOptionalKernel(int device, Kernel kernel, int threads, int shared, int ctas) {
+bool ConfigureResidentKernel(int device, Kernel kernel, int threads, int shared, int ctas) {
     int blocks = 0, sms = 0;
     if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) != cudaSuccess ||
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, threads, shared) != cudaSuccess ||
@@ -704,13 +739,27 @@ bool ConfigureOptionalKernel(int device, Kernel kernel, int threads, int shared,
     }
     return blocks * sms >= ctas;
 }
-void Start(State &s, int rank, int request, const int *live, cudaStream_t stream, const B *input, const EmbeddedInput *embedded = nullptr) {
+bool ConfigureDraftBackbone(int device, bool hopper) {
+    return ConfigureResidentKernel(device, ShardedAttentionKernel, kAttnThreads,
+               hopper ? AttnRowsBody<64>::kSharedBytes : kAttnSmem, hopper ? 64 : kAttnCtas) &&
+           ConfigureResidentKernel(device, FusedDraftMlp<ShardedMlp>, kMlpThreads,
+               hopper ? MlpRowsBody<1,true>::kSharedBytes : kMlpSmem, kMlpCtas);
+}
+HeadGrid HopperHeadGrid(int sms) {
+    return HeadGrid::forCtas(std::min(sms, kTiles));
+}
+bool HopperDraftGridsSupported(int device, int sms);
+BeginArgs BodyBeginArgs(State &s, int rank, int request, const int *live, const B *input) {
     auto &l = s.ranks[rank].lanes[request];
     BeginArgs a{};
     for (int i = 0; i < 8; ++i) a.peers[i] = s.ranks[i].lanes[request].mailbox;
     a.rank = rank; a.epoch = l.epoch; a.watchdog = l.watchdog; a.live = live;
     a.positions = l.positions; a.cosine = l.cosine; a.sine = l.sine; a.theta = s.theta;
     a.input = input; a.output = l.padded; a.rows = s.rows;
+    return a;
+}
+void Start(State &s, int rank, int request, const int *live, cudaStream_t stream, const B *input, const EmbeddedInput *embedded = nullptr) {
+    BeginArgs a=BodyBeginArgs(s,rank,request,live,input);
     if (embedded) {
         EmbeddedInput local = *embedded;
         local.ids += request;
@@ -738,21 +787,31 @@ SwaAttnArgs AttentionArguments(State &s,int rank,int request,int layer,const B *
     return a;
 }
 void Attention(State &s,int rank,int request,int layer,const B *input,B *output,
-        const int *live,const void *const *table,int requests,cudaStream_t stream) {
-    LaunchDependent(s.programmatic,ShardedAttentionKernel,kAttnCtas,kAttnThreads,kAttnSmem,stream,
+        const int *live,const void *const *table,int requests,cudaStream_t stream, bool bodyPdl = false) {
+    LaunchDependent(s.programmatic || bodyPdl,ShardedAttentionKernel,s.hopper ? 64 : kAttnCtas,kAttnThreads,
+        s.hopper ? AttnRowsBody<64>::kSharedBytes : kAttnSmem,stream,
         AttentionArguments(s,rank,request,layer,input,output),table,live,request,requests);
 }
-template<int Requests>
+template<int Requests, int TotalCtas = 128>
 void AttentionShared(State &s,int rank,int first,int layer,const int *live,
         const void *const *table,int count,cudaStream_t stream) {
     AttentionRequests<Requests> tile{};
     for(int i=0;i<Requests;++i){auto &l=s.ranks[rank].lanes[first+i];
         tile.lanes[i]=AttentionArguments(s,rank,first+i,layer,l.padded,l.attention);}
-    LaunchDependent(s.programmatic,FusedDraftAttentionRequests<Requests>,128,kAttnThreads,
-        AttnRowsBody<128/Requests,Requests>::kSharedBytes,stream,tile,table,live,first,count);
+    LaunchDependent(s.programmatic,FusedDraftAttentionRequests<Requests,TotalCtas>,TotalCtas,kAttnThreads,
+        AttnRowsBody<TotalCtas/Requests,Requests>::kSharedBytes,stream,tile,table,live,first,count);
+}
+void AttentionQuad(State &s,int rank,int first,int layer,const int *live,
+        const void *const *table,int count,cudaStream_t stream) {
+    if (s.hopper) AttentionShared<4,64>(s,rank,first,layer,live,table,count,stream);
+    else AttentionShared<4>(s,rank,first,layer,live,table,count,stream);
 }
 void AttentionTile(State &s,int rank,int first,int layer,const int *live,
         const void *const *table,int requests,cudaStream_t stream) {
+    if (s.compactAttentionPair) {
+        AttentionShared<2,64>(s,rank,first,layer,live,table,requests,stream);
+        return;
+    }
     AttentionTileArgs tile{};
     for(int i=0;i<2;++i) {
         auto &l=s.ranks[rank].lanes[first+i];
@@ -771,9 +830,16 @@ MlpArgs MlpArguments(State &s, int rank, int request, int layer, const B *input,
     a.watchdog_limit_ns = 5000000000ull; a.watchdog_flag = l.watchdog; a.rms_epsilon = s.eps;
     return a;
 }
-void Mlp(State &s, int rank, int request, int layer, const B *input, B *output, cudaStream_t stream) {
-    LaunchDependent(s.programmatic,FusedDraftMlp<ShardedMlp>,kMlpCtas,kMlpThreads,kMlpSmem,stream,
+void Mlp(State &s, int rank, int request, int layer, const B *input, B *output, cudaStream_t stream, bool bodyPdl = false) {
+    LaunchDependent(s.programmatic || bodyPdl,FusedDraftMlp<ShardedMlp>,kMlpCtas,kMlpThreads,
+        s.hopper ? MlpRowsBody<1,true>::kSharedBytes : kMlpSmem,stream,
         MlpArguments(s,rank,request,layer,input,output));
+}
+// The paired Hopper kernel uses the scalar Hopper K partition for the same
+// accumulation order and enough shared memory for two resident CTAs per SM.
+template<int Requests>
+constexpr int MlpTileBytes(bool hopper) {
+    return hopper ? MlpRowsBody<Requests,true>::kSharedBytes : MlpRowsBody<Requests>::kSharedBytes;
 }
 void MlpTile(State &s,int rank,int first,int layer,bool probe,cudaStream_t stream) {
     MlpTileArgs tile{};
@@ -783,7 +849,7 @@ void MlpTile(State &s,int rank,int first,int layer,bool probe,cudaStream_t strea
             probe?lane.padded:lane.attention,probe?lane.attention:lane.padded);
     }
     LaunchDependent(s.programmatic,FusedDraftMlpTile,kMlpCtas,kMlpThreads,
-        MlpRowsBody<2>::kSharedBytes,stream,tile);
+        MlpTileBytes<2>(s.hopper),stream,tile);
 }
 void MlpQuad(State &s,int rank,int first,int layer,bool probe,cudaStream_t stream) {
     MlpQuadArgs tile{};
@@ -793,33 +859,49 @@ void MlpQuad(State &s,int rank,int first,int layer,bool probe,cudaStream_t strea
             probe?lane.padded:lane.attention,probe?lane.attention:lane.padded);
     }
     LaunchDependent(s.programmatic,FusedDraftMlpQuad,kMlpCtas,kMlpThreads,
-        MlpRowsBody<4>::kSharedBytes,stream,tile);
+        MlpTileBytes<4>(s.hopper),stream,tile);
 }
 void RunBody(State &s,int rank,int requests,B *hidden,const int *live,
         const void *const *table,const float *gamma,B *normalized,cudaStream_t stream, const EmbeddedInput *embedded = nullptr) {
+    const bool singletonPdl = s.hopperBodyPdl && requests == 1;
     for(int first=0;first<requests;) {
         const int count=s.batchMlp4 && first+3<requests ? 4 :
             (s.batchMlp || s.batchAttention) && first+1<requests ? 2 : 1;
-        for(int request=first;request<first+count;++request)
-            Start(s,rank,request,live+request,stream,hidden+size_t(request)*s.rows*4096,embedded);
+        const bool groupLanes = s.hopper && count == 4 && !embedded;
+        BeginTile begin{};
+        for (int i=0; i<count; ++i) {
+            const int request=first+i;
+            B *input=hidden+size_t(request)*s.rows*4096;
+            if (groupLanes) begin.lanes[i]=BodyBeginArgs(s,rank,request,live+request,input);
+            else Start(s,rank,request,live+request,stream,input,embedded);
+        }
+        if (groupLanes) {
+            BeginRequests<<<count,256,0,stream>>>(begin,nullptr);
+            Check(cudaGetLastError());
+        }
         for(int layer=0;layer<s.layers;++layer) {
-            if(count==4 && s.batchAttention4) AttentionShared<4>(s,rank,first,layer,live,table,requests,stream);
+            if(count==4 && s.batchAttention4) AttentionQuad(s,rank,first,layer,live,table,requests,stream);
             else if(count>=2 && s.batchAttention) {
                 for(int offset=0;offset<count;offset+=2)
                     AttentionTile(s,rank,first+offset,layer,live,table,requests,stream);
             }
             else for(int request=first;request<first+count;++request) {
                 auto &l=s.ranks[rank].lanes[request];
-                Attention(s,rank,request,layer,l.padded,l.attention,live+request,table,requests,stream);
+                Attention(s,rank,request,layer,l.padded,l.attention,live+request,table,requests,stream, singletonPdl && layer > 0);
             }
             if(count==4) MlpQuad(s,rank,first,layer,false,stream);
             else if(count==2 && s.batchMlp) MlpTile(s,rank,first,layer,false,stream);
             else for(int request=first;request<first+count;++request) {
                 auto &l=s.ranks[rank].lanes[request];
-                Mlp(s,rank,request,layer,l.attention,l.padded,stream);
+                Mlp(s,rank,request,layer,l.attention,l.padded,stream, singletonPdl);
             }
         }
-        for(int request=first;request<first+count;++request) {
+        if (groupLanes && normalized) {
+            const size_t offset=size_t(first)*s.rows*4096;
+            FinishNormalizedRequests<<<dim3(s.rows,count),256,0,stream>>>(
+                begin,hidden+offset,normalized+offset,gamma,s.eps);
+            Check(cudaGetLastError());
+        } else for(int request=first;request<first+count;++request) {
             auto &l=s.ranks[rank].lanes[request];
             const size_t offset=size_t(request)*s.rows*4096;
             if(normalized)
@@ -836,9 +918,20 @@ void RunBody(State &s,int rank,int requests,B *hidden,const int *live,
 using namespace fastllm_draft_fused;
 extern "C" bool FastllmDraftFusedSupported(const int *devices, int ranks) {
     if (!devices || ranks != 8) return false;
+    int architecture = -1;
     for (int i = 0; i < ranks; ++i) {
         cudaDeviceProp p{};
-        if (cudaGetDeviceProperties(&p, devices[i]) != cudaSuccess || p.major != 10 || p.minor != 3) return false;
+        if (cudaGetDeviceProperties(&p, devices[i]) != cudaSuccess) return false;
+        const int arch = 10*p.major+p.minor;
+        bool supported = false;
+#ifdef FASTLLM_DRAFT_HAS_SM90
+        supported |= arch == 90 && HopperDraftGridsSupported(devices[i], p.multiProcessorCount);
+#endif
+#ifdef FASTLLM_DRAFT_HAS_SM103
+        supported |= arch == 103;
+#endif
+        if (!supported || (i && architecture != arch)) return false;
+        architecture = arch;
         for (int j = 0; j < i; ++j) {
             int access = 0;
             if (devices[i] == devices[j] || cudaDeviceCanAccessPeer(&access, devices[i], devices[j]) != cudaSuccess || !access) return false;
@@ -852,23 +945,46 @@ extern "C" void *FastllmDraftFusedCreate(const int *devices, int ranks, int laye
         rows < 2 || rows > 8 || window < 2 || window > 16384 || !std::isfinite(eps) || eps <= 0 || !std::isfinite(theta) || theta <= 0) return nullptr;
     try {
         std::unique_ptr<State> s(new State()); s->ranks.resize(ranks);
+        int major = 0;
+        Check(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,devices[0]));
+        s->hopper = major == 9;
+        if (s->hopper && window > AttnRowsBody<64>::kMaxHistory) return nullptr;
         s->layers = layers; s->rows = rows; s->window = window; s->eps = eps; s->theta = theta;
 #if CUDART_VERSION >= 12030
         int runtime=0,driver=0;
         Check(cudaRuntimeGetVersion(&runtime));Check(cudaDriverGetVersion(&driver));
-        s->programmatic=runtime>=12030 && driver>=12030;
+        s->programmatic=!s->hopper && runtime>=12030 && driver>=12030;
+        s->hopperBodyPdl = s->hopper && rows == 7 && runtime >= 12030 && driver >= 12030;
 #endif
+        bool compactPairAvailable = s->hopper && window <= AttnRowsBody<32,2>::kMaxHistory;
         for (int rank = 0; rank < ranks; ++rank) {
-            auto &r = s->ranks[rank]; r.device = devices[rank]; Configure(r.device);
-            s->batchMlp4 = ConfigureOptionalKernel(r.device, FusedDraftMlpQuad,
-                kMlpThreads,MlpRowsBody<4>::kSharedBytes,kMlpCtas) && s->batchMlp4;
-            s->batchMlp = ConfigureOptionalKernel(r.device, FusedDraftMlpTile,
-                kMlpThreads, MlpRowsBody<2>::kSharedBytes, kMlpCtas) && s->batchMlp;
-            s->batchAttention4 = ConfigureOptionalKernel(r.device,FusedDraftAttentionRequests<4>,
-                kAttnThreads,AttnRowsBody<32,4>::kSharedBytes,128) && s->batchAttention4 && window<=AttnRowsBody<32,4>::kMaxHistory;
-            s->batchAttention = ConfigureOptionalKernel(r.device, FusedDraftAttentionTile,
+            auto &r = s->ranks[rank]; r.device = devices[rank];
+            Check(cudaSetDevice(r.device));
+            if (s->hopper) {
+                int sms;
+                Check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, r.device));
+                r.headGrid = HopperHeadGrid(sms);
+            } else if (!ConfigureDraftBackbone(r.device, false)) {
+                throw std::runtime_error("fused draft requires a fully resident grid");
+            }
+            s->batchMlp4 = ConfigureResidentKernel(r.device, FusedDraftMlpQuad,
+                kMlpThreads,MlpTileBytes<4>(s->hopper),kMlpCtas) && s->batchMlp4;
+            s->batchMlp = ConfigureResidentKernel(r.device, FusedDraftMlpTile,
+                kMlpThreads, MlpTileBytes<2>(s->hopper), kMlpCtas) && s->batchMlp;
+            if (s->hopper) {
+                s->batchAttention4 &= window <= AttnRowsBody<16,4>::kMaxHistory &&
+                    ConfigureResidentKernel(r.device,FusedDraftAttentionRequests<4,64>,
+                        kAttnThreads,AttnRowsBody<16,4>::kSharedBytes,64);
+            } else {
+                s->batchAttention4 &= window <= AttnRowsBody<32,4>::kMaxHistory &&
+                    ConfigureResidentKernel(r.device,FusedDraftAttentionRequests<4>,
+                        kAttnThreads,AttnRowsBody<32,4>::kSharedBytes,128);
+            }
+            s->batchAttention = ConfigureResidentKernel(r.device, FusedDraftAttentionTile,
                 kAttnThreads, AttnRowsBody<64>::kSharedBytes, kAttnCtas) && s->batchAttention &&
                 window <= AttnRowsBody<64>::kMaxHistory;
+            compactPairAvailable = compactPairAvailable && ConfigureResidentKernel(r.device,
+                FusedDraftAttentionRequests<2,64>, kAttnThreads, AttnRowsBody<32,2>::kSharedBytes, 64);
             for (int peer = 0; peer < ranks; ++peer) if (peer != rank) {
                 auto result = cudaDeviceEnablePeerAccess(devices[peer], 0);
                 if (result == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError(); else Check(result);
@@ -897,6 +1013,8 @@ extern "C" void *FastllmDraftFusedCreate(const int *devices, int ranks, int laye
             }
             Check(cudaDeviceSynchronize());
         }
+        s->compactAttentionPair = !s->batchAttention && compactPairAvailable;
+        s->batchAttention |= s->compactAttentionPair;
         Check(cudaSetDevice(devices[0])); return s.release();
     } catch (const std::exception &e) { error = e.what(); return nullptr; }
 }
@@ -906,7 +1024,7 @@ void AllocateHeadLane(Rank &r, Lane &l, int index) {
     l.headIds = contiguous ? r.headIds+size_t(index)*8 : r.Alloc<int64_t>(8); l.sampling = r.Alloc<int64_t>(2);
     l.samplingParams = r.Alloc<float>(5);
     l.headLogits = contiguous ? r.headLogits+size_t(index)*7*19072 : r.Alloc<float>(7 * 19072); l.corrected = r.Alloc<float>(7 * 19072);
-    l.headControl = r.Alloc<unsigned long long>(2 * 148 + 2);
+    l.headControl = r.Alloc<unsigned long long>(std::max(2 * r.headGrid.ctas + 2, HeadMarkovTiles));
     l.softmax = r.Alloc<float>(7 * 38 * 2); l.confidence = contiguous ? r.headConfidence+size_t(index)*7 : r.Alloc<float>(7);
 }
 }
@@ -1050,7 +1168,7 @@ extern "C" bool FastllmDraftFusedAttentionBatchProbe(void *opaque,int rank,int r
             const int count=s.batchAttention4 && first+3<requests?4:s.batchAttention && first+1<requests?2:1;
             for(int request=first;request<first+count;++request)
                 Start(s,rank,request,live+request,stream,static_cast<const B*>(input)+size_t(request)*s.rows*4096);
-            if(count==4) AttentionShared<4>(s,rank,first,layer,live,table,requests,stream);
+            if(count==4) AttentionQuad(s,rank,first,layer,live,table,requests,stream);
             else if(count==2) AttentionTile(s,rank,first,layer,live,table,requests,stream);
             else {
                 auto &l=s.ranks[rank].lanes[first];
@@ -1081,10 +1199,10 @@ extern "C" bool FastllmDraftFusedContextPrepare(void *opaque, const void *fc, co
         if (s.contextReady) return true;
         for (int rank = 0; rank < 8; ++rank) {
             auto &r = s.ranks[rank]; Check(cudaSetDevice(r.device));
-            Check(cudaFuncSetAttribute(FusedDraftContext, cudaFuncAttributeMaxDynamicSharedMemorySize, ContextSmem));
+            Check(cudaFuncSetAttribute(FusedDraftContext, cudaFuncAttributeMaxDynamicSharedMemorySize, ContextBytes(s.hopper)));
             Check(cudaFuncSetAttribute(ContextTrim, cudaFuncAttributeMaxDynamicSharedMemorySize, 1024 * 32 * 2));
             int perSm = 0, sms = 0;
-            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, FusedDraftContext, kThreads, ContextSmem));
+            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, FusedDraftContext, kThreads, ContextBytes(s.hopper)));
             Check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, r.device));
             if (perSm * sms < kCtas) throw std::runtime_error("context grid is not resident");
             r.fc = r.Alloc<B>(4096 * 4096); r.hiddenNorm = r.Alloc<float>(4096);
@@ -1313,8 +1431,10 @@ void AddWideContext(State &s,int rank,int count,cudaGraph_t graph,cudaGraphNode_
 }
 
 __global__ void FinishDraftContextResult(const PreparedContextRequest *requests,
-        const FastllmDraftNextInputs *next,int rank,int row,const unsigned *watchdog) {
+        const FastllmDraftNextInputs *next,int rank,int first,WatchdogTile flags) {
     if (threadIdx.x != 0) return;
+    const int row = first + blockIdx.x;
+    const unsigned *watchdog = flags.lanes[blockIdx.x];
     if (*watchdog & naivert::kMailboxWatchdogTripped) { asm volatile("trap;"); return; }
     if (!next->tokens) return;
     const auto &request = requests[row];
@@ -1343,9 +1463,9 @@ void PrepareContextPlans(State &s, int requests) {
         }
         for (int rank=0;rank<8;++rank) {
             Check(cudaSetDevice(s.ranks[rank].device));
-            s.batchContext4=ConfigureOptionalKernel(s.ranks[rank].device,FusedDraftContextRequests<4>,
-                kThreads,ContextSmem,kCtas) && s.batchContext4;
-            s.batchContext=ConfigureOptionalKernel(s.ranks[rank].device,FusedDraftContextTile,
+            s.batchContext4=ConfigureResidentKernel(s.ranks[rank].device,FusedDraftContextRequests<4>,
+                kThreads,ContextQuadBytes(s.hopper),kCtas) && s.batchContext4;
+            s.batchContext=!s.hopper && ConfigureResidentKernel(s.ranks[rank].device,FusedDraftContextTile,
                 kThreads,ContextSmem,kCtas) && s.batchContext;
         }
         for (int rank = 0; rank < 8; ++rank) {
@@ -1353,9 +1473,9 @@ void PrepareContextPlans(State &s, int requests) {
             PrepareWideContext(s,rank);
             Check(cudaFuncSetAttribute(ContextBatchTrim,cudaFuncAttributeMaxDynamicSharedMemorySize,1024*32*2));
             cudaFuncAttributes attrs{};Check(cudaFuncGetAttributes(&attrs,ContextBatchAliases));
-            Check(cudaFuncSetAttribute(FusedDraftContextPrepared,cudaFuncAttributeMaxDynamicSharedMemorySize,ContextSmem));
+            Check(cudaFuncSetAttribute(FusedDraftContextPrepared,cudaFuncAttributeMaxDynamicSharedMemorySize,ContextBytes(s.hopper)));
             int active = 0, sms = 0;
-            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,FusedDraftContextPrepared,kThreads,ContextSmem));
+            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,FusedDraftContextPrepared,kThreads,ContextBytes(s.hopper)));
             Check(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,r.device));
             if (active*sms < kCtas) throw std::runtime_error("context graph requires a resident grid");
             if (!r.contextPlans) {
@@ -1396,7 +1516,7 @@ void PrepareContextPlans(State &s, int requests) {
                             ContextRequests<4> tile{};
                             for(int i=0;i<4;++i)tile.lanes[i]=ContextArguments(s,rank,first+i);
                             void *body[]={&tile,&d,&s.window,&s.theta,&fallback};
-                            add((void*)FusedDraftContextRequests<4>,kCtas,kThreads,ContextSmem,body);
+                            add((void*)FusedDraftContextRequests<4>,kCtas,kThreads,ContextQuadBytes(s.hopper),body);
                         } else if(requests==2) {
                             ContextTileArgs tile{{ContextArguments(s,rank,first),ContextArguments(s,rank,first+1)}};
                             void *body[]={&tile,&d,&s.window,&s.theta,&fallback};
@@ -1404,14 +1524,18 @@ void PrepareContextPlans(State &s, int requests) {
                         } else {
                             auto a=ContextArguments(s,rank,first);
                             void *body[]={&a,&d,&s.window,&s.theta,&fallback};
-                            add((void*)FusedDraftContextPrepared,kCtas,kThreads,ContextSmem,body);
+                            add((void*)FusedDraftContextPrepared,kCtas,kThreads,ContextBytes(s.hopper),body);
                         }
-                        for(int request=first;request<first+requests;++request) {
+                        for (int offset = 0; offset < requests;) {
+                            const int n = requests == 4 ? 4 : 1;
+                            int row = first + offset;
+                            WatchdogTile flags{};
+                            for (int i=0; i<n; ++i) flags.lanes[i]=r.lanes[row+i].watchdog;
                             auto *descriptors=s.contextInputs->gpu+rank*count;
                             auto *next=reinterpret_cast<FastllmDraftNextInputs *>(s.contextInputs->gpu+8*count);
-                            auto *watchdog=r.lanes[request].watchdog;
-                            void *finish[]={&descriptors,&next,&rank,&request,&watchdog};
-                            add((void*)FinishDraftContextResult,1,32,0,finish);
+                            void *finish[]={&descriptors,&next,&rank,&row,&flags};
+                            add((void*)FinishDraftContextResult,n,32,0,finish);
+                            offset += n;
                         }
                         first+=requests;
                     }
@@ -1585,7 +1709,7 @@ extern "C" void *FastllmDraftFusedAcceptedBodyCreate(void *opaque,int rank,void 
         void *prepareArgs[] = {&args,&embedding,&request,&next};
         p.func = reinterpret_cast<void *>(PrepareAcceptedEmbedding);
         p.gridDim = dim3(16); p.blockDim = dim3(256); p.kernelParams = prepareArgs;
-        if (!firstAttention || !ConfigureOptionalKernel(s.ranks[rank].device,ContinuationContext,kThreads,ContextSmem,kCtas))
+        if (!firstAttention || !ConfigureResidentKernel(s.ranks[rank].device,ContinuationContext,kThreads,ContextBytes(s.hopper),kCtas))
             throw std::runtime_error("Draft context overlap unavailable");
         cudaGraphNode_t prepare, published;
         Check(cudaGraphAddKernelNode(&prepare,graph,nullptr,0,&p));
@@ -1593,7 +1717,7 @@ extern "C" void *FastllmDraftFusedAcceptedBodyCreate(void *opaque,int rank,void 
         auto fc=ContextArguments(s,rank,0);
         void *contextArgs[]={&fc,&request,&s.window,&s.theta};
         p.func=reinterpret_cast<void *>(ContinuationContext);
-        p.gridDim=dim3(kCtas);p.blockDim=dim3(kThreads);p.sharedMemBytes=ContextSmem;p.kernelParams=contextArgs;
+        p.gridDim=dim3(kCtas);p.blockDim=dim3(kThreads);p.sharedMemBytes=ContextBytes(s.hopper);p.kernelParams=contextArgs;
         Check(cudaGraphKernelNodeSetParams(begin,&p));
         Check(cudaGraphAddEventRecordNode(&published,graph,&begin,1,static_cast<cudaEvent_t>(contextDone)));
         if (!norm || !normalized) throw std::runtime_error("Missing draft normalization");
@@ -1672,19 +1796,14 @@ extern "C" bool FastllmDraftFusedContextRun(void *opaque, int rank, int request,
         Check(cudaGetLastError());
         auto a = ContextArguments(s,rank,request);
         a.kv.cache_table = table; a.kv.table_requests = tableRequests; a.kv.table_request = tableRequest;
-        FusedDraftContext<<<kCtas,kThreads,ContextSmem,stream>>>(a);
+        FusedDraftContext<<<kCtas,kThreads,ContextBytes(s.hopper),stream>>>(a);
         FinishResult<<<1,32,0,stream>>>(nullptr,nullptr,0,l.watchdog);
         Check(cudaGetLastError()); return true;
     } catch (const std::exception &e) { error = e.what(); return false; }
 }
 
 namespace fastllm_draft_fused {
-constexpr int HeadStride = 146;
-constexpr int HeadSmem = kHeadSmem + 7 * HeadStride * sizeof(float);
-constexpr int HeadQuadSmem = kHeadSmem + 4 * 7 * HeadStride * sizeof(float);
-static_assert(HeadQuadSmem <= 232448);
-constexpr int HeadTileSmem = kHeadSmem + 2 * 7 * HeadStride * sizeof(float);
-static_assert(HeadTileSmem <= 232448, "paired head must fit one resident CTA per SM");
+static_assert(HeadBytes(Sm103HeadGrid,4) <= 232448);
 __global__ void PackHead(const B *source, B *out) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(19072) * 4096) return;
@@ -1704,11 +1823,27 @@ __global__ __launch_bounds__(128) void PrecomputeDraftBias(const B *w1, const B 
 }
 __global__ __launch_bounds__(kHeadThreads,1) void FusedDraftHeadProposal(
         const __grid_constant__ HeadArgs h, const __grid_constant__ MarkovArgs m,
-        unsigned long long *control,int steps) {
+        unsigned long long *control,int steps,HeadGrid launchGrid) {
     extern __shared__ __align__(128) unsigned char memory[];
-    HeadBody::run<true,HeadStride>(memory,h,nullptr,steps);
-    markov_cooperative_steps<160,false,HeadStride>(m,
-        reinterpret_cast<const float*>(memory+kHeadSmem),control,control+2*kHeadCtas,steps);
+    const HeadGrid grid = DeviceHeadGrid(launchGrid);
+    HeadBody::run<true>(memory,h,nullptr,steps,grid);
+    markov_cooperative_steps<160,false>(m,
+        reinterpret_cast<const float*>(memory+kHeadSmem),control,control+2*grid.ctas,steps,grid);
+}
+// Admission also chooses the context weight layout, so check residency before
+// the caller partitions the weights. Each rank exchanges one vocabulary winner.
+bool HopperDraftGridsSupported(int device, int sms) {
+    if (sms <= 0) return false;
+    int owner;
+    if (cudaGetDevice(&owner) != cudaSuccess ||
+        (owner != device && cudaSetDevice(device) != cudaSuccess)) return false;
+    const HeadGrid grid = HopperHeadGrid(sms);
+    const bool supported = ConfigureDraftBackbone(device, true) &&
+        ConfigureResidentKernel(device, FusedDraftContext, kThreads, ContextBytes(true), kCtas) &&
+        ConfigureResidentKernel(device, FusedDraftContextPrepared, kThreads, ContextBytes(true), kCtas) &&
+        ConfigureResidentKernel(device, FusedDraftHeadProposal, kHeadThreads, HeadBytes(grid,1), grid.ctas);
+    if (owner != device && cudaSetDevice(owner) != cudaSuccess) return false;
+    return supported;
 }
 void BindHeadLane(State &s, int rank, int row, const B *input,
         BeginArgs &begin, HeadArgs &head, MarkovArgs &markov) {
@@ -1739,8 +1874,9 @@ void AppendAcceptedHead(State &s,int rank,cudaGraph_t graph,cudaGraphNode_t norm
     };
     void *inputs[]={&b,&next};
     auto begin=add((void*)BeginAcceptedHead,1,32,0,inputs,norm);
-    int steps=7;void *head[]={&h,&m,&l.headControl,&steps};
-    add((void*)FusedDraftHeadProposal,kHeadCtas,kHeadThreads,HeadSmem,head,begin);
+    auto &grid=s.ranks[rank].headGrid;
+    int steps=7;void *head[]={&h,&m,&l.headControl,&steps,&grid};
+    add((void*)FusedDraftHeadProposal,grid.ctas,kHeadThreads,HeadBytes(grid,1),head,begin);
 }
 struct HeadTileArgs {
     HeadArgs head[2];
@@ -1749,17 +1885,18 @@ struct HeadTileArgs {
     int steps;
 };
 __global__ __launch_bounds__(kHeadThreads,1) void FusedDraftHeadTile(
-        const __grid_constant__ HeadTileArgs tile) {
+        const __grid_constant__ HeadTileArgs tile, HeadGrid launchGrid) {
     extern __shared__ __align__(128) unsigned char memory[];
-    HeadBody::run<true,HeadStride,2>(memory,tile.head[0],tile.head+1,tile.steps);
+    const HeadGrid grid = DeviceHeadGrid(launchGrid);
+    HeadBody::run<true,2>(memory,tile.head[0],tile.head+1,tile.steps,grid);
     // Independent request groups advance their own Markov chain concurrently.
     // The preceding head CTA join retired all projection producers. Each group
     // retains its request's RNG, mailbox, epoch and candidate buffers.
     const int request=threadIdx.x/192;
     auto *control=tile.control[request];
-    markov_cooperative_steps<192,false,HeadStride,2>(tile.markov[request],
-        reinterpret_cast<const float*>(memory+kHeadSmem)+request*7*HeadStride,
-        control,control+2*kHeadCtas,tile.steps);
+    markov_cooperative_steps<192,false,2>(tile.markov[request],
+        reinterpret_cast<const float*>(memory+kHeadSmem)+request*7*grid.rowStride,
+        control,control+2*grid.ctas,tile.steps,grid);
 }
 struct HeadQuadArgs {
     HeadArgs head[4];
@@ -1768,17 +1905,18 @@ struct HeadQuadArgs {
     int steps;
 };
 __global__ __launch_bounds__(kHeadThreads,1) void FusedDraftHeadQuad(
-        const __grid_constant__ HeadQuadArgs tile) {
+        const __grid_constant__ HeadQuadArgs tile, HeadGrid launchGrid) {
     extern __shared__ __align__(128) unsigned char memory[];
-    HeadBody::run<true,HeadStride,4>(memory,tile.head[0],tile.head+1,tile.steps);
+    const HeadGrid grid = DeviceHeadGrid(launchGrid);
+    HeadBody::run<true,4>(memory,tile.head[0],tile.head+1,tile.steps,grid);
     // Independent request groups advance their own Markov chain concurrently.
     // The preceding head CTA join retired all projection producers. Each group
     // retains its request's RNG, mailbox, epoch and candidate buffers.
     const int request=threadIdx.x/96;
     auto *control=tile.control[request];
-    markov_cooperative_steps<96,false,HeadStride,4>(tile.markov[request],
-        reinterpret_cast<const float*>(memory+kHeadSmem)+request*7*HeadStride,
-        control,control+2*kHeadCtas,tile.steps);
+    markov_cooperative_steps<96,false,4>(tile.markov[request],
+        reinterpret_cast<const float*>(memory+kHeadSmem)+request*7*grid.rowStride,
+        control,control+2*grid.ctas,tile.steps,grid);
 }
 // Wide batches share one dense projection. Parallel vocabulary tiles feed an
 // independent reduction per Markov chain; lane seeds and BF16 boundaries remain.
@@ -1805,7 +1943,6 @@ __global__ void BeginHeadBatch(const HeadBatchLane *lanes,const FastllmDraftHead
     b.anchor=d.anchor;b.seed=d.seed;b.inverseTemperature=__fdiv_rn(1.f,d.temperature);
     BeginBody(b);
 }
-constexpr int HeadMarkovTiles=16;
 __global__ __launch_bounds__(256) void DraftHeadMarkovScores(const HeadBatchLane *lanes,int step) {
     const auto &d=lanes[blockIdx.y];const auto &a=d.markov;
     const int tid=threadIdx.x,lane=tid%32,warp=tid/32,prev=int(a.block_ids[step]);
@@ -2027,14 +2164,25 @@ __global__ void VerificationInput(const int64_t *tokens, float *input, int strid
         reinterpret_cast<int *>(input+2*stride)[offset+row] = position+row+1;
     }
 }
-__global__ void VerificationInputPrepared(const int64_t *tokens,float *input,int stride,int offset,
-        const FastllmDraftHeadRequest *request,int rows,const unsigned *watchdog) {
-    if (*watchdog & naivert::kMailboxWatchdogTripped) asm volatile("trap;");
-    const int row=threadIdx.x, position=request->position;
+__device__ __forceinline__ void WriteVerificationInput(const int64_t *tokens,float *input,
+        int stride,int offset,int position,int rows) {
+    const int row=threadIdx.x;
     if(row<rows) {
         input[offset+row]=float(tokens[row]); input[stride+offset+row]=float(position+row);
         reinterpret_cast<int *>(input+2*stride)[offset+row]=position+row+1;
     }
+}
+__global__ void VerificationInputPrepared(const int64_t *tokens,float *input,int stride,int offset,
+        const FastllmDraftHeadRequest *request,int rows,const unsigned *watchdog) {
+    if (*watchdog & naivert::kMailboxWatchdogTripped) asm volatile("trap;");
+    WriteVerificationInput(tokens,input,stride,offset,request->position,rows);
+}
+__global__ void VerificationInputs(const __grid_constant__ BeginTile tile,
+        const FastllmDraftHeadRequest *requests,float *input,int stride,int first,int rows) {
+    const int i=blockIdx.x;
+    const auto &lane=tile.lanes[i];
+    if (*lane.watchdog & naivert::kMailboxWatchdogTripped) asm volatile("trap;");
+    WriteVerificationInput(lane.headIds,input,stride,(first+i)*rows,requests[i].position,rows);
 }
 struct VerificationPlan {
     int device,count;
@@ -2068,6 +2216,10 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
     try {
         Check(cudaSetDevice(r.device));
         cudaFuncAttributes attrs{};
+        if (s.hopper && s.batchHead4 && count>=4) {
+            Check(cudaFuncGetAttributes(&attrs,BeginRequests));
+            Check(cudaFuncGetAttributes(&attrs,VerificationInputs));
+        }
         Check(cudaFuncGetAttributes(&attrs,BeginHeadPrepared));
         Check(cudaFuncGetAttributes(&attrs,VerificationInputPrepared));
         Check(cudaFuncGetAttributes(&attrs,BeginHeadBatch));
@@ -2103,6 +2255,9 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
             add((void*)VerificationInputBatch,count,32,0,finish);
         } else for(int first=0;first<count;) {
             const int requests=s.batchHead4 && first+3<count ? 4 : s.batchHead && first+1<count ? 2 : 1;
+            const bool groupLanes = s.hopper && requests == 4;
+            BeginTile beginTile{};
+            auto *requestGroup=p->gpu+first;
             HeadQuadArgs tile{};tile.steps=verifyRows-1;
             for(int requestIndex=0;requestIndex<requests;++requestIndex) {
                 const int row=first+requestIndex;
@@ -2112,21 +2267,31 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
                 b.input=requests==1 ? nullptr : headInput;b.output=l.padded;b.rows=tile.steps;
                 BindHeadLane(s, rank, row, requests==1 ? headInput : l.padded, b,
                     tile.head[requestIndex], tile.markov[requestIndex]);
-                void *begin[]={&b,&request};add((void*)BeginHeadPrepared,1,256,0,begin);
+                if (groupLanes) beginTile.lanes[requestIndex]=b;
+                else {
+                    void *begin[]={&b,&request};add((void*)BeginHeadPrepared,1,256,0,begin);
+                }
                 tile.control[requestIndex]=l.headControl;
             }
+            if (groupLanes) {
+                void *begin[]={&beginTile,&requestGroup};
+                add((void*)BeginRequests,requests,256,0,begin);
+            }
             if(requests==4) {
-                void *head[]={&tile};add((void*)FusedDraftHeadQuad,kHeadCtas,kHeadThreads,HeadQuadSmem,head);
+                void *head[]={&tile,&r.headGrid};add((void*)FusedDraftHeadQuad,r.headGrid.ctas,kHeadThreads,HeadBytes(r.headGrid,4),head);
             } else if(requests==2) {
                 HeadTileArgs pair{};pair.steps=tile.steps;
                 for(int i=0;i<2;++i){pair.head[i]=tile.head[i];pair.markov[i]=tile.markov[i];pair.control[i]=tile.control[i];}
-                void *head[]={&pair};add((void*)FusedDraftHeadTile,kHeadCtas,kHeadThreads,HeadTileSmem,head);
+                void *head[]={&pair,&r.headGrid};add((void*)FusedDraftHeadTile,r.headGrid.ctas,kHeadThreads,HeadBytes(r.headGrid,2),head);
             } else {
-                void *head[]={tile.head,tile.markov,tile.control,&tile.steps};
-                // The head stages immutable weights before waiting for the new mailbox epoch.
-                add((void*)FusedDraftHeadProposal,kHeadCtas,kHeadThreads,HeadSmem,head,true);
+                void *head[]={tile.head,tile.markov,tile.control,&tile.steps,&r.headGrid};
+                add((void*)FusedDraftHeadProposal,r.headGrid.ctas,kHeadThreads,HeadBytes(r.headGrid,1),head,true);
             }
-            for(int requestIndex=0;requestIndex<requests;++requestIndex) {
+            if (groupLanes) {
+                auto *packed=static_cast<float*>(input);
+                void *args[]={&beginTile,&requestGroup,&packed,&stride,&first,&verifyRows};
+                add((void*)VerificationInputs,requests,32,0,args);
+            } else for(int requestIndex=0;requestIndex<requests;++requestIndex) {
                 const int row=first+requestIndex;auto &l=r.lanes[row];auto *request=p->gpu+row;
                 int offset=row*verifyRows;auto *packed=static_cast<float*>(input);
                 void *adapter[]={&l.headIds,&packed,&stride,&offset,&request,&verifyRows,&l.watchdog};
@@ -2218,15 +2383,15 @@ extern "C" bool FastllmDraftFusedHeadPrepareWithBudget(void *opaque,const void *
                 Check(cudaSetDevice(owner));
                 return false;
             }
-            Check(cudaFuncSetAttribute(FusedDraftHeadProposal,cudaFuncAttributeMaxDynamicSharedMemorySize,HeadSmem));
+            Check(cudaFuncSetAttribute(FusedDraftHeadProposal,cudaFuncAttributeMaxDynamicSharedMemorySize,HeadBytes(r.headGrid,1)));
             int active=0,sms=0;
-            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,FusedDraftHeadProposal,kHeadThreads,HeadSmem));
+            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,FusedDraftHeadProposal,kHeadThreads,HeadBytes(r.headGrid,1)));
             Check(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,r.device));
-            if(active*sms<kHeadCtas) return false;
-            s.batchHead4=ConfigureOptionalKernel(r.device,FusedDraftHeadQuad,kHeadThreads,
-                HeadQuadSmem,kHeadCtas) && s.batchHead4;
-            s.batchHead=ConfigureOptionalKernel(r.device,FusedDraftHeadTile,kHeadThreads,
-                HeadTileSmem,kHeadCtas) && s.batchHead;
+            if(active*sms<r.headGrid.ctas) return false;
+            s.batchHead4=ConfigureResidentKernel(r.device,FusedDraftHeadQuad,kHeadThreads,
+                HeadBytes(r.headGrid,4),r.headGrid.ctas) && s.batchHead4;
+            s.batchHead=ConfigureResidentKernel(r.device,FusedDraftHeadTile,kHeadThreads,
+                HeadBytes(r.headGrid,2),r.headGrid.ctas) && s.batchHead;
         }
         for(int rank=0;rank<8;++rank) {
             auto &r=s.ranks[rank]; Check(cudaSetDevice(r.device));
@@ -2276,7 +2441,7 @@ extern "C" bool FastllmDraftFusedHeadRun(void *opaque,int rank,int request,const
         BindHeadLane(s, rank, request, static_cast<const B *>(hidden), b, h, m);
         b.anchor=anchor;b.seed=seed;b.inverseTemperature=1.f/temperature;
         Begin<<<1,256,0,stream>>>(b);
-        FusedDraftHeadProposal<<<kHeadCtas,kHeadThreads,HeadSmem,stream>>>(h,m,l.headControl,steps);
+        FusedDraftHeadProposal<<<r.headGrid.ctas,kHeadThreads,HeadBytes(r.headGrid,1),stream>>>(h,m,l.headControl,steps,r.headGrid);
         FinishResult<<<1,32,0,stream>>>(nullptr,nullptr,0,l.watchdog);
         Check(cudaGetLastError());return true;
     } catch(const std::exception &e) {error=e.what();return false;}

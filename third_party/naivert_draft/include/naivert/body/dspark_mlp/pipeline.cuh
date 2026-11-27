@@ -7,11 +7,12 @@
 // each query fragment serves two M tiles. Fold eight warp partials.
 __device__ static void mlp_down_tile(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                              float* partials, float* output) {
+  constexpr int rows = 8 * kDownChunks;
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   const int g = lane >> 2, q = lane & 3;
   if (warp < 8) {
     constexpr int kTiles = kColsPerCtaD4 / 16;
-    float accum[Chunks][kTiles][4] = {};
+    float accum[kDownChunks][kTiles][4] = {};
 #pragma unroll
     for (int slot = 0; slot < 2; ++slot) {
       const int k = slot * 256 + warp * 32 + q * 8;
@@ -23,7 +24,7 @@ __device__ static void mlp_down_tile(const __nv_bfloat16* x, const __nv_bfloat16
         const uint4 a0 = *reinterpret_cast<const uint4*>(w0 + k);
         const uint4 a1 = *reinterpret_cast<const uint4*>(w1 + k);
 #pragma unroll
-        for (int chunk = 0; chunk < Chunks; ++chunk) {
+        for (int chunk = 0; chunk < kDownChunks; ++chunk) {
           const uint4 b = *reinterpret_cast<const uint4*>(x + (chunk * 8 + g) * kMlpDownStride + k);
           naivert::attn_rows::mma_bf16_16816(accum[chunk][tile], a0.x,a1.x,a0.y,a1.y,b.x,b.y);
           naivert::attn_rows::mma_bf16_16816(accum[chunk][tile], a0.z,a1.z,a0.w,a1.w,b.z,b.w);
@@ -32,23 +33,23 @@ __device__ static void mlp_down_tile(const __nv_bfloat16* x, const __nv_bfloat16
     }
 #pragma unroll
     for (int tile = 0; tile < kTiles; ++tile) {
-      float* mine = partials + (warp * kColsPerCtaD4 + tile * 16) * kMlpWindow;
+      float* mine = partials + (warp * kColsPerCtaD4 + tile * 16) * rows;
 #pragma unroll
-      for (int chunk = 0; chunk < Chunks; ++chunk) {
-        mine[g * kMlpWindow + chunk * 8 + 2*q] = accum[chunk][tile][0];
-        mine[g * kMlpWindow + chunk * 8 + 2*q + 1] = accum[chunk][tile][1];
-        mine[(g+8) * kMlpWindow + chunk * 8 + 2*q] = accum[chunk][tile][2];
-        mine[(g+8) * kMlpWindow + chunk * 8 + 2*q + 1] = accum[chunk][tile][3];
+      for (int chunk = 0; chunk < kDownChunks; ++chunk) {
+        mine[g * rows + chunk * 8 + 2*q] = accum[chunk][tile][0];
+        mine[g * rows + chunk * 8 + 2*q + 1] = accum[chunk][tile][1];
+        mine[(g+8) * rows + chunk * 8 + 2*q] = accum[chunk][tile][2];
+        mine[(g+8) * rows + chunk * 8 + 2*q + 1] = accum[chunk][tile][3];
       }
     }
   }
   __syncthreads();
-  for (int item = tid; item < kMlpWindow * kColsPerCtaD4; item += kMlpThreads) {
-    const int column = item / kMlpWindow, row = item % kMlpWindow;
+  for (int item = tid; item < rows * kColsPerCtaD4; item += kMlpThreads) {
+    const int column = item / rows, row = item % rows;
     float sum = 0.0f;
 #pragma unroll
     for (int w = 0; w < 8; ++w)
-      sum += partials[(w * kColsPerCtaD4 + column) * kMlpWindow + row];
+      sum += partials[(w * kColsPerCtaD4 + column) * rows + row];
     output[row * kDownStageStride + column] = sum;
   }
   __syncthreads();
@@ -237,7 +238,7 @@ __device__ static void mlp_gate_pages(
   } else if (tid < 256) {
     const int g = lane >> 2, q = lane & 3;
     float accum[Chunks][4] = {};
-    if constexpr (Chunks > 1) {
+    if constexpr (!kLocalNorm) {
       if (lane == 0) {
 #pragma unroll
         for(int chunk=0;chunk<Chunks;++chunk)
@@ -269,7 +270,7 @@ __device__ static void mlp_gate_pages(
 #pragma unroll
           for (int chunk = 0; chunk < Chunks; ++chunk) {
             uint4 b;
-            if constexpr (Chunks == 1)
+            if constexpr (kLocalNorm)
               b = *reinterpret_cast<const uint4*>(x + mlp_input_index(g, page * kGuPageK + k));
             else
               b = mlp_load_normalized((chunk == 0 ? args : second[chunk-1]).resid_out + g * kMlpHidden + page * kGuPageK + k);

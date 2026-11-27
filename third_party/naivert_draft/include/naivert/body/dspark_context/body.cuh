@@ -25,9 +25,14 @@ struct D12FinishCoefficients {
 constexpr int kD12FinishOffset = kWindow * kD12WeightStride * 2 + kShellWarps * 128 * sizeof(float);
 static_assert(kD12FinishOffset + sizeof(D12FinishCoefficients) <= kD12WeightOffset);
 static_assert(kThreads - kWindow * 32 == kHeadDim && kHeadDim == kKvRowsR);
+constexpr int kD12CompactOffset = (kD12FinishOffset + sizeof(D12FinishCoefficients) + 127) & ~127;
+constexpr int kD12QuadStride = kHidden / kD12Splits + 16;
+constexpr int kD12QuadWeightOffset = 16*kD12QuadStride*sizeof(__nv_bfloat16) +
+    2*kShellWarps*128*sizeof(float);
+constexpr int kD12QuadBytes = kD12QuadWeightOffset + kD12WeightRows*kD12QuadStride*sizeof(__nv_bfloat16);
 struct FcCtxKvBody {
   struct InputMetadata { int rows,position,keep,window; float theta; };
-  template<bool PreparedInput = false, bool PrecomputedFc = false, bool Announced = false>
+  template<bool PreparedInput = false, bool PrecomputedFc = false, bool Compact = false, bool Announced = false>
   __device__ static void run(unsigned char* smem_raw,const FcCtxKvArgs& args,
       InputMetadata input = {8,0,0,1024,10000.f}, float fc_value = 0.f) {
     static_assert(kCtas == kCtasD2);
@@ -46,7 +51,7 @@ struct FcCtxKvBody {
     const int bucket = int(blockIdx.x) % kD12CtasPerSplit;
     const int k_begin = split * split_k;
     const int tid = int(threadIdx.x), row = tid / 32, lane = tid % 32;
-    auto* weights_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + kD12WeightOffset);
+    auto* weights_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + (Compact ? kD12CompactOffset : kD12WeightOffset));
     auto prefetch = [&] {
       // Stage KV weights after FC MMA; transport may progress during TP8/RMSNorm.
       // Each copy reads one aligned 16-byte K segment of an original weight row.
@@ -63,7 +68,15 @@ struct FcCtxKvBody {
       }
       cutlass::arch::cp_async_fence();
     };
-    FcCtxBody::run<true,PreparedInput,decltype(prefetch),PrecomputedFc,Announced>(smem_raw, args.fc, prefetch,input.rows,fc_value);
+    if constexpr (Compact) {
+      // Reuse the FC activation tile after the last FC reader retires.
+      auto deferred = [] {};
+      FcCtxBody::run<true,PreparedInput,decltype(deferred),PrecomputedFc,Announced>(smem_raw,args.fc,deferred,input.rows,fc_value);
+      __syncthreads();
+      prefetch();
+    } else {
+      FcCtxBody::run<true,PreparedInput,decltype(prefetch),PrecomputedFc,Announced>(smem_raw,args.fc,prefetch,input.rows,fc_value);
+    }
     auto* ctx_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     auto* finish = reinterpret_cast<D12FinishCoefficients*>(smem_raw + kD12FinishOffset);
     // These four warps do not normalize query rows. Immutable finish inputs
@@ -189,21 +202,23 @@ struct FcCtxKvBody {
       static_cast<__nv_bfloat16*>(const_cast<void*>(cache_table[(layer * table_requests + table_request) * 2]))[out + tid] = __float2bfloat16_rn(__fadd_rn(float(__float2bfloat16_rn(__fmul_rn(value, finish->cosine[tid]))), float(__float2bfloat16_rn(__fmul_rn(rotated, finish->sine[tid])))));
     }
   }
-  template<int Requests,class Descriptor>
+  template<int Requests, bool Compact,class Descriptor>
   __device__ static void run_requests(unsigned char* memory,const FcCtxKvArgs* args,
       const Descriptor* descriptors,int window,float theta) {
     static_assert(Requests==2 || Requests==4);
     constexpr int partial_elements=kLayers*2*kWindow*kKvRowsR;
     constexpr int split_k=kHidden/kD12Splits;
-    constexpr int query_stride=kD12WeightStride;
+    constexpr int query_stride=Compact ? kD12QuadStride : kD12WeightStride;
+    constexpr int group=Compact ? 2 : Requests;
     constexpr int tiles_per_cta=(kTotalCols/16)/kD12CtasPerSplit;
-    constexpr int query_bytes=Requests*8*query_stride*2;
-    constexpr int partial_bytes=Requests*kShellWarps*128*sizeof(float);
-    static_assert(query_bytes+partial_bytes<=kD12WeightOffset);
+    constexpr int query_bytes=group*8*query_stride*2;
+    constexpr int partial_bytes=group*kShellWarps*128*sizeof(float);
+    constexpr int weight_offset=Compact ? kD12QuadWeightOffset : kD12WeightOffset;
+    static_assert(query_bytes+partial_bytes<=weight_offset);
     const int tid=threadIdx.x,cta=blockIdx.x;
     const int split=cta/kD12CtasPerSplit,bucket=cta%kD12CtasPerSplit,k_begin=split*split_k;
     naivert::pdl::trigger_dependents<true>();
-    auto *projected=reinterpret_cast<float*>(memory+partial_bytes);
+    auto *projected=reinterpret_cast<float*>(memory+Requests*kShellWarps*128*sizeof(float));
     const __nv_bfloat16* feature_ptrs[Requests];int feature_rows[Requests];
 #pragma unroll
     for(int request=0;request<Requests;++request){const auto &d=descriptors[request];
@@ -221,7 +236,7 @@ struct FcCtxKvBody {
 #pragma unroll
     for(int request=0;request<Requests;++request)values[request]=tid<256?projected[request*256+tid]:0.f;
     __syncthreads();
-    auto* weights_s=reinterpret_cast<__nv_bfloat16*>(memory+kD12WeightOffset);
+    auto* weights_s=reinterpret_cast<__nv_bfloat16*>(memory+weight_offset);
     auto prefetch=[&]{
       int pending=0;
       for(int i=tid;i<kD12WeightRows*(split_k/8);i+=kThreads){
@@ -237,7 +252,7 @@ struct FcCtxKvBody {
     // same shared receive tile, and join the grid only after all SSQ tiles exist.
     constexpr int pairs=kColsPerCta/2,items=kWindow*pairs;
     static_assert((kRanks-1)*items*sizeof(naivert::PayloadPair)<=8192);
-    static_assert(8192+Requests*kWindow*kColsPerCta*sizeof(float)<=kD12WeightOffset);
+    static_assert(8192+Requests*kWindow*kColsPerCta*sizeof(float)<=weight_offset);
     auto* exact=reinterpret_cast<float*>(memory+8192);
     auto* gathered=reinterpret_cast<naivert::PayloadPair*>(memory);
     unsigned generations[Requests],iterations[Requests];
@@ -296,36 +311,42 @@ struct FcCtxKvBody {
     grid_barrier(args[0].fc.barrier);
     if(!cta&&!tid)for(int request=0;request<Requests;++request)
       atomicAdd(reinterpret_cast<unsigned*>(args[request].fc.replay_generation),1u);
-    auto* queries=reinterpret_cast<__nv_bfloat16*>(memory);
-    const int row=tid/32,lane=tid%32;
+    // Keep the shared KV weight tile live across both 16-row Hopper projections.
 #pragma unroll
-    for(int request=0;request<Requests;++request)if(row<8){
-      const auto &a=args[request].fc;const auto &d=descriptors[request];
-      const int rows=d.accepted?*d.accepted+1:d.rows;
-      const float4 piece=__ldcg(reinterpret_cast<const float4*>(a.ssq+row*kCtas)+lane);
-      float sum=(piece.x+piece.y)+piece.z+piece.w;
-      for(int delta=16;delta;delta>>=1)sum+=__shfl_xor_sync(0xffffffffu,sum,delta);
-      const float inverse=rsqrtf(sum/4096.f+a.rms_epsilon);
-      for(int part=0;part<split_k/256;++part){
-        const int n=(part*32+lane)*8,column=k_begin+n;
-        const uint4 in=__ldcg(reinterpret_cast<const uint4*>(a.ctx_sum+row*4096+column));
-        const float4 lo=*reinterpret_cast<const float4*>(a.hidden_norm+column),hi=*reinterpret_cast<const float4*>(a.hidden_norm+column+4);
-        const float gamma[8]={lo.x,lo.y,lo.z,lo.w,hi.x,hi.y,hi.z,hi.w};
-        const unsigned words[4]={in.x,in.y,in.z,in.w};uint4 out;auto*packed=reinterpret_cast<unsigned*>(&out);
-        for(int i=0;i<4;++i){const float2 v=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(words+i));
-          const float x=float(__float2bfloat16_rn(v.x*inverse))*gamma[2*i],y=float(__float2bfloat16_rn(v.y*inverse))*gamma[2*i+1];
-          auto normalized=__floats2bfloat162_rn(row<rows?x:0.f,row<rows?y:0.f);packed[i]=*reinterpret_cast<unsigned*>(&normalized);}
-        *reinterpret_cast<uint4*>(queries+(request*8+row)*query_stride+n)=out;
+    for (int first=0; first<Requests; first+=group) {
+      auto* queries=reinterpret_cast<__nv_bfloat16*>(memory);
+      const int row=tid/32,lane=tid%32;
+#pragma unroll
+      for(int local=0;local<group;++local)if(row<8){
+        const int request=first+local;
+        const auto &a=args[request].fc;const auto &d=descriptors[request];
+        const int rows=d.accepted?*d.accepted+1:d.rows;
+        const float4 piece=__ldcg(reinterpret_cast<const float4*>(a.ssq+row*kCtas)+lane);
+        float sum=(piece.x+piece.y)+piece.z+piece.w;
+        for(int delta=16;delta;delta>>=1)sum+=__shfl_xor_sync(0xffffffffu,sum,delta);
+        const float inverse=rsqrtf(sum/4096.f+a.rms_epsilon);
+        for(int part=0;part<split_k/256;++part){
+          const int n=(part*32+lane)*8,column=k_begin+n;
+          const uint4 in=__ldcg(reinterpret_cast<const uint4*>(a.ctx_sum+row*4096+column));
+          const float4 lo=*reinterpret_cast<const float4*>(a.hidden_norm+column),hi=*reinterpret_cast<const float4*>(a.hidden_norm+column+4);
+          const float gamma[8]={lo.x,lo.y,lo.z,lo.w,hi.x,hi.y,hi.z,hi.w};
+          const unsigned words[4]={in.x,in.y,in.z,in.w};uint4 out;auto*packed=reinterpret_cast<unsigned*>(&out);
+          for(int i=0;i<4;++i){const float2 v=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(words+i));
+            const float x=float(__float2bfloat16_rn(v.x*inverse))*gamma[2*i],y=float(__float2bfloat16_rn(v.y*inverse))*gamma[2*i+1];
+            auto normalized=__floats2bfloat162_rn(row<rows?x:0.f,row<rows?y:0.f);packed[i]=*reinterpret_cast<unsigned*>(&normalized);}
+          *reinterpret_cast<uint4*>(queries+(local*8+row)*query_stride+n)=out;
+        }
       }
+      cutlass::arch::cp_async_wait<0>();__syncthreads();
+      naivert::attn_rows::project_strided_rows_mma<group*8,split_k,1,tiles_per_cta,kShellWarps,query_stride,true,true>(
+        bucket*tiles_per_cta*16,tiles_per_cta,[&](int column){return weights_s+(column-bucket*kD12WeightRows)*query_stride;},
+        queries,reinterpret_cast<float*>(memory+query_bytes),[&](int column,int query,float value){
+          const int layer=column/kColsPerLayer,kv=column%kColsPerLayer;
+          const int offset=((layer*2+kv/kKvRowsR)*8+query%8)*kKvRowsR+kv%kKvRowsR;
+          args[first+query/8].kv_partials[split*partial_elements+offset]=value;
+        },0);
+      if constexpr (group < Requests) __syncthreads();
     }
-    cutlass::arch::cp_async_wait<0>();__syncthreads();
-    naivert::attn_rows::project_strided_rows_mma<Requests*8,split_k,1,tiles_per_cta,kShellWarps,query_stride,true,true>(
-      bucket*tiles_per_cta*16,tiles_per_cta,[&](int column){return weights_s+(column-bucket*kD12WeightRows)*query_stride;},
-      queries,reinterpret_cast<float*>(memory+query_bytes),[&](int column,int query,float value){
-        const int layer=column/kColsPerLayer,kv=column%kColsPerLayer;
-        const int offset=((layer*2+kv/kKvRowsR)*8+query%8)*kKvRowsR+kv%kKvRowsR;
-        args[query/8].kv_partials[split*partial_elements+offset]=value;
-      },0);
     grid_barrier(args[0].fc.barrier);
     auto* finish=reinterpret_cast<D12FinishCoefficients*>(memory+4096);
     for(int task=cta;task<Requests*kFinishCtas;task+=kCtas){

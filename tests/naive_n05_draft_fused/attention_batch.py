@@ -71,6 +71,9 @@ for count in counts:
             m=metrics(outs[r],ref,initial)
             control=metrics(control_out[r],ref,initial)
             regression=metrics(outs[r],control_out[r],initial)
+            if count >= 4 and torch.cuda.get_device_capability(r) == (9, 0):
+                assert torch.equal(outs[r],control_out[r]), ('SM90 scalar attention',count,layer,r)
+                assert all(torch.equal(x,y) for x,y in zip(batch_kv[r],caches[r])), ('SM90 scalar KV',count,layer,r)
             assert regression['max_row_l2']<=.006,regression
             # Large random suites expose pre-existing BF16-boundary outliers in
             # the scalar path. Retain them in the report, and require the batch
@@ -133,6 +136,8 @@ for count in counts:
                             tables[r].data_ptr(),count,streams[r].cuda_stream)
             sync()
             for r in range(8):
+                if count >= 4 and torch.cuda.get_device_capability(r) == (9, 0):
+                    assert torch.equal(outs[r],control_out[r]), ('SM90 scalar replay',count,r)
                 m=metrics(outs[r],control_out[r],xs[r]);assert m['max_row_l2']<=.006,m
                 results.append(dict(op='changing_graph',requests=count,rank=r,**m))
                 # Later independent-reference cases start from their original

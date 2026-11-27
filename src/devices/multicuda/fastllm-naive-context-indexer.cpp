@@ -1,5 +1,6 @@
 #include "devices/cuda/naive-n05-swa-settings.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/multicuda/fastllm-naive-context-indexer.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "utils/utils.h"
@@ -24,6 +25,10 @@ bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime) {
     std::vector<int> archs(runtime.Layout().Size());
     runtime.Run([&](int rank, int) { archs[rank] = FastllmCudaRuntimeArch(); });
     return FastllmCudaStablePrefillReduction(archs);
+}
+
+int FastllmCudaOwnerDraftFeatureLimit(const std::vector<int> &devices) {
+    return FastllmCudaNaiveHopperGroup(devices) ? kFastllmMtpSmallRejectionMaxBatch : 1;
 }
 
 bool FastllmCudaVerifyReduceNormSupported(int rows, const std::vector<int> &devices) {

@@ -6932,16 +6932,20 @@ bool FastllmCudaExpandPackedBf16Slices(const FastllmCudaPackedBf16Slice *slices,
 
 namespace {
     constexpr int FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS = 128;
+    constexpr int FASTLLM_CUDA_BATCH_COPY_WIDE_SEGMENTS = 160;
     constexpr int FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT = 8;
 
-    struct FastllmCudaBatchCopyParams {
-        const uint8_t *srcs[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
-        uint8_t *dsts[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
-        size_t sizes[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
+    template<int Capacity> struct FastllmCudaBatchCopyParams {
+        const uint8_t *srcs[Capacity];
+        uint8_t *dsts[Capacity];
+        size_t sizes[Capacity];
         int count;
     };
 
-    __global__ void FastllmCudaBatchCopyKernel(FastllmCudaBatchCopyParams params) {
+    static_assert(sizeof(FastllmCudaBatchCopyParams<FASTLLM_CUDA_BATCH_COPY_WIDE_SEGMENTS>) <= 4096);
+
+    template<int Capacity>
+    __global__ void FastllmCudaBatchCopyKernel(FastllmCudaBatchCopyParams<Capacity> params) {
         int segment = blockIdx.x / FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
         int segmentBlock = blockIdx.x % FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
         if (segment >= params.count) {
@@ -6969,22 +6973,17 @@ namespace {
     }
 }
 
-bool FastllmCudaBatchCopyFromDeviceToDeviceAsync(
-        void *const *dsts, const void *const *srcs,
+template<int Capacity>
+static bool FastllmCudaLaunchBatchCopy(void *const *dsts, const void *const *srcs,
         const size_t *sizes, int count, void *stream) {
-    if (count < 0 ||
-        (count > 0 && (dsts == nullptr || srcs == nullptr || sizes == nullptr))) {
-        return false;
-    }
-
     // Keep the by-value kernel parameter bounded, but allow callers to submit
     // an arbitrary number of independent state tensors.  Large requests are
     // split into a few launches on the same stream, preserving
     // ordering without falling back to one cudaMemcpy per tensor.
     for (int begin = 0; begin < count;) {
         int end = begin + std::min(
-            FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS, count - begin);
-        FastllmCudaBatchCopyParams params;
+            Capacity, count - begin);
+        FastllmCudaBatchCopyParams<Capacity> params;
         params.count = 0;
         for (int i = begin; i < end; i++) {
             if (sizes[i] == 0 || dsts[i] == srcs[i]) {
@@ -7013,6 +7012,21 @@ bool FastllmCudaBatchCopyFromDeviceToDeviceAsync(
         }
     }
     return true;
+}
+
+bool FastllmCudaBatchCopyFromDeviceToDeviceAsync(
+        void *const *dsts, const void *const *srcs,
+        const size_t *sizes, int count, void *stream) {
+    if (count < 0 ||
+        (count > 0 && (dsts == nullptr || srcs == nullptr || sizes == nullptr))) {
+        return false;
+    }
+
+    // A Hopper draft-cache trim can submit 144 segments on one stream.
+    if (count > FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS && count <= FASTLLM_CUDA_BATCH_COPY_WIDE_SEGMENTS &&
+        FastllmCudaRuntimeArch() == 90)
+        return FastllmCudaLaunchBatchCopy<FASTLLM_CUDA_BATCH_COPY_WIDE_SEGMENTS>(dsts, srcs, sizes, count, stream);
+    return FastllmCudaLaunchBatchCopy<FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS>(dsts, srcs, sizes, count, stream);
 }
 
 bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
@@ -16354,6 +16368,108 @@ __global__ __launch_bounds__(256) void DraftProposalSoftmax(FastllmBF16BiasSoftm
         if (i < vocab) probs[i] = expf(values[j] - rowMax) * invSum;
     }
 }
+
+namespace fastllm_draft_owner {
+// One MMA consumes a consecutive K=16 slice. Load its two BF16 pairs together.
+__device__ __forceinline__ uint4 LoadMarkovK32(const B *row) {
+    const uint2 lo = *reinterpret_cast<const uint2 *>(row);
+    const uint2 hi = *reinterpret_cast<const uint2 *>(row + 16);
+    return make_uint4(lo.x, lo.y, hi.x, hi.y);
+}
+struct StepLogits {
+    float *data;
+    size_t stride;
+    __device__ float operator()(int row, int column, int) const { return data[size_t(row) * stride + column]; }
+};
+
+// Project eight request columns per MMA. Repartition the vocabulary at the
+// same 4096-column boundaries as the ordinary sampler before producing q.
+template<bool PaddedGrid>
+__global__ __launch_bounds__(256, 4) void FusedDraftHeadProposalGroup(Proposal a) {
+    const int tid = threadIdx.x, lane = tid % 32;
+    const int rows = gridDim.y, tiles = (a.vocab - 1) / 4096 + 1;
+    const int block = blockIdx.y * gridDim.x + blockIdx.x;
+    const int warps = (a.vocab + 127) / 128;
+    const auto grid = cooperative_groups::this_grid();
+    float2 *warpStats = a.stats + rows * tiles;
+    curandStatePhilox4_32_10_t rng;
+    if (!tid && block < rows) curand_init(*a.seed, block, 0, &rng);
+    __shared__ float normalized[4096], maximum, inverse, uniform;
+    using WarpReduce = cub::WarpReduce<float>;
+    __shared__ typename WarpReduce::TempStorage reduce[8];
+    for (int step = 0; step < a.steps; ++step) {
+        StepLogits q{a.q + size_t(step) * a.vocab, size_t(a.steps) * a.vocab};
+        int token = int(a.ids[size_t(step) * rows + (lane / 4 < rows ? lane / 4 : 0)]);
+        if (token < 0 || token >= a.vocab) token = 0;
+        const B *embedding = a.embedding + size_t(token) * 256 + (lane % 4) * 4;
+        uint4 latent[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) latent[k] = LoadMarkovK32(embedding + k * 32);
+        for (int first = block * WideTile; first < a.vocab; first += int(gridDim.x) * rows * WideTile) {
+            const int end = min(first + WideTile, a.vocab);
+            for (int group = first + tid / 32 * 16; group < end; group += 128) {
+                const int col = group + lane / 4;
+                float acc[4]{};
+                const B *w = a.weight + size_t(col) * 256 + lane % 4 * 4;
+                // Keep the ordinary BF16 GEMM's increasing K order at the rounding boundary.
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const uint4 lo = LoadMarkovK32(w + k * 32), hi = LoadMarkovK32(w + 8 * 256 + k * 32);
+                    using fastllm::cuda::low_latency::projection::mma_bf16_16816;
+                    mma_bf16_16816(acc, lo.x, hi.x, lo.y, hi.y, latent[k].x, latent[k].y);
+                    mma_bf16_16816(acc, lo.z, hi.z, lo.w, hi.w, latent[k].z, latent[k].w);
+                }
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int r = lane % 4 * 2 + j;
+                    if (r >= rows) continue;
+                    const B *base = a.base + (size_t(r) * a.steps + step) * a.vocab + col;
+                    float *dst = q.data + size_t(r) * q.stride + col;
+                    dst[0] = float(B(float(base[0]) + float(B(acc[j]))));
+                    dst[8] = float(B(float(base[8]) + float(B(acc[j + 2]))));
+                }
+            }
+        }
+        grid.sync();
+        float values[16];
+        if (!PaddedGrid || blockIdx.x < tiles)
+            MtpTileStats(q, a.temperature, a.stats, a.vocab, tiles, values);
+        grid.sync();
+        if (!PaddedGrid || blockIdx.x < tiles) {
+            MtpRowStats(a.stats + blockIdx.y * tiles, tiles, maximum, inverse);
+            const int start = blockIdx.x * 4096;
+            float *out = q.data + size_t(blockIdx.y) * q.stride;
+        #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int i = tid + j * 256;
+                const float p = expf(values[j] - maximum) * inverse;
+                normalized[i] = p;
+                if (start + i < a.vocab) out[start + i] = p;
+            }
+            __syncthreads();
+            for (int i = tid / 32; i < 32; i += 8) {
+                const int w = blockIdx.x * 32 + i;
+                if (w >= warps) break;
+                const float *p = normalized + i * 128 + lane * 4;
+                float v[]{p[0], p[1], p[2], p[3]};
+                const float sum = WarpReduce(reduce[tid / 32]).Sum(cub::ThreadReduce(v, cuda::std::plus<>{}));
+                const float scan = ProposalWarpUpsweep(((v[0] + v[1]) + v[2]) + v[3], lane);
+                const float scanSum = __shfl_sync(0xffffffffu, scan, 31);
+                if (!lane) warpStats[blockIdx.y * warps + w] = make_float2(sum, scanSum);
+            }
+        }
+        grid.sync();
+        if (block < rows) {
+            if (!tid) uniform = curand_uniform4(&rng).x;
+            __syncthreads();
+            const int id = SampleWideProposal<256>(q.data + size_t(block) * q.stride, a.vocab,
+                warpStats + block * warps, warps, uniform);
+            if (!tid) a.ids[(size_t(step) + 1) * rows + block] = float(id);
+        }
+        grid.sync();
+    }
+}
+}
 #endif
 
 template <int BLOCK_THREADS>
@@ -18538,45 +18654,84 @@ bool FastllmCudaMtpPrepareDraftReplay(void *sampler, float *deviceAnchors, int r
 }
 bool FastllmCudaMtpTryOwnerHead(void *sampler, const void *base, const void *embedding,
         const void *weight, float *ids, float *probabilities, int vocab, int steps) {
+    return FastllmCudaMtpTryOwnerHeadBatch(sampler, base, embedding, weight, ids, probabilities, vocab, steps, 1);
+}
+bool FastllmCudaMtpTryOwnerHeadBatch(void *sampler, const void *base, const void *embedding,
+        const void *weight, float *ids, float *probabilities, int vocab, int steps, int rows) {
 #ifndef USE_ROCM
     using namespace fastllm_draft_owner;
     if (!sampler || !base || !embedding || !weight || !ids || !probabilities || steps < 1 ||
         vocab < 65536 || vocab % 32) return false;
     auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
-    if (!ws.dedicated || ws.rows != 1 || ws.vocab != vocab || ws.needTopK || ws.needTopP)
+    if (!ws.dedicated || ws.rows != rows || rows < 1 || rows > 8 || ws.vocab != vocab || ws.needTopK || ws.needTopP)
         return false;
     const int device = FastllmCudaGetDevice();
-    static thread_local int cachedDevice = -1, capacity = 0;
+    static thread_local int cachedDevice = -1, capacity = 0, pairedCapacity = 0, batchCapacity = 0;
+    static thread_local int wideCapacity[2]{}, groupCapacity[2]{};
     if (cachedDevice != device) {
         cudaDeviceProp props{};
         checkCudaErrors("Draft head device properties", cudaGetDeviceProperties(&props, device));
-        capacity = 0;
-        if (props.major >= 8 && props.cooperativeLaunch) {
+        auto resident = [&](auto kernel, int threads = Threads) {
             cudaFuncAttributes image{};
-            const auto status = cudaFuncGetAttributes(&image, FusedDraftHeadProposal);
+            const auto status = cudaFuncGetAttributes(&image, kernel);
             if (status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice) {
                 cudaGetLastError();
-            } else {
-                checkCudaErrors("Draft head image", status);
-                if (image.ptxVersion >= 80) {
-                    int active = 0;
-                    checkCudaErrors("Draft head occupancy", cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                        &active, FusedDraftHeadProposal, Threads, 0));
-                    capacity = active * props.multiProcessorCount;
-                }
+                return 0;
             }
+            checkCudaErrors("Draft head image", status);
+            if (!props.cooperativeLaunch || props.major < 8 || image.ptxVersion < 80) return 0;
+            int active = 0;
+            checkCudaErrors("Draft head occupancy", cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active, kernel, threads, 0));
+            return active * props.multiProcessorCount;
+        };
+        capacity = resident(FusedDraftHeadProposal);
+        pairedCapacity = props.major == 9 && props.minor == 0 ? resident(FusedDraftHeadProposalPaired) : 0;
+        batchCapacity = props.major == 9 && props.minor == 0 ? resident(FusedDraftHeadProposalBatch) : 0;
+        if (props.major == 9 && props.minor == 0) {
+            groupCapacity[0] = resident(FusedDraftHeadProposalGroup<false>, 256);
+            groupCapacity[1] = resident(FusedDraftHeadProposalGroup<true>, 256);
+            wideCapacity[0] = resident(FusedDraftHeadProposalWide<3>);
+            wideCapacity[1] = resident(FusedDraftHeadProposalWide<4>);
+        } else {
+            groupCapacity[0] = groupCapacity[1] = wideCapacity[0] = wideCapacity[1] = 0;
         }
         cachedDevice = device;
     }
-    // Keep a contiguous vocabulary span per CTA; grid-wide barriers require residency.
-    const int blocks = (vocab - 1) / Tile + 1;
-    if (blocks > capacity) return false;
+    int blocks = (vocab - 1) / Tile + 1;
+    auto kernel = FusedDraftHeadProposal;
+    if (rows > 4) {
+        blocks = (vocab - 1) / 4096 + 1;
+        // Extra projection CTAs avoid a partially occupied second wave at five to seven owners.
+        const int projectionTiles = (vocab - 1) / WideTile + 1;
+        const int columns = (projectionTiles + rows - 1) / rows;
+        if (columns > blocks && columns <= groupCapacity[1] / rows) {
+            blocks = columns;
+            kernel = FusedDraftHeadProposalGroup<true>;
+        } else {
+            if (blocks > groupCapacity[0] / rows) return false;
+            kernel = FusedDraftHeadProposalGroup<false>;
+        }
+        if (reinterpret_cast<uintptr_t>(probabilities) & 15) return false;
+    } else if (rows >= 3) {
+        blocks = (vocab - 1) / WideTile + 1;
+        if (blocks > wideCapacity[rows - 3] || (reinterpret_cast<uintptr_t>(probabilities) & 15)) return false;
+        kernel = rows == 3 ? FusedDraftHeadProposalWide<3> : FusedDraftHeadProposalWide<4>;
+    } else if (rows == 2) {
+        blocks = (blocks + 1) / 2;
+        if (blocks > batchCapacity) return false;
+        kernel = FusedDraftHeadProposalBatch;
+    } else if (blocks > capacity) {
+        blocks = (blocks + 1) / 2;
+        if (blocks > pairedCapacity) return false;
+        kernel = FusedDraftHeadProposalPaired;
+    }
     Proposal args{static_cast<const B *>(base), static_cast<const B *>(embedding),
         static_cast<const B *>(weight), ws.temperatures, ws.seed, ids, probabilities,
         reinterpret_cast<float2 *>(ws.bufferB), vocab, steps};
     void *params[]{&args};
-    checkCudaErrors("Fused draft head launch", cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(FusedDraftHeadProposal),
-        blocks, Threads, params, 0, cudaStreamPerThread));
+    checkCudaErrors("Fused draft head launch", cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(kernel),
+        dim3(blocks, rows > 4 ? rows : 1), rows > 4 ? 256 : Threads, params, 0, cudaStreamPerThread));
     return true;
 #else
     return false;

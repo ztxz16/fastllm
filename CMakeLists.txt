@@ -618,11 +618,13 @@ if (USE_CUDA)
           CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "(^|;)90(-real|-virtual)?(;|$)")))
         list(APPEND FASTLLM_CUDA_SM90_SOURCES
             src/devices/cuda/models/naive-n05-qkv.cu
+            src/devices/cuda/models/naive-n05-dense-sm90.cu
             src/devices/cuda/models/naive-n05-indexer.cu
             src/devices/cuda/moe/fastllm-moe16-wgmma.cu)
         set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
             APPEND PROPERTY COMPILE_DEFINITIONS
                 FASTLLM_ENABLE_NAIVE_QKV_SM90 FASTLLM_ENABLE_NAIVE_INDEXER_SM90)
+        set_property(SOURCE src/devices/multicuda/fastllm-naive-experts.cpp APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DENSE_SM90)
         set_property(SOURCE src/devices/cuda/moe/fastllm-moe16.cu
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MOE16_SM90)
     endif()
@@ -979,18 +981,12 @@ if (FASTLLM_CUDA_SM120_SOURCES)
         "${FASTLLM_CUTLASS_DIR}/include")
     set(dp_dsa_source src/devices/cuda/models/naive-n05-dp-dsa-verify.cu)
     set(dp_draft_source src/devices/cuda/models/naive-n05-draft-replica.cu)
-    if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+    if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR FASTLLM_NAIVE_SM90_ENABLED)
         # Both architectures share one host launcher and one graph node.
         set_property(SOURCE ${dp_dsa_source} ${dp_draft_source} APPEND PROPERTY COMPILE_OPTIONS
             "--generate-code=arch=compute_120f,code=sm_120f")
     else()
-        target_sources(fastllm_cuda_sm120 PRIVATE ${dp_draft_source})
-        if (FASTLLM_NAIVE_SM90_ENABLED)
-            set_property(SOURCE ${dp_dsa_source} APPEND PROPERTY COMPILE_OPTIONS
-                "--generate-code=arch=compute_120f,code=sm_120f")
-        else()
-            target_sources(fastllm_cuda_sm120 PRIVATE ${dp_dsa_source})
-        endif()
+        target_sources(fastllm_cuda_sm120 PRIVATE ${dp_dsa_source} ${dp_draft_source})
         set_property(SOURCE ${dp_dsa_source} ${dp_draft_source} APPEND PROPERTY COMPILE_OPTIONS
             "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
         set_property(SOURCE ${dp_dsa_source} APPEND PROPERTY INCLUDE_DIRECTORIES
@@ -1162,24 +1158,6 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DSA_FUSED)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_dsa_fused>)
-    add_library(fastllm_draft_fused OBJECT src/devices/cuda/models/naive-n05-draft-fused.cu
-        src/devices/cuda/models/naive-n05-draft-replica.cu)
-    set_target_properties(fastllm_draft_fused PROPERTIES
-        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(fastllm_draft_fused BEFORE PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_draft/include"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/devices/cuda"
-        "${FASTLLM_CUTLASS_DIR}/include")
-    target_compile_options(fastllm_draft_fused PRIVATE
-        "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr"
-        "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
-    target_compile_definitions(fastllm_draft_fused PRIVATE
-        NAIVERT_SM_COUNT=148 NAIVERT_TP_RANKS=8 NAIVERT_HIDDEN=4096
-        NAIVERT_VOCAB_SHARD=19072 NAIVERT_NORM_EPS=1e-05)
-    set_property(SOURCE src/devices/multicuda/fastllm-naive-draft-execution.cpp
-        src/devices/cuda/models/naive-n05-draft-backend.cpp
-        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DRAFT_FUSED)
-    list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_draft_fused>)
     add_library(fastllm_shared_flex_sm103 OBJECT
         src/devices/cuda/moe/fastllm-shared-flex-ep.cu
         src/devices/cuda/moe/fastllm-shared-flex-tp.cu
@@ -1217,8 +1195,32 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR FASTLLM_NAIVE_SM90_ENABLED)
         target_compile_definitions(fastllm_dp_dsa_verify PRIVATE FASTLLM_DP_DSA_SM90)
     endif()
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_dp_dsa_verify>)
-    set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
-        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DP_VERIFY)
+    add_library(fastllm_draft_fused OBJECT src/devices/cuda/models/naive-n05-draft-fused.cu
+        src/devices/cuda/models/naive-n05-draft-replica.cu)
+    set_target_properties(fastllm_draft_fused PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_draft_fused BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_draft/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/devices/cuda"
+        "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_draft_fused PRIVATE
+        "--expt-relaxed-constexpr"
+        "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
+    if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+        target_compile_options(fastllm_draft_fused PRIVATE "--generate-code=arch=compute_103a,code=sm_103a")
+        target_compile_definitions(fastllm_draft_fused PRIVATE FASTLLM_DRAFT_HAS_SM103)
+    endif()
+    if (FASTLLM_NAIVE_SM90_ENABLED)
+        target_compile_options(fastllm_draft_fused PRIVATE "--generate-code=arch=compute_90a,code=sm_90a")
+        target_compile_definitions(fastllm_draft_fused PRIVATE FASTLLM_DRAFT_HAS_SM90)
+    endif()
+    target_compile_definitions(fastllm_draft_fused PRIVATE
+        NAIVERT_SM_COUNT=148 NAIVERT_TP_RANKS=8 NAIVERT_HIDDEN=4096
+        NAIVERT_VOCAB_SHARD=19072 NAIVERT_NORM_EPS=1e-05)
+    set_property(SOURCE src/devices/multicuda/fastllm-naive-draft-execution.cpp
+        src/devices/cuda/models/naive-n05-draft-backend.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DRAFT_FUSED)
+    list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_draft_fused>)
 endif()
 
 if (TARGET fastllm_draft_fused OR FASTLLM_CUDA_SM120_SOURCES)
@@ -4095,6 +4097,9 @@ if (UNIT_TEST)
             PASS_REGULAR_EXPRESSION "PASS norm linear Data adapter")
 
         add_executable(cuda_decode_dense_adapter_test test/basic/test_cuda_decode_dense_adapter.cu)
+        if ("src/devices/cuda/models/naive-n05-dense-sm90.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES)
+            target_compile_definitions(cuda_decode_dense_adapter_test PRIVATE FASTLLM_ENABLE_NAIVE_DENSE_SM90)
+        endif()
         target_include_directories(cuda_decode_dense_adapter_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(cuda_decode_dense_adapter_test PRIVATE fastllm)
         set_target_properties(cuda_decode_dense_adapter_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

@@ -2,6 +2,9 @@
 #include "devices/cuda/fastllm-cuda-decode-linear.h"
 #include "devices/cuda/low_latency/dense.h"
 #include <cuda_bf16.h>
+#ifdef FASTLLM_ENABLE_NAIVE_DENSE_SM90
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
@@ -12,10 +15,62 @@ void C(cudaError_t e){Check(e==cudaSuccess,cudaGetErrorString(e));}
 void Init(Data &d,DataType type,std::vector<int> shape){d.dataType=type;d.UpdateUnitSize();d.Resize(shape);d.ToDevice(CUDA,{0},false);d.Allocate(false);}
 void Fill(Data &d,int seed){std::vector<__nv_bfloat16> h(d.Count(0));for(auto &x:h){seed=(seed*31+17)%65521;x=__nv_bfloat16((seed%127-63)*.003f);}C(cudaMemcpy(d.cudaData,h.data(),d.GetBytes(),cudaMemcpyHostToDevice));}
 std::vector<unsigned short> Read(const Data &d){std::vector<unsigned short> h(d.GetBytes()/2);C(cudaMemcpy(h.data(),d.cudaData,d.GetBytes(),cudaMemcpyDeviceToHost));return h;}
+#ifdef FASTLLM_ENABLE_NAIVE_DENSE_SM90
+// Binary fractions keep the reference dot products exact for any cuBLAS split.
+// Compare every BF16 result including both nonlinear rounding boundaries.
+void FillBinary(Data &d, unsigned seed) {
+    std::vector<__nv_bfloat16> h(d.Count(0));
+    for (auto &x : h) {
+        seed = seed * 1664525u + 1013904223u;
+        x = __nv_bfloat16((int(seed >> 27) - 16) / 32.f);
+    }
+    C(cudaMemcpy(d.cudaData, h.data(), d.GetBytes(), cudaMemcpyHostToDevice));
+}
+
+void CheckHopperVerifyGateUp(int rows) {
+    constexpr int hidden = 4096, width = 2048;
+    Data x, gate, up, fused, reference, upResult, bias;
+    Init(x, BFLOAT16, {1, rows, hidden});
+    Init(gate, BFLOAT16, {width, hidden});
+    Init(up, BFLOAT16, gate.dims);
+    Init(reference, BFLOAT16, {1, rows, width});
+    Init(upResult, BFLOAT16, reference.dims);
+    FillBinary(x, 53);
+    FillBinary(gate, 11);
+    FillBinary(up, 37);
+    auto run = [&] { return FastllmCudaNaiveVerifyDenseGateUp(x, gate, up, fused); };
+    Check(run(), "SM90 verification gate/up rejected its warmup shape");
+    Check(!FastllmCudaNaiveVerifyDenseGateUp(x, gate, up, x), "input/output alias accepted");
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    C(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Check(run(), "SM90 verification gate/up rejected capture");
+    C(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    size_t nodes = 0;
+    C(cudaGraphGetNodes(graph, nullptr, &nodes));
+    Check(nodes == 1, "gate/up projection and activation must capture as one kernel");
+    C(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (unsigned seed : {53u, 54u, 55u}) {
+        FillBinary(x, seed);
+        C(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Check(FastllmCudaBFloat16MatMulBFloat16(x, gate, bias, reference, rows, hidden, width) &&
+              FastllmCudaBFloat16MatMulBFloat16(x, up, bias, upResult, rows, hidden, width) &&
+              FastllmCudaSilu(reference, reference) && FastllmCudaMulTo(reference, upResult, 1.f),
+              "reference gate/up failed");
+        C(cudaStreamSynchronize(cudaStreamPerThread));
+        Check(Read(fused) == Read(reference), "SM90 gate/up changed BF16 output");
+    }
+    C(cudaGraphExecDestroy(exec));
+    C(cudaGraphDestroy(graph));
+}
+#endif
 int main(){try{
  int n=0;if(cudaGetDeviceCount(&n)!=cudaSuccess||!n)return 77;
  C(cudaSetDevice(0));cudaDeviceProp properties{};C(cudaGetDeviceProperties(&properties,0));
  if(properties.major<7)return 77;
+#ifdef FASTLLM_ENABLE_NAIVE_DENSE_SM90
+ if(properties.major==9 && properties.minor==0) for (int rows : {9, 15, 16, 17, 31, 33, 65, 127, 128}) CheckHopperVerifyGateUp(rows);
+#endif
  ll::DensePlan plan;
  const auto admission=ll::PrepareDense({1,1024,256},plan,cudaStreamPerThread);
  const bool mma=admission==cudaSuccess;

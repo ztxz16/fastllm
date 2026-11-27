@@ -34,6 +34,8 @@ bool FastllmCudaMtpPrepareDraftReplay(void *sampler, float *deviceAnchors, int r
 
 bool FastllmCudaMtpTryOwnerHead(void *sampler, const void *base, const void *embedding,
     const void *weight, float *ids, float *probabilities, int vocab, int steps);
+bool FastllmCudaMtpTryOwnerHeadBatch(void *sampler, const void *base, const void *embedding,
+    const void *weight, float *ids, float *probabilities, int vocab, int steps, int rows);
 
 // Fuse BF16 base+bias (with BF16 rounding) and temperature softmax for large
 // unfiltered draft batches. Unsupported cases return false before writing.

@@ -1090,8 +1090,9 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     const int maxRows = serving->batchBuckets.back();
     const int maxLocalRows = maxRows / attentionDP;
     const bool singleOwnerFeatures = draftEnabled && CanRunSingleOwnerProposal();
+    const int ownerFeatureLimit = singleOwnerFeatures ? FastllmCudaOwnerDraftFeatureLimit(tpDevices) : 0;
     auto useLocalFeatures = [&](int localRequests) {
-        return (localRequests == 1 && singleOwnerFeatures) || localRequests > kFastllmMtpSmallRejectionMaxBatch;
+        return localRequests <= ownerFeatureLimit || localRequests > kFastllmMtpSmallRejectionMaxBatch;
     };
     // Reserve world rows only for buckets that gather their layer features on rank zero.
     int rootFeatureRows = maxLocalRows;

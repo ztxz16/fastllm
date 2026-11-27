@@ -34,6 +34,7 @@ void FastllmDraftLocalAttentionRun(int blocks, const FastllmDraftLocalAttention 
 // Full-width BF16 replica. One 7- or 8-row request, original row-major weights; the
 // graph owner supplies existing activation buffers. Query on the active device.
 int FastllmDraftFusedLocalMlpBlocks(int device);
+int FastllmDraftFusedPairMlpBlocks(int device);
 void FastllmDraftFusedLocalMlpRun(int blocks, int rows, const void *normalized, const void *gateUp,
     const void *down, void *middle, void *normScratch, void *residual, const float *gamma,
     float eps, void *output, void *stream);

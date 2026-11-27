@@ -41,6 +41,12 @@ FastllmDenseResult FastllmRunNaiveDense(FastllmExpertHandoff *prepared, bool dec
         return FastllmDenseResult::Reduced;
     }
 #ifndef USE_ROCM
+#ifdef FASTLLM_ENABLE_NAIVE_DENSE_SM90
+    if (decode && rows > 8 && FastllmCudaNaiveVerifyDenseGateUp(normed, gate, up, scratch)) {
+        Linear(scratch, down, Data(), output);
+        return FastllmDenseResult::Local;
+    }
+#endif
     if (decode && FastllmCudaDecodeDense(normed, gate, up, down, scratch, output)) return FastllmDenseResult::Local;
 #endif
     return FastllmDenseResult::Unsupported;

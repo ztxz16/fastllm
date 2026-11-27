@@ -1,4 +1,4 @@
-Fused draft operator validation (8 x SM103, torch, safetensors)
+Fused draft operator validation (8 x SM90 or SM103, torch, safetensors)
 
 Build the normal fastllm_tools target, then run each script separately, with no
 other GPU workload. Inputs use the actual checkpoint weights and an independent

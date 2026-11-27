@@ -28,13 +28,15 @@ template<int Threads, int Groups=1> __device__ __forceinline__ void markov_sync(
     asm volatile("bar.sync %0, %1;" :: "r"(barrier), "n"(Threads) : "memory");
   }
 }
-template<int Threads, bool Distributed=false, int Stride=146, int Groups=1>
+template<int Threads, bool Distributed=false, int Groups=1>
 __device__ __forceinline__ void markov_cooperative_steps(const MarkovArgs& a,
-    const float* logits,unsigned long long* partials,unsigned long long* winner,int steps) {
+    const float* logits,unsigned long long* partials,unsigned long long* winner,int steps,HeadGrid grid) {
   if(threadIdx.x>=Threads*Groups)return;
   static_assert(Groups>=1 && Groups<=4 && Threads%32==0);
   const int group=threadIdx.x/Threads;
-  constexpr int Warps=Threads/32,Ctas=148,Columns=144;
+  constexpr int Warps=Threads/32;
+  static_assert(kMkVocab == kHeadVocab);
+  const int Ctas=grid.ctas, Columns=grid.rowStride-HeadGrid::rowPadding;
   static_assert(Warps<=8);
   __shared__ float all_values[Groups][2][Warps];
   __shared__ int all_indices[Groups][2][Warps], all_previous[Groups];
@@ -58,7 +60,7 @@ __device__ __forceinline__ void markov_cooperative_steps(const MarkovArgs& a,
     for(int col=tid;col<Columns;col+=Threads) {
       int n=(cta+(col/16)*Ctas)*16+col%16;
       if(n<kMkVocab) {
-        float value=logits[j*Stride+col];
+        float value=logits[j*grid.rowStride+col];
         if(a.apply_markov) {
           auto bias=a.bias_table[std::size_t(prev)*kMkVocab+n];value=float(__float2bfloat16_rn(value+__bfloat162float(bias)));
           if constexpr(kExportDiagnostics){a.step_bias[n]=bias;a.bias_trace[j*kMkVocab+n]=bias;}

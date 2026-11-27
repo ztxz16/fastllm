@@ -20,7 +20,7 @@ ap.add_argument('--positions', default='1,17,256,1024,8193,65529,2', help='Reque
 a = ap.parse_args()
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.manual_seed(1749)
-assert torch.cuda.device_count() >= 8, 'These operator tests require eight peer-connected SM103 GPUs'
+assert torch.cuda.device_count() >= 8, 'These operator tests require eight peer-connected SM90 or SM103 GPUs'
 lib = C.CDLL(a.library)
 print('library loaded',flush=True)
 P = C.c_void_p

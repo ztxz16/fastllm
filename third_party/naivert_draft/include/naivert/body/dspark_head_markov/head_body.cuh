@@ -19,7 +19,6 @@ namespace fastllm_draft_ops {
 constexpr int kHeadWindow = 8;
 constexpr int kHeadHidden = 4096;
 constexpr int kQueryStride = kHeadHidden + 32;
-constexpr int kHeadVocab = 19072;
 constexpr int kHeadCtas = NAIVERT_SM_COUNT;
 constexpr int kHeadThreads = 384;
 constexpr int kTiles = kHeadVocab / 16;
@@ -57,9 +56,9 @@ __device__ bool wait_pane(std::uint64_t* barrier, unsigned phase,
   }
 }
 struct HeadBody {
-  template<bool Fused, int LogitStride = 144, int Requests = 1>
+  template<bool Fused, int Requests = 1>
   __device__ static void run(unsigned char* memory, const HeadArgs& args, const HeadArgs *second,
-                            int logitRows) {
+                            int logitRows, HeadGrid grid) {
     static_assert(Requests == 1 || Requests == 2 || Requests == 4);
     const int tid = int(threadIdx.x);
     const int warp = tid / 32;
@@ -120,8 +119,8 @@ struct HeadBody {
       const int page = warp - 8;
       auto* destination = memory + kPaneOffset + page * kPageBytes;
       // wave 0 was issued before the programmatic wait above
-      for (int wave = 1, tile = int(blockIdx.x) + kHeadCtas; tile < kTiles;
-           ++wave, tile += kHeadCtas) {
+      for (int wave = 1, tile = int(blockIdx.x) + grid.ctas; tile < kTiles;
+           ++wave, tile += grid.ctas) {
         const bool available = wait_pane(released + page, unsigned(wave & 1), watchdog);
         if (!__all_sync(0xffffffffu, available)) break;
         if (lane == 0) {
@@ -151,7 +150,7 @@ struct HeadBody {
       }
       unsigned failed_panes = 0;
       for (int wave = 0, tile = int(blockIdx.x); tile < kTiles;
-           ++wave, tile += kHeadCtas) {
+           ++wave, tile += grid.ctas) {
         float c[Requests][4] = {};
 #pragma unroll
         for (int page = 0; page < 4; ++page) {
@@ -209,7 +208,8 @@ struct HeadBody {
             sum = float(__float2bfloat16_rn(sum));
             if (row >= output.first_logit_row && row < output.first_logit_row + logitRows) {
               if constexpr (Fused)
-                reinterpret_cast<float*>(memory + kHeadSmem + request * 7 * LogitStride * sizeof(float))[(row - output.first_logit_row) * LogitStride + wave * 16 + column] = sum;
+                reinterpret_cast<float*>(memory + kHeadSmem)[
+                    (request * 7 + row - output.first_logit_row) * grid.rowStride + wave * 16 + column] = sum;
               if (output.logits)
                 output.logits[std::size_t(row - output.first_logit_row) * kHeadVocab + tile * 16 + column] = sum;
             }

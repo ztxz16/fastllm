@@ -6,6 +6,16 @@
 #include <cuda_runtime_api.h>
 #include <cstdint>
 namespace fastllm_draft_ops {
+constexpr int kHeadVocab = 19072;
+struct HeadGrid {
+  int ctas;
+  int rowStride;
+  static constexpr int rowPadding = 2;
+
+  static constexpr HeadGrid forCtas(int ctas) {
+    return {ctas, ((kHeadVocab + 16 * ctas - 1) / (16 * ctas)) * 16 + rowPadding};
+  }
+};
 struct HeadArgs {
   const __nv_bfloat16* resid_in;
   const float* norm_gamma;

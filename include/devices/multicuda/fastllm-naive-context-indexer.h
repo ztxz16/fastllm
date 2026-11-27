@@ -23,6 +23,7 @@ struct NaiveVerifyAttentionPlan {
     Layer ForLayer(bool sliding, bool residual, bool localIndexer, int cacheRequests,
                    bool ringCache, bool contextIndex) const;
 };
+int FastllmCudaOwnerDraftFeatureLimit(const std::vector<int> &devices);
 bool FastllmCudaVerifyReduceNormSupported(int rows, const std::vector<int> &devices);
 NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, int tpRanks,
         const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,

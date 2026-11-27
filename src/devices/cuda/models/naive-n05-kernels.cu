@@ -3068,6 +3068,21 @@ struct DeviceDraftBatch {
     const DraftBatchRow *rows;
     const uint64_t *cacheBindings = nullptr;
 };
+template<int N> struct BoundDraftBatch { DraftBatchRow rows[N]; };
+template<int N>
+BoundDraftBatch<N> BindDraftRows(const std::vector<DraftBatchRow> &rows, const fastllm::Data &bindings) {
+    BoundDraftBatch<N> batch{};
+    const auto *table = static_cast<const void *const *>(bindings.cudaData);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        batch.rows[i] = rows[i];
+        batch.rows[i].cacheTable = table + 2 * i;
+    }
+    return batch;
+}
+template<int N>
+__device__ __forceinline__ DraftBatchRow DraftRow(const BoundDraftBatch<N> &batch, int index) {
+    return ResolveDraftRow(batch.rows[index]);
+}
 // In a singleton graph the descriptor fits in the kernel arguments. Only
 // the KV addresses change at replay and are read from the owner binding table.
 __device__ __forceinline__ DraftBatchRow DraftRow(const DraftBatchRow &row, int) {
@@ -3372,6 +3387,12 @@ bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
             auto row = descriptors.front();
             row.cacheTable = static_cast<const void *const *>(cacheBindings->cudaData);
             launch(row);
+        } else if (count == 2 && cacheBindings && FastllmCudaRuntimeArch() == 90) {
+            launch(BindDraftRows<2>(descriptors, *cacheBindings));
+        } else if (count == 4 && cacheBindings && FastllmCudaRuntimeArch() == 90) {
+            launch(BindDraftRows<4>(descriptors, *cacheBindings));
+        } else if (count <= 8 && cacheBindings && FastllmCudaRuntimeArch() == 90) {
+            launch(BindDraftRows<8>(descriptors, *cacheBindings));
         } else {
             DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace),
                 cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
@@ -3436,20 +3457,31 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         for (int i = 0; i < count; ++i)
             descriptors[i].output = (BF16 *)output.cudaData + (size_t)i * rows * heads * dim;
         const dim3 grid((rows * (heads / kvHeads) + 63) / 64, count, kvHeads), block(32, 4, 1);
-        if (count == 1 && cacheBindings) {
-            auto row = descriptors.front();
-            row.cacheTable = static_cast<const void *const *>(cacheBindings->cudaData);
+        auto launchBound = [&](auto batch) {
             // Tile the packed query rows across CTAs for low-parallelism owner graphs.
             constexpr size_t smallShared = sizeof(DraftFlashSmallTraits::SharedStorageSingle);
             static_assert(!DraftFlashSmallTraits::IsInvalid());
             const int packedRows = rows * (heads / kvHeads);
             if (kvHeads <= 8 && packedRows > 16 && packedRows <= 64 && window >= 256 &&
-                BulkKernelSupported(BatchDraftFlash<DraftBatchRow, DraftFlashSmallTraits>, smallShared, 80)) {
-                BatchDraftFlash<DraftBatchRow, DraftFlashSmallTraits><<<dim3((packedRows + 15) / 16, 1, kvHeads),
-                    dim3(32, 1, 4), smallShared, cudaStreamPerThread>>>(row, params);
+                BulkKernelSupported(BatchDraftFlash<decltype(batch), DraftFlashSmallTraits>, smallShared, 80)) {
+                BatchDraftFlash<decltype(batch), DraftFlashSmallTraits><<<dim3((packedRows + 15) / 16, count, kvHeads),
+                    dim3(32, 1, 4), smallShared, cudaStreamPerThread>>>(batch, params);
             } else {
-                BatchDraftFlash<<<grid, block, shared, cudaStreamPerThread>>>(row, params);
+                BatchDraftFlash<<<grid, block, shared, cudaStreamPerThread>>>(batch, params);
             }
+        };
+        if (count == 1 && cacheBindings) {
+            auto row = descriptors.front();
+            row.cacheTable = static_cast<const void *const *>(cacheBindings->cudaData);
+            launchBound(row);
+        } else if (count == 2 && cacheBindings && FastllmCudaRuntimeArch() == 90) {
+            launchBound(BindDraftRows<2>(descriptors, *cacheBindings));
+        } else if (count == 4 && cacheBindings && FastllmCudaRuntimeArch() == 90) {
+            BatchDraftFlash<<<grid, block, shared, cudaStreamPerThread>>>(
+                BindDraftRows<4>(descriptors, *cacheBindings), params);
+        } else if (count <= 8 && cacheBindings && FastllmCudaRuntimeArch() == 90) {
+            BatchDraftFlash<<<grid, block, shared, cudaStreamPerThread>>>(
+                BindDraftRows<8>(descriptors, *cacheBindings), params);
         } else {
             DeviceDraftBatch batch{DeviceDescriptors(descriptors, scores),
                 cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};

@@ -100,13 +100,16 @@ bool TryCudaDraftHead(const DraftProjectedHead &h, int steps) {
 #ifndef USE_ROCM
     if (h.base.dims.size() != 3 || steps < 1 || h.base.dataDeviceIds.size() != 1) return false;
     const int device = h.base.dataDeviceIds.front(), vocab = h.base.dims.back();
-    if (!Resident(h.base, device, BFLOAT16, {1, steps, vocab}) ||
+    if (h.ids.dims.size() != 2) return false;
+    const int rows = h.ids.dims[1];
+    if ((rows < 1 || rows > 8 || (rows > 1 && FastllmCudaRuntimeArch() != 90)) ||
+        !Resident(h.base, device, BFLOAT16, {1, rows * steps, vocab}) ||
         !Resident(h.embedding, device, BFLOAT16, {vocab, 256}, 16) ||
         !Resident(h.projection, device, BFLOAT16, {vocab, 256}, 16) ||
-        !Resident(h.ids, device, FLOAT32, {steps + 1, 1}) ||
-        !Resident(h.probabilities, device, FLOAT32, {1, steps, vocab}, 8)) return false;
-    return FastllmCudaMtpTryOwnerHead(h.sampler, h.base.cudaData, h.embedding.cudaData, h.projection.cudaData,
-        static_cast<float *>(h.ids.cudaData), static_cast<float *>(h.probabilities.cudaData), vocab, steps);
+        !Resident(h.ids, device, FLOAT32, {steps + 1, rows}) ||
+        !Resident(h.probabilities, device, FLOAT32, {rows, steps, vocab}, 8)) return false;
+    return FastllmCudaMtpTryOwnerHeadBatch(h.sampler, h.base.cudaData, h.embedding.cudaData, h.projection.cudaData,
+        static_cast<float *>(h.ids.cudaData), static_cast<float *>(h.probabilities.cudaData), vocab, steps, rows);
 #else
     return false;
 #endif
@@ -130,22 +133,28 @@ bool TryCudaDraftMlp(const DraftLayerParallel &p, int requests, const Data &norm
                                     eps, p.devices.at(p.rank), *collective->storage);
 #endif
 #ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
-    if (p.tpSize != 1 || requests != 1 || p.rank < 0 || size_t(p.rank) >= p.devices.size() ||
-        !w.gateUp || normalized.dims.size() != 3 || normalized.dims[1] < 7 || normalized.dims[1] > 8)
+    if (p.tpSize != 1 || p.rank < 0 || size_t(p.rank) >= p.devices.size() ||
+        !w.gateUp || normalized.dims.size() != 3 ||
+        requests < 1 || requests > 16)
         return false;
     const int device = p.devices[p.rank];
     const auto &shape = normalized.dims;
-    if (!Resident(normalized, device, BFLOAT16, {1, shape[1], 4096}, 16) ||
+    if (shape[1] < 1 || shape[1] > 16 || (shape[0] != 1 && shape[0] != requests)) return false;
+    const int rows = shape[0] * shape[1];
+    const bool hopper = FastllmCudaRuntimeArch() == 90;
+    // A second 16-row cooperative tile costs more than the batched GEMM path.
+    if (shape[2] != 4096 || rows > 16 || rows < requests || rows > 8 * requests ||
+        (!hopper && (requests != 1 || rows < 7)) || !Resident(normalized, device, BFLOAT16, shape, 16) ||
         !Resident(*w.gateUp, device, BFLOAT16, {8192, 4096}, 32) ||
         !Resident(w.down, device, BFLOAT16, {4096, 4096}, 32) ||
         !Resident(residual, device, BFLOAT16, shape, 16) || !Resident(scratch, device, BFLOAT16, shape, 16) ||
         !Resident(gamma, device, FLOAT32, {4096}, 16) || !CanWrite(middle, device, shape) ||
         !CanWrite(output, device, shape)) return false;
-    const int blocks = FastllmDraftFusedLocalMlpBlocks(device);
+    const int blocks = rows > 8 ? FastllmDraftFusedPairMlpBlocks(device) : FastllmDraftFusedLocalMlpBlocks(device);
     if (!blocks) return false;
     AllocateOutput(middle, device, shape);
     AllocateOutput(output, device, shape);
-    FastllmDraftFusedLocalMlpRun(blocks, shape[1], normalized.cudaData, w.gateUp->cudaData, w.down.cudaData,
+    FastllmDraftFusedLocalMlpRun(blocks, rows, normalized.cudaData, w.gateUp->cudaData, w.down.cudaData,
         middle.cudaData, scratch.cudaData, residual.cudaData, static_cast<const float *>(gamma.cudaData),
         eps, output.cudaData, nullptr);
     return true;
@@ -169,6 +178,7 @@ bool TryCudaDraftAttention(const DraftLayerParallel &p, const DraftAttentionGeom
         !w.qkv || normalized.dims.size() != 3 || !std::isfinite(g.eps) || g.eps <= 0 ||
         !std::isfinite(g.theta) || g.theta <= 0) return false;
     const int device = p.devices[p.rank], rows = normalized.dims[1];
+    if (rows < 7 && FastllmCudaRuntimeArch() != 90) return false;
     int floats = 0;
     const int blocks = FastllmDraftLocalAttentionPlan(device, rows, g.heads, g.kvHeads, g.headDim, g.window, &floats);
     if (!blocks) return false;
@@ -249,7 +259,7 @@ bool ExportCudaDraftShardedHead(void *state, const Data &hidden, int steps, int 
         int64_t *ids, float *confidence) {
     const int count = limits.size();
     auto *probabilities = static_cast<float *>(q.cudaData);
-    if (count >= 8)
+    if (count >= 8 || (count >= 4 && FastllmCudaRuntimeArch() == 90))
         return FastllmDraftFusedHeadSubmitBatch(state, count, hidden.cudaData,
             temperatures.data(), limits.data(), probabilities, ids, confidence, nullptr);
     for (int row = 0; row < count; ++row) {

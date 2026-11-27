@@ -101,16 +101,19 @@ __device__ bool wait_weight(std::uint64_t* barrier, unsigned phase,
 
 // Each launch handles a bounded row tile. Requests keep independent scratch,
 // epochs and mailboxes; larger batches iterate these tiles on the host.
-template<int Chunks = 1> struct MlpRowsBody {
+template<int Chunks = 1, bool Compact = false> struct MlpRowsBody {
   static_assert(Chunks == 1 || Chunks == 2 || Chunks == 4);
+  static constexpr bool kLocalNorm = Chunks == 1 && !Compact;
   static constexpr int kMlpWindow = 8 * Chunks;
-  static constexpr int kDownAccumFloats = 8 * kColsPerCtaD4 * kMlpWindow;
-  static constexpr int kMlpBaseSmem = Chunks == 1 ?
+  // Two 16-row down tiles reuse the warp partials on Hopper's four-request path.
+  static constexpr int kDownChunks = Compact && Chunks == 4 ? 2 : Chunks;
+  static constexpr int kDownAccumFloats = 8 * kColsPerCtaD4 * (8 * kDownChunks);
+  static constexpr int kMlpBaseSmem = kLocalNorm ?
       kMlpWindow * kMlpInputStride * 2 + (kMlpWindow * 16 + kMlpWarps * 128 * Chunks) * 4 :
       kMlpWindow * kMlpDownStride * 2 + (kDownAccumFloats + kMlpWindow * kDownStageStride) * 4;
   // Batched normalization reuses resid_out, leaving room for the same two
   // 2048-K weight pages as the scalar kernel.
-  static constexpr int kGuPageK = 2048;
+  static constexpr int kGuPageK = Compact ? 512 : 2048;
   static constexpr int kGuPages = kMlpHidden / kGuPageK;
   static constexpr int kGuPageBytes = 16 * kGuPageK * 2;
   static constexpr int kWeightBytes = kGuSlots * kGuPageBytes;
@@ -153,7 +156,7 @@ template<int Chunks = 1> struct MlpRowsBody {
     auto* sh = sx;
     auto* down_partials = reinterpret_cast<float*>(sx + kMlpWindow * kMlpDownStride);
     auto* stage = down_partials + kDownAccumFloats;
-    auto* gu = reinterpret_cast<float*>(sx + (Chunks == 1 ? kMlpWindow * kMlpInputStride : 0));
+    auto* gu = reinterpret_cast<float*>(sx + (kLocalNorm ? kMlpWindow * kMlpInputStride : 0));
     auto* partials = gu + kMlpWindow * 16;
     const int tid = threadIdx.x, cta = blockIdx.x;
     const int col0 = cta * kColsPerCtaD4;
@@ -185,13 +188,13 @@ template<int Chunks = 1> struct MlpRowsBody {
     }
     auto* gamma = reinterpret_cast<float*>(memory + kGammaOffset);
     auto* gamma_ready = reinterpret_cast<std::uint64_t*>(memory + kGammaReadyOffset);
-    if (tid == 288 && (Chunks == 1 ? has_gate : cta < kMlpWindow)) {
+    if (tid == 288 && (kLocalNorm ? has_gate : cta < kMlpWindow)) {
       naivert::Barrier::expect_transaction(gamma_ready,kGammaBytes);
       WeightTransport::cp_async_bulk_evict_first(gamma,args.post_ln,kGammaBytes,gamma_ready);
       naivert::Barrier::arrive(gamma_ready);
     }
     const naivert::MailboxWatchdog watchdog{args.watchdog_limit_ns,args.watchdog_flag};
-    if constexpr (Chunks > 1) {
+    if constexpr (!kLocalNorm) {
       // hid_a and resid_out are distinct prepared lane buffers.
       // One CTA owns each normalized row. Reuse the eventual output: GU has
       // retired every read before the existing post-SiLU grid join releases down.
@@ -199,7 +202,7 @@ template<int Chunks = 1> struct MlpRowsBody {
         mlp_normalize_row(cta < 8 ? args : second[cta/8-1], cta % 8, gamma, gamma_ready, partials);
     }
     if (has_gate) {
-      if constexpr (Chunks == 1) {
+      if constexpr (kLocalNorm) {
         if (tid < 256) mlp_normalize_local(args, gamma, sx, gamma_ready);
       }
       auto* empty = reinterpret_cast<std::uint64_t*>(memory+kEmptyOffset);
@@ -243,7 +246,10 @@ template<int Chunks = 1> struct MlpRowsBody {
       for (int i = tid; i < kMlpWindow*kColsPerCtaD4; i += kMlpThreads) stage[(i/kColsPerCtaD4)*kDownStageStride+i%kColsPerCtaD4]=0.0f;
       __syncthreads();
     } else {
-      mlp_down_tile(sh, weight, down_partials, stage);
+#pragma unroll
+      for (int first = 0; first < Chunks; first += kDownChunks)
+        mlp_down_tile(sh + first * 8 * kMlpDownStride, weight, down_partials,
+                      stage + first * 8 * kDownStageStride);
     }
     if (tid < kMlpWindow * kColsPerCtaD4 / 8) __pipeline_wait_prior(0);
     __syncthreads();

@@ -41,7 +41,10 @@ ptrs=(P*8)(*(x.data_ptr() for x in heads));sync()
 assert lib.FastllmDraftFusedHeadPrepare(state,ptrs,w1.data_ptr(),w2.data_ptr(),cw.data_ptr(),cb.data_ptr(),0),lib.FastllmDraftFusedError()
 print('PREPARED',flush=True)
 results=[]
-for count in [int(x) for x in (a.requests or '8,15,16,31,32,63,64').split(',')]:
+counts=[int(x) for x in a.requests.split(',')] if a.requests else [8,15,16,31,32,63,64]
+if not a.requests and torch.cuda.get_device_capability(0) == (9, 0):
+ counts.insert(0,4)
+for count in counts:
  plans=[];children=[];ready=[];max_head_l2=0.;max_q_l2=0.
  xx=torch.randn(count*7,4096).bfloat16();xs=[xx.to(r) for r in range(8)]
  packed=[torch.full((3,count*8+3),-17.,device=r) for r in range(8)]
@@ -131,7 +134,7 @@ for count in [int(x) for x in (a.requests or '8,15,16,31,32,63,64').split(',')]:
   max_head_l2=max(max_head_l2,head_l2);max_q_l2=max(max_q_l2,q_l2)
  # The full-budget projection is shared by DS1/DS3; their graph prefixes
  # must stop at the requested number of Markov steps and pack the right stride.
- if count in (8,15,64):
+ if count in (4,8,15,64):
   for short_rows in (2,4):
    short_plans=[];short_children=[];short_ready=[]
    short_packed=[torch.full((3,count*short_rows+3),-17.,device=r) for r in range(8)]

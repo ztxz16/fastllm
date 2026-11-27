@@ -8,4 +8,9 @@ namespace fastllm {
 // Capability rejection occurs before output resizing or any kernel launch.
 bool FastllmCudaDecodeDense(const Data &input, const Data &gate, const Data &up,
                            const Data &down, Data &intermediate, Data &output);
+
+#ifdef FASTLLM_ENABLE_NAIVE_DENSE_SM90
+// Hopper verification projects gate and up together, rounding SiLU before the product.
+bool FastllmCudaNaiveVerifyDenseGateUp(const Data &input, const Data &gate, const Data &up, Data &output);
+#endif
 }

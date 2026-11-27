@@ -34,6 +34,21 @@ def prepared_matches_eager(features,caches,before,tables,ns,starts,references):
     global prepared_cases,prepared_exact_cases
     count=len(ns)
     expected=[[x.clone() for x in row] for row in caches]
+    if count >= 4 and count < 8 and torch.cuda.get_device_capability(0) == (9, 0):
+        for r in range(8):
+            for dst,src in zip(caches[r],before[r]): dst.copy_(src)
+        sync()
+        for j in range(count):
+            single=(ContextRequest*8)(*[ContextRequest(features[r][j].data_ptr(),tables[r].data_ptr(),
+                ns[j],starts[j],min(starts[j],1023),count,j) for r in range(8)])
+            assert lib.FastllmDraftFusedContextSharedUpload(state,single,1)
+            for r in range(8):
+                with torch.cuda.device(r),torch.cuda.stream(streams[r]):
+                    assert lib.FastllmDraftFusedContextSharedRun(state,r,1,streams[r].cuda_stream)
+            sync()
+        scalar=[[x.clone() for x in row] for row in caches]
+    else:
+        scalar=None
     stride=8
     tokens=torch.arange(32,32+count*stride,dtype=torch.int32,device=0).view(count,stride)
     anchors=[torch.empty(count+1,dtype=torch.float32,device=r) for r in range(8)]
@@ -87,6 +102,8 @@ def prepared_matches_eager(features,caches,before,tables,ns,starts,references):
                 # compacted history, guard rows and padding must remain bitwise equal.
                 assert torch.equal(got[:keep],want[:keep]),('shared retained',count,r,i)
                 assert torch.equal(got[end:],want[end:]),('shared guard/padding',count,r,i)
+                if scalar is not None:
+                    assert torch.equal(got,scalar[r][i]), ('scalar prepared KV',count,r,i,device_counts)
                 exact=exact and torch.equal(got,want)
                 ref=references[r][i]
                 m=metrics(got[keep:end],ref,torch.zeros_like(ref))

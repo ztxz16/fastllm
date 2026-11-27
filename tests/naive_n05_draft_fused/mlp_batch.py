@@ -72,6 +72,8 @@ for count in counts:
             sync()
             for r in range(8):
                 m=metrics(outs[r],controls[r],xs[r]);assert m['max_row_l2']<=.006,m
+                if count >= 2 and torch.cuda.get_device_capability(r) == (9, 0):
+                    assert torch.equal(outs[r], controls[r]), 'SM90 batched MLP changed scalar BF16 output'
                 results.append(dict(op='changing_graph',requests=count,layer=layer,rank=r,**m))
                 xs[r].copy_(initial.to(r))
             sync();del graphs

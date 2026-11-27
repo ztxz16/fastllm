@@ -406,7 +406,7 @@ static void ReplicaAttentionReplay() {
         a.ToDevice(CUDA,std::vector<int>{0}); return a;
     };
     Data qn=scale(128), kn=scale(128), gamma=scale(4096);
-    for (int rows : {7,8}) {
+    for (int rows = FastllmCudaRuntimeArch() == 90 ? 1 : 7; rows <= 8; ++rows) {
         const std::vector<int> dims{1,rows,4096};
         const int cap=1024+rows;
         Data x=BF(dims,23), src=BF(dims,29), normed=BF(dims,1), hidden=BF(dims,2);
@@ -455,8 +455,35 @@ static void ReplicaAttentionReplay() {
             Data rq,query,ws,scores,ra,ro,rn,rh;
             rh.CopyFrom(src); MatMulTransB(x,qkvWeight,rq);
             std::vector<FastllmNaiveDraftRow> rr{{&refK[owner],&refV[owner],&pos,&live}};
-            Require(FastllmCudaNaiveBatchDraftQKV(rq,qn,kn,rr,query,32,4,128,1024,1e-5f,10000,&ws,&refBindings) &&
-                FastllmCudaNaiveBatchDraftAttention(query,rr,32,4,128,1024,scores,ra,&refBindings),"attention reference");
+            if (rows == 1) {
+                Require(FastllmCudaNaiveDraftQKV(rq,qn,kn,pos,live,refK[owner],refV[owner],
+                    query,32,4,128,1024,1e-5f,10000),"single-row draft QKV reference");
+                // The batched reference adds every draft position to the softmax.
+                // Compute the singleton directly so a second key cannot change its denominator.
+                const auto q = Bits(query), k = Bits(refK[owner], cap * 512), v = Bits(refV[owner], cap * 512);
+                std::vector<float> values(4096), logits(base + 1);
+                auto round = [](float n) { return Float(Float32ToBFloat16RNEBits(n)); };
+                for (int head = 0; head < 32; ++head) {
+                    for (int t = 0; t <= base; ++t) {
+                        float dot = 0;
+                        for (int c = 0; c < 128; ++c) dot += Float(q[head*128+c])*Float(k[t*512+head/8*128+c]);
+                        logits[t] = round(round(dot) / std::sqrt(128.f));
+                    }
+                    const float maximum = *std::max_element(logits.begin(), logits.end());
+                    float sum = 0;
+                    for (int t = 0; t <= base; ++t) {
+                        const float weight = std::exp(logits[t] - maximum);
+                        sum += weight;
+                        for (int c = 0; c < 128; ++c) values[head*128+c] += weight*Float(v[t*512+head/8*128+c]);
+                    }
+                    for (int c = 0; c < 128; ++c) values[head*128+c] /= sum;
+                }
+                Data host(FLOAT32,{1,1,4096},values);
+                ToDataType(host,BFLOAT16); host.ToDevice(CUDA,devices); ra.CopyFrom(host);
+            } else {
+                Require(FastllmCudaNaiveBatchDraftQKV(rq,qn,kn,rr,query,32,4,128,1024,1e-5f,10000,&ws,&refBindings) &&
+                    FastllmCudaNaiveBatchDraftAttention(query,rr,32,4,128,1024,scores,ra,&refBindings),"attention reference");
+            }
             MatMulTransB(ra,wo,ro); FastllmCudaNaiveAddDecodeRMSNorm(rh,ro,gamma,1e-5f,rn);
             auto compare=[&](const Data &a,const Data &b,int width,int offset=0) {
                 const auto av=Bits(a,(offset+rows)*size_t(width)),bv=Bits(b,(offset+rows)*size_t(width));
@@ -466,7 +493,11 @@ static void ReplicaAttentionReplay() {
                         const int i=row*width+c; double r=Float(bv[i]),diff=Float(av[i])-r;
                         err+=diff*diff;sum+=r*r;
                     }
-                    Require(std::sqrt(err/std::max(sum,1e-20))<0.012,"draft attention row relative L2");
+                    if (!(std::sqrt(err/std::max(sum,1e-20)) < 0.012)) {
+                        std::cerr << "rows=" << rows << " past=" << past << " width=" << width
+                                  << " relative L2=" << std::sqrt(err/std::max(sum,1e-20)) << std::endl;
+                        throw std::runtime_error("draft attention row relative L2");
+                    }
                 }
             };
             compare(key[owner],refK[owner],512,base); compare(val[owner],refV[owner],512,base);
@@ -484,7 +515,9 @@ static void ReplicaMlpReplay() {
     gamma.Allocate();
     for (int i = 0; i < 4096; ++i) ((float *)gamma.cpuData)[i] = 0.5f + float(i % 127) / 128;
     gamma.ToDevice(CUDA, std::vector<int>{0});
-    for (const int rows : {7, 8}) {
+    std::vector<int> cases{7, 8};
+    if (FastllmCudaRuntimeArch() == 90) cases = {1, 5, 7, 8, 9, 15, 16, 17, 23, 31, 33, 65, 127, 128};
+    for (int rows : cases) {
         const std::vector<int> dims{1, rows, 4096};
         Data input = BF(dims, 1), middle = BF(dims, 2), branch = BF(dims, 3);
         Data hidden = BF(dims, 4), tail = BF(dims, 5);
@@ -496,9 +529,18 @@ static void ReplicaMlpReplay() {
         const DraftMlpWeights weights{&gu, down};
         Require(!TryCudaDraftMlp({devices, 0, 2}, 1, input, weights, hidden, gamma,
                     1e-5f, middle, branch, output) &&
-                !TryCudaDraftMlp(local, 2, input, weights, hidden, gamma, 1e-5f, middle, branch, output),
-                "replica MLP cannot take a partial TP result or multiple requests");
-        Require(TryCudaDraftMlp(local, 1, input, weights, hidden,
+                !TryCudaDraftMlp(local, rows + 1, input, weights, hidden, gamma, 1e-5f, middle, branch, output),
+                "replica MLP cannot take a partial TP result or more requests than rows");
+        if (rows > 16) {
+            Require(!TryCudaDraftMlp(local, (rows + 7) / 8, input, weights, hidden,
+                gamma, 1e-5f, middle, branch, output), "wide draft MLP must use the batched GEMM");
+            size_t nodes = 1;
+            Require(cudaStreamEndCapture(cudaStreamPerThread,&graph) == cudaSuccess &&
+                cudaGraphGetNodes(graph,nullptr,&nodes) == cudaSuccess && nodes == 0,"wide MLP launched work");
+            cudaGraphDestroy(graph);
+            continue;
+        }
+        Require(TryCudaDraftMlp(local, (rows + 7) / 8, input, weights, hidden,
             gamma, 1e-5f, middle, branch, output), "replica MLP dispatch");
         Require(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "end replica MLP capture");
         size_t nodes = 0;

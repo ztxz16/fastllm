@@ -18,7 +18,11 @@ int ReplicaBlocks(int device) {
     CheckReplica(cudaGetDeviceProperties(&props, device));
     int active = 0;
     const int arch = props.major * 10 + props.minor;
-    if ((arch == 103 || arch == 120) && props.cooperativeLaunch) {
+    bool supported = arch == 103 || arch == 120;
+#ifdef FASTLLM_DRAFT_HAS_SM90
+    supported |= arch == 90;
+#endif
+    if (supported && props.cooperativeLaunch) {
         auto status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, Kernel, Op::Threads, 0);
         if (fastllm::cuda::low_latency::BackendUnavailable(status)) {
             const auto pending = cudaGetLastError();
@@ -44,7 +48,7 @@ void RunReplica(int blocks, typename Op::Args &args, void *stream) {
 extern "C" int FastllmDraftLocalAttentionPlan(int device, int rows, int heads, int kvHeads, int dim,
         int window, int *partialFloats) {
     using Op = ReplicaAttention;
-    if (rows < 7 || rows > 8 || heads != Op::Heads || kvHeads != Op::KVHeads || dim != Op::Dim ||
+    if (rows < 1 || rows > 8 || heads != Op::Heads || kvHeads != Op::KVHeads || dim != Op::Dim ||
         window < rows || window > 1024) return 0;
     *partialFloats = ((window - 1 + rows + Op::Chunk - 1) / Op::Chunk) * heads * rows * Op::Stride;
     return ReplicaBlocks<Op, FusedDraftAttention<Op>>(device);
@@ -58,6 +62,9 @@ extern "C" void FastllmDraftLocalAttentionRun(int blocks, const FastllmDraftLoca
         static_cast<BF *>(x.output), x.partials, x.normScratch, x.rows, x.window, x.eps, x.theta};
     RunReplica<ReplicaAttention, FusedDraftAttention<ReplicaAttention>>(blocks, a, stream);
 }
+extern "C" int FastllmDraftFusedPairMlpBlocks(int device) {
+    return ReplicaBlocks<ReplicaMlpPair, FusedDraftMlp<ReplicaMlpPair>>(device);
+}
 extern "C" int FastllmDraftFusedLocalMlpBlocks(int device) {
     const int blocks = ReplicaBlocks<ReplicaMlp, FusedDraftMlp<ReplicaMlp>>(device);
     return blocks >= ReplicaMlp::Rows ? blocks : 0;
@@ -68,5 +75,6 @@ extern "C" void FastllmDraftFusedLocalMlpRun(int blocks, int rows, const void *n
     ReplicaMlp::Args args{static_cast<const ReplicaMlp::BF *>(normalized), static_cast<const ReplicaMlp::BF *>(gateUp),
         static_cast<const ReplicaMlp::BF *>(down), static_cast<ReplicaMlp::BF *>(middle), static_cast<float *>(normScratch),
         static_cast<ReplicaMlp::BF *>(residual), static_cast<ReplicaMlp::BF *>(output), gamma, eps, rows};
-    RunReplica<ReplicaMlp, FusedDraftMlp<ReplicaMlp>>(blocks, args, stream);
+    if (rows > ReplicaMlp::Rows) RunReplica<ReplicaMlpPair, FusedDraftMlp<ReplicaMlpPair>>(blocks, args, stream);
+    else RunReplica<ReplicaMlp, FusedDraftMlp<ReplicaMlp>>(blocks, args, stream);
 }
