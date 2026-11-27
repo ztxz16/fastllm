@@ -832,6 +832,7 @@ Data NaiveN05FlashModel::RunTarget(
                     (batch || (int)pastKeyValues.size() == block_cnt),
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
     const bool tensorParallel = tpRank >= 0;
+    const bool collectiveTP = tensorParallel && tpDevices.size() > 1;
     const bool decodeWorkspace = workspace && workspace->capacity > 0;
     const bool verifying = capture && capture->verifying;
     const bool graphVerify = decodeWorkspace && verifying;
@@ -861,8 +862,8 @@ Data NaiveN05FlashModel::RunTarget(
     };
     auto reduce = [&](Data &data, Data *residual = nullptr,
                       const Data *normWeight = nullptr, Data *normOutput = nullptr) {
+        if (!collectiveTP) return false;
         trackCommunication(data);
-        if (!tensorParallel) return false;
 #ifndef USE_ROCM
         if (residual && decodeWorkspace &&
             (!verifying || FastllmCudaVerifyReduceNormSupported(inputIds.dims[1], tpDevices))) {
@@ -1022,7 +1023,7 @@ Data NaiveN05FlashModel::RunTarget(
         EmbeddingDirect(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     else Embedding(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     ToDataType(hidden, DataType::BFLOAT16);
-    const bool verifyTpPacked = graphVerify && !attentionParallel && experts && experts->PackedVerify(length, tpDevices.size());
+    const bool verifyTpPacked = graphVerify && !attentionParallel && collectiveTP && experts && experts->PackedVerify(length, tpDevices.size());
     const auto *projectionBackend = (attentionParallel && (decodeWorkspace || (!verifying && !batchDecode && length > 1))) || verifyTpPacked
         ? FastllmCudaGetMxfp8ProjectionBackend() : nullptr;
     const int maxProjectionWidth = std::max({embed_dim, full.heads * full.valueDim, sliding.heads * sliding.valueDim});
@@ -1066,7 +1067,7 @@ Data NaiveN05FlashModel::RunTarget(
     };
     bool useSwaLayer = false;
 #ifndef USE_ROCM
-    useSwaLayer = !attentionParallel && tensorParallel && decodeWorkspace && !verifying && length == 1 &&
+    useSwaLayer = !attentionParallel && collectiveTP && decodeWorkspace && !verifying && length == 1 &&
         tpSwaRingCache && !(capture && capture->collectHidden) && FastllmCudaSwaLayerSupported(gpu);
 #endif
     const auto verifyPlan = FastllmCudaPlanVerifyAttention(gpu, length, tpDevices.size(),
@@ -1434,7 +1435,7 @@ Data NaiveN05FlashModel::RunTarget(
         if (batchedDSA) dsaRows.reserve(length);
         const bool verifySWA = verifying && (!graphVerify || (batch && capture->ringVerify)) && window == 128 &&
             cfg.headDim == 192 && cfg.valueDim == 128 &&
-            (attentionParallel || cfg.heads < 64 || cfg.heads / cfg.kvHeads != 8);
+            (attentionParallel || (tensorParallel && tpDevices.size() == 1) || cfg.heads < 64 || cfg.heads / cfg.kvHeads != 8);
         const bool ringBatchDecode = slidingLayers[layer] && tpSwaRingCache && attentionBatchDecode;
         const bool eagerSwa = ringBatchDecode && !verifying && !decodeWorkspace && !tpSwaPrefillWorkspaces.empty();
         const bool batchedSWA = (slidingLayers[layer] && verifySWA) ||
@@ -2544,7 +2545,7 @@ Data NaiveN05FlashModel::RunTarget(
             // DSA and SWA share the same output-projection contract. The collective
             // admits the complete rank group before launching; other shapes and
             // devices retain the ordinary projection/reduce/residual path below.
-            if (!attentionParallel && tensorParallel && decodeWorkspace && length >= 1 && length <= 8) {
+            if (!attentionParallel && collectiveTP && decodeWorkspace && length >= 1 && length <= 8) {
                 const bool mmaProjection = verifying && slidingLayers[layer] && length > 1;
                 if (moeLayers[layer]) {
                     attentionRouterReady = FastllmCudaSwaOutputAddRMSNormPrepared(attn,
@@ -2846,7 +2847,7 @@ Data NaiveN05FlashModel::RunTarget(
                                                       nextQkv, feature, index, count});
                 }
                 const auto result = experts->Forward(layer, length, normed, hidden, w1, moeOutput, routes, routeInExpert,
-                    verifying && !localMoe, attentionInputPrepared ? prepared : nullptr, epilogue ? &*epilogue : nullptr);
+                    verifying && collectiveTP && !localMoe, attentionInputPrepared ? prepared : nullptr, epilogue ? &*epilogue : nullptr);
                 residualUpdated = result.residualUpdated;
                 moeTpReduced = result.reduced;
                 moeNormReady = result.normalized;
@@ -3300,7 +3301,7 @@ void NaiveN05FlashModel::WarmUp() {
     elementsInKVCachePerToken = 0;
     for (int layer = 0; layer < block_cnt; layer++) {
         if (slidingLayers[layer]) continue;
-        if (tpDevices.size() > 1) {
+        if (!tpDevices.empty()) {
             // Count physical storage, including replicated KV heads and the
             // configured Indexer placement, for the scheduler's token budget.
             for (int device : cache[layer].first.dataDeviceIds)
@@ -3383,7 +3384,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     // serves BF16/FP8/FP4 TP, independently of GPU generation and CUDA Graph.
     // Draft checkpoints distribute normalized inputs across the TP GPUs.
     // Restore rebuilds owner-local or sharded draft KV through AppendDraftContext.
-    if (!tpKVPool.empty() || !tpPrepared || tpDevices.size() <= 1 ||
+    if (!tpKVPool.empty() || !tpPrepared || tpDevices.empty() ||
         GetKVCacheInCPU() || !FastllmNaiveAttentionKVType(kvCacheDataType) ||
         elementsInKVCachePerToken <= 0) return;
     const double gpuMemRatio = GetGpuMemRatio();

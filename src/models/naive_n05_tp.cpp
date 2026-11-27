@@ -209,7 +209,14 @@ bool NaiveN05FlashModel::InitTensorParallel() {
     }
     AssertInFastLLM(!explicitEp || tpDevices.size() == (size_t)epRanks,
                    "MiMo --ep must equal the TP device count.");
-    if (tpDevices.size() <= 1) { tpDevices.clear(); return false; }
+    // A resident single-GPU draft model can reuse the paged rank-local verify
+    // graph, including its request-rebindable KV table. Keep serial placement
+    // for offloaded models and ordinary eager execution.
+    if (tpDevices.size() == 1 && (!draftEnabled || !GetFastllmEnv().cudaGraph ||
+            GetKVCacheInCPU() || !GetCudaEmbedding() || GetLowMemMode() || !CanUseGPUForward() || !ResidentMoePlacement())) {
+        tpDevices.clear();
+        return false;
+    }
     const int ranks = tpDevices.size();
     for (auto cfg : {full, sliding}) {
         AssertInFastLLM(cfg.heads % ranks == 0 &&
@@ -253,7 +260,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         return;
     }
     const int ranks = tpDevices.size();
-    AssertInFastLLM(ranks > 1 && !GetKVCacheInCPU(), "Naive TP requires CUDA KV cache.");
+    AssertInFastLLM(ranks > 0 && !GetKVCacheInCPU(), "Naive TP requires CUDA KV cache.");
     bool native = dataType == BFLOAT16 && moeAtype == BFLOAT16 && norm_topk_prob &&
         routed_scaling_factor == 1.0f && ResidentMoePlacement() &&
         (tpEp8Mega || (attentionDP == 1 && tpMoeBackend != NaiveMoeBackend::LegacyTP &&
@@ -342,7 +349,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         delete local; root.multiDeviceDatas.clear(); root.multiDeviceData = false;
         root.ClearTensorParallelLayout();
     };
-    AssertInFastLLM(FastllmInitNccl(tpDevices), "Naive TP: NCCL initialization failed.");
+    AssertInFastLLM(ranks == 1 || FastllmInitNccl(tpDevices), "Naive TP: NCCL initialization failed.");
     if (attentionDP > 1 && !attentionParallel) {
         auto state = std::make_shared<AttentionParallelState>(
             parallel::Topology(tpDevices, attentionDP, tpEp8Mega ? ranks : 1));
@@ -384,6 +391,11 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         if (!bias.dims.empty()) ToDataType(bias, FLOAT32);
         if (UsesPackedMoeSource() && name.find(".mlp.experts.") != std::string::npos)
             weight[name].cudaRepackSource = true;
+        if (ranks == 1 && name.find(".mlp.experts.") != std::string::npos && bias.dims.empty()) {
+            AssertInFastLLM(PlaceMultiCudaWeightOnDevice(weight[name], tpDevices, tpDevices.front()),
+                            "Naive TP: cannot place " + name);
+            return;
+        }
         AssertInFastLLM(SplitMultiCudaWeight(weight[name], bias, tpDevices, scheme, axis, true),
                         "Naive TP: cannot split " + name);
     };
@@ -543,7 +555,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
                 consumed = consumed && !local.cudaData && !local.cpuData;
                 if (local.cudaData || local.cpuData) { ++sourcePointers; sourceBytes += local.GetBytes(); }
             }
-            if (releaseSources && consumed) ReleasePackedMoeSource(root);
+            if (consumed && (releaseSources || (tpExperts && tpExperts->HasLocalMega()))) ReleasePackedMoeSource(root);
         }
     }
     fprintf(stderr,"[Naive MoE prepared] backend=%s original_payload_pointers=%zu original_payload_bytes=%zu\n",
@@ -552,7 +564,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     tpSwaRingCache = (GetFastllmEnv().cudaGraph || (attentionDP > 1 && !draftEnabled)) &&
         FastllmNaiveKVType(AuxiliaryKVType()) &&
         window == 128 && sliding.headDim == 192 && sliding.valueDim == 128 &&
-        (attentionDP > 1 || sliding.heads / ranks < 64);
+        (ranks == 1 || attentionDP > 1 || sliding.heads / ranks < 64);
     AssertInFastLLM(!indexerContextSharding || (indexFp8 && indexHeads == 16 &&
         indexDim == 128 && indexTopK == 2048 && FastllmCudaNaiveIndexerContextSupported(tpDevices)),
         "Indexer context_shard requires the 16x128 FP8-query Indexer and CUDA SM80+ TP.");
@@ -733,8 +745,8 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
 #ifdef USE_CUDA
     const char *serving = std::getenv("FASTLLM_CUDA_SERVING_WARMUP");
     if ((!pdPrefillLimits.chunk && (!serving || std::string(serving) != "1" || !draftEnabled)) || !tpPrepared ||
-        tpDevices.size() <= 1 || !tpKVPool.empty()) return;
-    const int batch = maxBatch > 0 ? maxBatch : 512;
+        tpDevices.empty() || !tpKVPool.empty()) return;
+    const int batch = maxBatch > 0 ? maxBatch : (tpDevices.size() == 1 ? 1 : 512);
     const int contextLimit = contextPlan.effectiveLength > 0 ? std::min(max_positions, contextPlan.effectiveLength) : max_positions;
     const int chunk = std::max(1, std::min(contextLimit, GetChunkedPrefillSize()));
     const int verifyRows = std::max(1, draftTokens + 1);
@@ -969,13 +981,13 @@ std::vector<int> NaiveN05FlashModel::LocalServingGraphBuckets(int maxRequests) c
 void NaiveN05FlashModel::PrepareTensorParallelVerification() {
 #ifdef USE_CUDA
     if (!preparingGraphs || !draftEnabled || !GetFastllmEnv().cudaGraph || !tpPrepared ||
-        tpDevices.size() <= 1 || !tpSwaRingCache) return;
+        tpDevices.empty() || !tpSwaRingCache) return;
     for (auto &graph : tpBatchVerifyGraphs) graph->ClearGraphs();
     tpBatchVerifyGraphs.clear(); tpBatchVerifyState.reset(); tpVerifyState.reset();
     const int steps = std::min(8, draftTokens + 1);
     const int backendRequests = tpExperts && tpExperts->UpdatesResidual()
         ? std::max(1, 8 / steps) : (tpEp8MegaState || (tpExperts && tpExperts->AllowsLargeBatch())) ? MaxTPDecodeBatch : 8;
-    const int requests = std::min(maxBatch > 0 ? maxBatch : 256, backendRequests);
+    const int requests = std::min(maxBatch > 0 ? maxBatch : (tpDevices.size() == 1 ? 1 : 256), backendRequests);
     // Verification cannot invent inactive requests: prepare exact small
     // request counts, including the 5/6/7-request tails of an eight-way batch.
     auto batches = DecodeGraphBatchBuckets(requests, 8, 8);
@@ -2227,7 +2239,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     const int ranks = tpDevices.size();
     // Retain the existing FlashInfer path on larger shards until a graph-safe
     // dynamic-length equivalent is available.
-    if (sliding.heads / ranks >= 64 && sliding.heads / sliding.kvHeads == 8 &&
+    if (ranks > 1 && sliding.heads / ranks >= 64 && sliding.heads / sliding.kvHeads == 8 &&
         window == 128 && sliding.headDim == 192 && sliding.valueDim == 128)
         return false;
     bool dynamicCache = !attentionParallel && verifying && batch && tpSwaRingCache &&
@@ -3349,7 +3361,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     const int swaHeads = sliding.heads / tpDevices.size();
     const int swaKvHeads = std::max(1, sliding.kvHeads / (int)tpDevices.size());
     const bool eagerRingVerify = verify && window == 128 && sliding.headDim == 192 &&
-        sliding.valueDim == 128 && (swaHeads < 64 || swaHeads / swaKvHeads != 8) &&
+        sliding.valueDim == 128 && (tpDevices.size() == 1 || swaHeads < 64 || swaHeads / swaKvHeads != 8) &&
         (batch ? std::all_of(batch->lengths.begin(), batch->lengths.end(),
             [](int count) { return count > 0 && count <= 8; }) : rows > 0 && rows <= 8);
     bool ringVerify = verify && tpSwaRingCache && (graphDecode || eagerRingVerify);

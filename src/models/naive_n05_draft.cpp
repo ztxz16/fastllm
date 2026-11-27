@@ -596,7 +596,7 @@ Data &NaiveN05FlashModel::DraftWeight(const std::string &name) {
 Data NaiveN05FlashModel::RunDraftTarget(const Data &inputIds, const Data &positions,
         std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
         TargetCapture &capture, const TargetBatch *batch) {
-    if (!batch && capture.verifying && tpDevices.size() > 1 && tpSwaRingCache) {
+    if (!batch && capture.verifying && !tpDevices.empty() && tpSwaRingCache) {
         std::vector<std::pair<Data *, Data *>> caches;
         for (auto &pair : kv) caches.emplace_back(&pair.first, &pair.second);
         std::vector<GenerationConfig> configs{config};
