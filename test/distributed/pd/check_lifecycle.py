@@ -88,6 +88,9 @@ def control_case(args, name, stage):
                 raise AssertionError("rejected request changed target records")
             return dict(rejected=True, target_unchanged=True)
         invoke(args, args.prefill, "/internal/announce", pbody)
+        if stage != "announce_only":
+            paired = invoke(args, args.prefill, "/internal/pair", dict(pbody, source_url=args.prefill))
+            pbody["pair"] = dbody["pair"] = paired["pair"]
         if stage == "source_ready":
             invoke(args, args.prefill, "/internal/prefill", pbody)
         elif stage == "target_ready":

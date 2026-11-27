@@ -168,6 +168,7 @@ void BindServiceOutput(Handlers &h) {
                 requests.append(
                     D("request"_a = get(get(r, "identity"), "request"),
                       "transfer"_a = get(get(r, "identity"), "transfer"),
+                      "pair"_a = get(r, "pair"),
                       "local_reused"_a = get(r, "local_reused"), "remote_reused"_a = get(r, "remote_reused"),
                       "prefill_done"_a = get(r, "prefill_done"), "completed"_a = get(r, "complete"),
                       "released"_a = get(r, "released"), "error"_a = get(r, "error")));

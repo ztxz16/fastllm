@@ -60,6 +60,9 @@ class Record:
     history_active: bool = False
     local_reused: int = 0
     remote_reused: int = 0
+    pair: object = None
+    pair_source_url: str = ""
+    pair_lock: object = field(default_factory=threading.RLock)
 
 
 class Service:
@@ -91,8 +94,17 @@ class Service:
     def _new(self, body):
         return _core.invoke('service.Service._new', locals())
 
-    def _select_replica(self, record):
+    def _select_replica(self, record, candidates=None):
         return _core.invoke('service.Service._select_replica', locals())
+
+    def topology(self, body):
+        return _core.invoke('service.Service.topology', locals())
+
+    def pair(self, body):
+        return _core.invoke('service.Service.pair', locals())
+
+    def reserve(self, body):
+        return _core.invoke('service.Service.reserve', locals())
 
     def create(self, body):
         return _core.invoke('service.Service.create', locals())
@@ -203,6 +215,12 @@ def serve(service, host, port):
                 body = json.loads(self.rfile.read(size))
                 if self.path == "/internal/handshake":
                     return self._send(service.handshake(body))
+                if self.path == "/internal/topology":
+                    return self._send(service.topology(body))
+                if self.path == "/internal/pair":
+                    return self._send(service.pair(body))
+                if self.path == "/internal/reserve":
+                    return self._send(service.reserve(body))
                 if self.path == "/internal/full":
                     identity = identity_from(body["identity"])
                     iterator = service.generate_full(body)
