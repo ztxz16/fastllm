@@ -46,13 +46,16 @@ NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, in
         plan.replicaArch = FastllmCudaRuntimeArch();
         plan.replicaLocalDsa = localDsa && (plan.replicaArch == 90 || plan.replicaArch == 103 || plan.replicaArch == 120);
     }
-#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
-    const bool hopper = FastllmCudaRuntimeArch() == 90;
+    const int arch = FastllmCudaRuntimeArch();
     const bool index = indexHeads == 16 && indexDim == 128 && topK == 2048;
+    if (arch == 103 && index && capacity > topK && rows > 0 && rows <= 256)
+        plan.packedIndexer = !requests || std::all_of(requests->begin(), requests->end(), [](int n){return n > 0 && n <= 8;});
+#ifdef FASTLLM_ENABLE_NAIVE_HOPPER_VERIFY
+    const bool hopper = arch == 90;
     // Independent attention ranks project the padded verification group in one GEMM.
     // Their local Q and head weights are consumed even in the short-context buckets.
-    plan.packedIndexer = hopper && index && !requests && !integratedExperts &&
-                         capacity > 0 && rows > 0 && rows <= 256;
+    if (hopper)
+        plan.packedIndexer = index && !requests && !integratedExperts && capacity > 0 && rows > 0 && rows <= 256;
     // Hopper TP attention materializes its residual independently of the expert layout.
     if (requests && hopper && !requests->empty() &&
         std::all_of(requests->begin(), requests->end(), [](int n) { return n > 0; })) {
@@ -108,7 +111,7 @@ void RunContextVerifyIndexer(const Data &query, const Data &weights,
     // including ranks whose final page is empty during replay.
     const int width = ranks > 0 && page > 0 ? ContextCandidateWidth(capacity, page, ranks) : 0;
     const bool hopper = FastllmCudaNaiveHopperGroup(devices);
-    const int directWidth = (hopper ? (width < 2048 || rows < 16) : rows == 8) && ranks == 8 && page > 0 && page % ranks == 0 &&
+    const int directWidth = (hopper ? (width < 2048 || rows < 16) : (rows > 0 && rows <= 8)) && ranks == 8 && page > 0 && page % ranks == 0 &&
         (hopper || capacity <= 2048 * ranks) && (hopper || FastllmCudaNaiveIndexerContextSupported(devices, true))
         ? width : 0;
     const int rowWords = (directWidth ? directWidth : 2048) * 2, part = rows * rowWords;

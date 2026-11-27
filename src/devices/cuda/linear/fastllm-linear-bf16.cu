@@ -1263,7 +1263,8 @@ bool IndexerWeightLayout(const fastllm::Data &wq, const fastllm::Data &wk,
             part.strides.size() != 2 || part.strides[0] != kIndexerInput || part.strides[1] != 1 ||
             part.dataDeviceIds != wq.dataDeviceIds) return false;
     }
-    return FastllmCudaRuntimeArch() == 90;
+    const int arch = FastllmCudaRuntimeArch();
+    return arch == 90 || arch == 103;
 }
 
 bool IndexerWeightsPacked(const fastllm::Data &wq, const fastllm::Data &wk,
@@ -1474,7 +1475,9 @@ bool FastllmCudaIndexerProjection(const fastllm::Data &input,
         FastllmGemvBf16Bf16WarpRows<kIndexerInput, 2, true><<<(kIndexerQKW + 3) / 4, 128>>>(x, w, q, nullptr, kIndexerQKW, k, s);
     } else {
         prepare(scratch, kIndexerQKW);
-        ProjectIndexerRows(input, wq, rows, scratch.cudaData);
+        if (rows <= 64 || rows > 128 || FastllmCudaRuntimeArch() != 103 ||
+            !ProjectWideVerifyIndexer(rows, input, wq, scratch.cudaData))
+            ProjectIndexerRows(input, wq, rows, scratch.cudaData);
         IndexerProjectionUnpack<<<(rows * kIndexerQKW + 255) / 256, 256>>>(
             (const __nv_bfloat16 *)scratch.cudaData, q, k, s, rows);
     }

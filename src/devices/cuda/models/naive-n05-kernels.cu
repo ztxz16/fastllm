@@ -7154,8 +7154,14 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
 #endif
     for (int first = 0; first < (int)rows.size();) {
 #if defined(FASTLLM_ENABLE_NAIVE_INDEXER_SM100) && CUDART_VERSION >= 12040
-        const int wideCount = std::min(sm::VerifyLimit, (int)rows.size() - first) / sm::VerifyQueries * sm::VerifyQueries;
-        if (wideVerify && wideCount >= sm::BatchLimit && tryWideVerify(first, wideCount)) {
+        int wideCount = std::min(sm::VerifyLimit, (int)rows.size() - first) / sm::VerifyQueries * sm::VerifyQueries;
+        // A ragged tail or a smaller resident grid can still use the original
+        // verification tiles when the full group cannot share a launch.
+        while (wideVerify && wideCount >= sm::BatchLimit && !tryWideVerify(first, wideCount)) {
+            wideCount = wideCount > 2 * sm::BatchLimit ? 2 * sm::BatchLimit :
+                        wideCount > sm::BatchLimit ? sm::BatchLimit : 0;
+        }
+        if (wideVerify && wideCount >= sm::BatchLimit) {
             first += wideCount;
             continue;
         }

@@ -48,9 +48,9 @@ __global__ void ToDouble(const BF *input, double *output, int count, bool absolu
 int main() {
     try {
         FastllmCudaSetDevice(0);
-        if (FastllmCudaRuntimeArch() != 90) {
-            std::cout << "SKIP: Hopper Indexer projection" << std::endl;
-            return 0;
+        if (FastllmCudaRuntimeArch() != 90 && FastllmCudaRuntimeArch() != 103) {
+            std::cout << "SKIP: packed Indexer projection unsupported" << std::endl;
+            return 77;
         }
         Data wq(BFLOAT16), wk(BFLOAT16), ws(BFLOAT16);
         std::vector<uint16_t> original;
@@ -109,7 +109,7 @@ int main() {
         auto handle = getFastllmCublasHandle();
         std::shared_ptr<void> lease;
         FastllmCudaLinearGraphScope scope(lease);
-        std::vector<int> batches{256, 128, 64, 32, 16, 8, 7, 6, 5, 4, 3, 2, 1};
+        std::vector<int> batches{256, 129, 128, 127, 96, 65, 64, 32, 16, 8, 7, 6, 5, 4, 3, 2, 1};
         std::vector<cudaGraphExec_t> graphs;
         for (int rows : batches) {
             input.Resize({1, rows, 4096});

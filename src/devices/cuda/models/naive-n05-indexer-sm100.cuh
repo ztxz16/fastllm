@@ -19,7 +19,7 @@ struct Row {
 constexpr int BatchLimit = 128;
 // Each verification group shares a KV view and its replay binding. Lengths, Q and outputs are per row.
 constexpr int VerifyQueries = 4;
-constexpr int VerifyLimit = 256;
+constexpr int VerifyLimit = 512;
 struct VerifyBatch { Row rows[VerifyLimit]; };
 } // namespace naive_indexer_sm100
 bool FastllmCudaNaiveIndexerSm100(const naive_indexer_sm100::Row *rows, int count, int capacity,

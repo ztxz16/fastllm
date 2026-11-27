@@ -11,9 +11,40 @@
 #include <algorithm>
 #include <map>
 namespace naive_indexer_sm100 {
-template<int Queries>
-struct TmaBatch {
-    Row rows[Queries == 1 ? BatchLimit : VerifyLimit];
+// A verify CTA shares one KV binding across four queries. Only the length,
+// query, weights index and destinations vary within the group.
+struct VerifyKey {
+    FastllmNaiveKV key;
+    const void *const *cache;
+    int stride;
+};
+struct VerifyQuery {
+    const int *live;
+    __nv_bfloat16 *query;
+    float *scale;
+    unsigned *scores;
+    int sequence;
+    __device__ int Count() const { return *live; }
+};
+template<int Queries> struct ScoreRows {
+    Row rows[BatchLimit];
+    __device__ Row Key(int owner) const { return rows[owner]; }
+    void Bind(const Row *source, int count) { std::copy_n(source, count, rows); }
+};
+template<> struct ScoreRows<VerifyQueries> {
+    VerifyQuery rows[VerifyLimit];
+    VerifyKey owners[VerifyLimit / VerifyQueries];
+    __device__ VerifyKey Key(int owner) const { return owners[owner]; }
+    void Bind(const Row *source, int count) {
+        for (int i = 0; i < count; ++i) {
+            const auto &r = source[i];
+            rows[i] = {r.live, r.query, r.scale, r.scores, r.sequence};
+            if (i % VerifyQueries == 0) owners[i / VerifyQueries] = {r.key, r.cache, r.stride};
+        }
+    }
+};
+template<int Queries> struct TmaBatch {
+    ScoreRows<Queries> bindings;
     CUtensorMap map, scaleMap;
     const void *base;
     int rowBytes;
@@ -38,7 +69,7 @@ __device__ void LoadVector(void *dst, const void *src, bool valid) {
                  "r"(valid ? 16 : 0)
                  : "memory");
 }
-__device__ void load_tma(const Row &r, int first, unsigned char *out, const CUtensorMap *map,
+template<class Key> __device__ void load_tma(const Key &r, int first, unsigned char *out, const CUtensorMap *map,
                          const CUtensorMap *scaleMap, void *scales, uint64_t *barrier) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     if (threadIdx.x == 0) {
@@ -82,10 +113,10 @@ __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
         stripe = schedule[blockIdx.x];
         if (stripe.owner < 0) return;
     }
-    const Row *rows = batch.rows + stripe.owner * Queries;
-    auto r = rows[0];
+    const auto *rows = batch.bindings.rows + stripe.owner * Queries;
+    auto r = batch.bindings.Key(stripe.owner);
     r.key.Bind(r.cache);
-    const int begin = r.Begin() + stripe.offset * 128, step = stripe.stride * 128;
+    const int begin = stripe.offset * 128, step = stripe.stride * 128;
     int lengths[Queries], end = 0;
 #pragma unroll
     for (int j = 0; j < Queries; ++j) {
@@ -107,7 +138,7 @@ __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
     __shared__ uint64_t fullK[Stages], emptyK[Stages], fullC[Outputs], emptyC[Outputs];
     bool tma = r.key.base == batch.base && r.key.scaledIndexer == batch.scaled &&
                r.stride * (r.key.fp8 ? 1 : 2) == batch.rowBytes && r.key.pages && r.key.pageLen % 128 == 0 &&
-               r.Begin() % 128 == 0 && r.key.offset == 0;
+               r.key.offset == 0;
     if (warp == 0) {
         cute::TMEM::Allocator1Sm a;
         a.allocate(Outputs * Queries * 16, &tmem);
@@ -285,7 +316,7 @@ __global__ void PrepareVerify(const __grid_constant__ TmaBatch<VerifyQueries> ba
                               const __nv_bfloat16 *input, int owners, int blocks, int uniformStripes,
                               VerifyStripe *schedule) {
     if (blockIdx.y) {
-        const Row &r = batch.rows[blockIdx.y - 1];
+        const auto &r = batch.bindings.rows[blockIdx.y - 1];
         if (*r.live > 0) PackHead(input + size_t(r.sequence) * 16 * 128, reinterpret_cast<unsigned *>(r.query),
                                    r.scale, blockIdx.x * 8 + threadIdx.x / 32);
         return;
@@ -294,7 +325,7 @@ __global__ void PrepareVerify(const __grid_constant__ TmaBatch<VerifyQueries> ba
     const int t = threadIdx.x;
     int tiles = 0;
     if (t < owners) {
-        for (int j = 0; j < VerifyQueries; ++j) tiles = max(tiles, batch.rows[t * VerifyQueries + j].Count());
+        for (int j = 0; j < VerifyQueries; ++j) tiles = max(tiles, batch.bindings.rows[t * VerifyQueries + j].Count());
         tiles = (tiles + 127) / 128;
     }
     __shared__ int firstLength;
@@ -489,7 +520,7 @@ bool Score(const Row *rows, int count, int capacity, const __nv_bfloat16 *weight
         cached.scaleMap = scaleMap;
     }
     TmaBatch<Queries> batch{};
-    std::copy(rows, rows + count, batch.rows);
+    batch.bindings.Bind(rows, count);
     batch.map = cached.map;
     batch.scaleMap = cached.scaleMap;
     batch.base = rows[0].key.base;

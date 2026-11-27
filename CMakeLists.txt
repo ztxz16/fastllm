@@ -4096,6 +4096,12 @@ if (UNIT_TEST)
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 90
             PASS_REGULAR_EXPRESSION "PASS norm linear Data adapter")
 
+        add_executable(cuda_indexer_projection_test test/basic/test_cuda_indexer_projection.cu)
+        target_link_libraries(cuda_indexer_projection_test PRIVATE fastllm)
+        set_target_properties(cuda_indexer_projection_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_indexer_projection COMMAND cuda_indexer_projection_test)
+        set_tests_properties(cuda_indexer_projection PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
         add_executable(cuda_decode_dense_adapter_test test/basic/test_cuda_decode_dense_adapter.cu)
         if ("src/devices/cuda/models/naive-n05-dense-sm90.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES)
             target_compile_definitions(cuda_decode_dense_adapter_test PRIVATE FASTLLM_ENABLE_NAIVE_DENSE_SM90)
