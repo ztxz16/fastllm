@@ -1107,7 +1107,8 @@ static inline __m128i get_scale_shuffle(int i) {
 }
 #endif
 
-#ifdef __AVX2__
+#ifdef __AVX__
+// These reductions also serve the AVX-only quantization paths.
 // horizontally add 8 int32_t
 static inline int hsum_i32_8(const __m256i a) {
     const __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extractf128_si256(a, 1));
@@ -1134,6 +1135,21 @@ static inline float hsum_float_8(const __m256 x) {
 }
 #endif
 
+#if defined(__AVX__) && !defined(__AVX2__)
+static inline int hsum_i32_4(const __m128i x) {
+    const __m128i sum64 = _mm_add_epi32(x, _mm_unpackhi_epi64(x, x));
+    const __m128i sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(sum32);
+}
+
+static inline __m128i mul_add_epi8_sse(const __m128i x, const __m128i y) {
+    const __m128i ax = _mm_sign_epi8(x, x);
+    const __m128i sy = _mm_sign_epi8(y, x);
+    return _mm_maddubs_epi16(ax, sy);
+}
+#endif
+
+#ifdef __AVX2__
 // spread 32 bits to 32 bytes { 0x00, 0xFF }
 static inline __m256i bytes_from_bits_32(const uint8_t * x) {
     uint32_t x32;
@@ -1178,6 +1194,49 @@ static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     const __m256i sy = _mm256_sign_epi8(y, x);
     return mul_sum_us8_pairs_float(ax, sy);
 }
+#elif defined(__AVX__)
+// AVX has 256-bit loads and floating-point arithmetic, but integer arithmetic
+// must operate on the two 128-bit halves until AVX2 is available.
+static inline __m256i bytes_from_bits_32(const uint8_t * x) {
+    uint32_t bits;
+    memcpy(&bits, x, sizeof(bits));
+    const __m128i source = _mm_set1_epi32(bits);
+    const __m128i bit_mask = _mm_set1_epi64x(0x7fbfdfeff7fbfdfe);
+    const __m128i ones = _mm_set1_epi8(-1);
+    const __m128i lo = _mm_shuffle_epi8(source,
+        _mm_set_epi64x(0x0101010101010101, 0x0000000000000000));
+    const __m128i hi = _mm_shuffle_epi8(source,
+        _mm_set_epi64x(0x0303030303030303, 0x0202020202020202));
+    return MM256_SET_M128I(_mm_cmpeq_epi8(_mm_or_si128(hi, bit_mask), ones),
+                          _mm_cmpeq_epi8(_mm_or_si128(lo, bit_mask), ones));
+}
+
+static inline __m256i bytes_from_nibbles_32(const uint8_t * x) {
+    const __m128i packed = _mm_loadu_si128((const __m128i *)x);
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    return MM256_SET_M128I(_mm_and_si128(_mm_srli_epi16(packed, 4), mask),
+                          _mm_and_si128(packed, mask));
+}
+
+static inline __m256 sum_i16_pairs_float(const __m256i x) {
+    const __m128i ones = _mm_set1_epi16(1);
+    const __m128 lo = _mm_cvtepi32_ps(_mm_madd_epi16(_mm256_castsi256_si128(x), ones));
+    const __m128 hi = _mm_cvtepi32_ps(_mm_madd_epi16(_mm256_extractf128_si256(x, 1), ones));
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
+}
+
+static inline __m256 mul_sum_us8_pairs_float(const __m256i x, const __m256i y) {
+    const __m128i lo = _mm_maddubs_epi16(_mm256_castsi256_si128(x), _mm256_castsi256_si128(y));
+    const __m128i hi = _mm_maddubs_epi16(_mm256_extractf128_si256(x, 1), _mm256_extractf128_si256(y, 1));
+    return sum_i16_pairs_float(MM256_SET_M128I(hi, lo));
+}
+
+static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
+    const __m128i lo = mul_add_epi8_sse(_mm256_castsi256_si128(x), _mm256_castsi256_si128(y));
+    const __m128i hi = mul_add_epi8_sse(_mm256_extractf128_si256(x, 1), _mm256_extractf128_si256(y, 1));
+    return sum_i16_pairs_float(MM256_SET_M128I(hi, lo));
+}
+#endif
 
 #define MAX(a, b) (a) > (b) ? (a) : (b)
 #define MIN(a, b) (a) < (b) ? (a) : (b)

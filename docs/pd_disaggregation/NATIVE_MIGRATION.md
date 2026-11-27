@@ -50,12 +50,32 @@ CMake 至少 3.18，pybind11 头文件可来自已有子模块或所选 Python �
 
 ```bash
 cd /home/project/vllm_fastllm
-cmake -S . -B build-process-tp -DUSE_CUDA=ON -DBUILD_PROCESS_TP=ON -DCUDA_ARCH=70
+cmake -S . -B build-process-tp -DUSE_CUDA=ON -DBUILD_PROCESS_TP=ON -DCUDA_ARCH=70 -DMAKE_WHL_X86=OFF
 cmake --build build-process-tp --target fastllm_pd_core fastllm_tp_generate fastllm_moe_generate fastllm_tp_worker -j 4
 ```
 
 这里 `70` 对应当前验证服务器的 V100；其他服务器沿用各自 GPU 架构配置。
-这次迁移不修改第三方源码，也不声称解决此前第三方 CPU SIMD 编译问题。
+PD 核心迁移本身不解决第三方 CPU SIMD 编译问题；后续完整组件升级单独记录如下。
+
+### 2026-11-27：GGUF 完整组件升级与 CPU 指令集适配
+
+将 FastLLM 上游的整个 `third_party/gguf/` 兼容组件固定到提交
+`e33b3cb795119e9d0b00d65b9c9991c4ca054483`：全部 7 个文件保持上游原样，
+相对升级前有 4 个文件变化，3 个文件本来就一致；公共头文件未变。
+此前仅替换两个文件的尝试已撤销，本次按完整子树重新导入。
+此组件整合 llama.cpp 与 ik_llama.cpp，不表示这两个原始仓库已整体升级。
+
+| 模块 | 实现语言/技术 | 本次变化 |
+| --- | --- | --- |
+| 上游 GGUF 组件 | C++、CPU SIMD | 完整版本升级，包含 AVX/IQK 修复及元数据读取、反量化和模型映射变化 |
+| FT CPU 算子适配 | C++ 条件编译 | 位于 `src/devices/cpu/cpudevice.cpp`；两处 FP16 转换要求 F16C，BF16 SIMD 转换要求 AVX2；函数体、MSVC 约定与标量路径保留 |
+| 版本管理与校验 | JSON、Python 标准库 | 位于 `tools/third_party/`，记录固定提交、完整文件清单及哈希；不参与推理，不触发编译 |
+
+版本来源、升级流程、兼容边界和校验命令见[第三方版本记录](../../tools/third_party/README.md)。
+已 Review 调用兼容性并直接对照上游全部文件与 Git tree；完整性静态检查通过。
+未本地编译或执行模型/数值回归；GGUF 兼容问题仍待服务器验收，不能用文件一致性代替构建通过。
+服务器 CPU 指令集与 `CUDA_ARCH=70` 指定的 V100 GPU 架构分别处理；
+不强制添加 CPU 不支持的 AVX2/FMA，也不宣称已补齐所有 IQ 格式的无 AVX2 点积能力。
 
 构建后逐阶段后台验收，每次检查运行目录的 `exit_code` 和汇总报告：
 

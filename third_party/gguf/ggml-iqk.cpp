@@ -501,7 +501,7 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
         return nullptr;
     }
 }
-#else
+#elif defined(__AVX2__) && ((defined(__FMA__) && defined(__F16C__)) || defined(_MSC_VER))
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 
@@ -2001,4 +2001,14 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
     }
 }
 
-#endif // #ifdef __aarch64__ else ...
+#else
+// Keep the original GGUF layout when the repacked kernels are unavailable.
+// The caller then uses the ordinary quantized dot-product implementation.
+const Repack * get_repack_info(ggml_type type) {
+    return nullptr;
+}
+
+mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
+    return nullptr;
+}
+#endif // architecture-specific repacked kernels

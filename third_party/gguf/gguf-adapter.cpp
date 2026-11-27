@@ -109,6 +109,179 @@ namespace fastllm {
                 }
             },
             {
+                "qwen3_5",
+                {
+                    // UD quants intentionally assign different GGML types to
+                    // Q, K and V.  Keep those packed types: Qwen3.5's CUDA
+                    // path can execute the three projections separately when
+                    // the loader cannot form a homogeneous merged tensor.
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_(q|k|v)\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.$2_proj.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_(q|k|v)\.bias$)"),
+                        "model.language_model.layers.$1.self_attn.$2_proj.bias"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_(q|k)_norm\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.$2_norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_output\.(weight|bias)$)"),
+                        "model.language_model.layers.$1.self_attn.o_proj.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)\.(weight|bias)$)"),
+                        "model.language_model.layers.$1.mlp.$2_proj.$3"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_norm\.weight$)"),
+                        "model.language_model.layers.$1.input_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.post_attention_norm\.weight$)"),
+                        "model.language_model.layers.$1.post_attention_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^token_embd\.weight$)"),
+                        "model.language_model.embed_tokens.weight",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^output\.weight$)"),
+                        "lm_head.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^output_norm\.weight$)"),
+                        "model.language_model.norm.weight"
+                    ),
+
+                    // Qwen3.5 GDN.  Keep heterogeneous qkv/z weights quantized;
+                    // the CUDA forward path falls back to two packed GGUF
+                    // projections when they cannot be merged losslessly.
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_qkv\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_qkv.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_gate\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_z.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_beta\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_b.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_alpha\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_a.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_conv1d\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.conv1d.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_a$)"),
+                        "model.language_model.layers.$1.linear_attn.A_log"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_dt\.bias$)"),
+                        "model.language_model.layers.$1.linear_attn.dt_bias"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_norm\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_out\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.out_proj.weight"
+                    ),
+
+                    // Qwen3.5 GGUF stores the MTP input projection and norms
+                    // under the optional NextN block.  The surrounding
+                    // transformer weights use the ordinary blk.N names and are
+                    // remapped relative to the main-layer count by the GGUF
+                    // loader.
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\.eh_proj\.weight$)"),
+                        "mtp.fc.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\.enorm\.weight$)"),
+                        "mtp.pre_fc_norm_embedding.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\.hnorm\.weight$)"),
+                        "mtp.pre_fc_norm_hidden.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\.shared_head_norm\.weight$)"),
+                        "mtp.norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\..*$)"),
+                        "ignore"
+                    )
+                }
+            },
+            {
+                "qwen3_5_mmproj",
+                {
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.attn_qkv\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.attn.qkv.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.attn_out\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.attn.proj.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.ffn_up\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.mlp.linear_fc1.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.ffn_down\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.mlp.linear_fc2.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.ln1\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.norm1.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.ln2\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.norm2.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.post_ln\.(weight|bias)$)"),
+                        "model.visual.merger.norm.$1"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^mm\.0\.(weight|bias)$)"),
+                        "model.visual.merger.linear_fc1.$1"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^mm\.2\.(weight|bias)$)"),
+                        "model.visual.merger.linear_fc2.$1"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.position_embd\.weight$)"),
+                        "model.visual.pos_embed.weight"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.patch_embd\.bias$)"),
+                        "model.visual.patch_embed.proj.bias"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.patch_embd\.weight\.1$)"),
+                        "model.visual.patch_embed.proj.weight.gguf_part1"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.patch_embd\.weight$)"),
+                        "model.visual.patch_embed.proj.weight.gguf_part0"
+                    )
+                }
+            },
+            {
                 "deepseek_v2", 
                 {
                     GGUFWeightReplaceRule (
@@ -354,6 +527,7 @@ namespace fastllm {
 
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > archRulesDict = {
             {"qwen2", originalArchRulesDict["default"]},
+            {"qwen35", originalArchRulesDict["qwen3_5"]},
             {"kimi_k2", originalArchRulesDict["deepseek_v2"]},
         };
 
