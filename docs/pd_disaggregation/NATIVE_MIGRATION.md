@@ -77,6 +77,19 @@ PD 核心迁移本身不解决第三方 CPU SIMD 编译问题；后续完整组�
 服务器 CPU 指令集与 `CUDA_ARCH=70` 指定的 V100 GPU 架构分别处理；
 不强制添加 CPU 不支持的 AVX2/FMA，也不宣称已补齐所有 IQ 格式的无 AVX2 点积能力。
 
+### 2026-11-27：FlashInfer 与 CCCL 依赖配套
+
+服务器继续编译时在 FlashInfer 采样头文件中报 `cuda::maximum/minimum` 不存在，
+原因是 CUDA 12.6 配套头文件缺少这些新版接口；当前快速除法封装也需要新版 CCCL。
+FT 通过 CMake 接入当前 FlashInfer 上游使用的 CCCL v3.3.2 完整固定提交，
+同时选择其 CUB、Thrust 和 libcudacxx。依赖存放在构建目录，第三方源码保持原样。
+现有 Toolkit 头文件已具备所需接口时直接使用；默认缺少接口时通过 Git 获取，
+离线环境可通过 `FASTLLM_CCCL_ROOT` 指定同一提交的完整干净 checkout。
+
+依赖选择由 CMake/Git 实现，CCCL 为 CUDA C++ 头文件库；FT 的 CUDA C++ 推理调用不变。
+版本、离线配置与兼容边界见[CCCL 依赖说明](../../tools/third_party/README.md#flashinfer-的-cccl-构建依赖2026-11-27)。
+已完成 Review 和静态检查，未本地运行 CMake、编译或 GPU 验收；服务器复用上方前台构建命令。
+
 构建后逐阶段后台验收，每次检查运行目录的 `exit_code` 和汇总报告：
 
 ```bash
