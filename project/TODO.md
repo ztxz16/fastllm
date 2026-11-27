@@ -382,7 +382,10 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   完成事件由 C++ 直接调用 CUDA Runtime；复用现有模型和算子。
   Python 保留 CLI、HTTP/Tokenizer、数据对象、原生接口及结果迭代器适配，测试与报告保留 Python。
   新增 `fastllm_pd_core` 构建/打包入口，旧 Python 核心实现不作为回退。
-  实现：迁移代码已接入；静态 review 与接口检查已执行，尚未本地或服务器编译。
+  实现：迁移代码已接入；静态 review 与接口检查已执行，本地未编译。
+  2026-11-27 服务器构建在 `pd_tasks.cpp` 的 `py::float_(0)` 处失败：整数参数同时匹配
+  float/double 构造函数。已将传输计时默认值和副本 KV 使用率初始值两处统一改为
+  `py::float_(0.0)`；已复查其余同类调用，待服务器重新编译验证。
   验证：尚未执行迁移后的协议、Router、GPU IPC、模型生成及生命周期回归，不标记验收成功。
   下一步：服务器构建原生扩展和执行器，按原有测试矩阵重新验收。
   模块、语言边界及命令见[原生迁移记录](../docs/pd_disaggregation/NATIVE_MIGRATION.md)。
