@@ -3914,9 +3914,14 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
 }
 
 void NaiveN05FlashModel::RunDraftHead(Data &hidden, Data &output) {
-    if (tpDevices.empty()) {
-        if (hidden.dims[1] > 1) MatMulTransB(hidden, weight["lm_head.weight"], output);
-        else Linear(hidden, weight["lm_head.weight"], Data(), output);
+#ifdef USE_CUDA
+    // The generic head shares its staging buffers with the sharded DP projection.
+    if (CanShardDraftHead()) JoinDraftHeadLookahead();
+#endif
+    if (tpDevices.size() <= 1) {
+        Data &head = DraftWeight("lm_head.weight");
+        if (hidden.dims[1] > 1) MatMulTransB(hidden, head, output);
+        else Linear(hidden, head, Data(), output);
         return;
     }
 #ifdef USE_CUDA

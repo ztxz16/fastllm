@@ -2440,7 +2440,9 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
             if (initializing) FastllmCudaSyncCurrentThreadStream();
             return;
         }
-        if (sharded) for (int peer = 0; peer < ranks; ++peer) if (peer != rank)
+        const void *gathered = headShards.gatheredBuffers.empty() ? nullptr : headShards.gatheredBuffers[rank];
+        if (gathered) FastllmCudaCurrentThreadStreamWaitEvent(draftBatchStorage->tpRanks[rank]->gatheredHeadReady);
+        else if (sharded) for (int peer = 0; peer < ranks; ++peer) if (peer != rank || !headShards.gatheredBuffers.empty())
             FastllmCudaCurrentThreadStreamWaitEvent(draftBatchStorage->tpRanks[peer]->done);
         std::vector<int> sourceRows;
         if (sharded) sourceRows.reserve(groups[rank].size() * size_t(steps));
@@ -2456,7 +2458,7 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
         Data &input = fixed ? storage.sampling.verifyProposal : storage.samplingInput;
         Data local;
         local.FakeFrom(input, 0); local.dataType = BFLOAT16; local.UpdateUnitSize(); local.Resize({1, rows, vocab});
-        if (sharded && !headShards.ownerLogits && !FastllmCudaNaiveGatherDraftLogits(shards, tpDevices, total, sourceRows, local)) {
+        if (sharded && !headShards.ownerLogits && gathered != local.cudaData && !FastllmCudaNaiveGatherDraftLogits(shards, tpDevices, total, sourceRows, local)) {
             // Unequal vocabulary shards and wider topologies keep the pitched copies.
             std::vector<void *> dst;
             std::vector<const void *> src;
@@ -3422,8 +3424,10 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             auto &r = *rounds[i];
             if (!r.greedy && r.samplingRank >= 0 && r.samplingRank == r.context.deviceRank &&
                 feature.targetCommit && feature.targetRows > kFastllmMtpSmallRejectionMaxBatch &&
-                r.oldLength == r.context.committed && feature.device == tpDevices.at(r.samplingRank))
+                r.oldLength == r.context.committed && feature.device == tpDevices.at(r.samplingRank)) {
                 r.feature = feature;
+                r.bodyOwnerKey = caches[selected[i]];
+            }
         }
     }
     if (capture.packedRows.size() == rounds.size() && draftContextStorage && draftTP && draftTP->dataParallel &&

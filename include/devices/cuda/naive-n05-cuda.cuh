@@ -519,6 +519,7 @@ void FastllmCudaNaiveMergeVerifyIndexer(
     FastllmNaiveDecodeScratch &scratch, const fastllm::Data &liveKeys,
     const fastllm::Data &exchange, int contextRanks, int contextPageLen, int directWidth = 0);
 // Collective dispatch must agree across the entire TP group, including mixed GPUs.
+bool FastllmCudaNaiveBatchedDraftHeadGroup(const std::vector<int> &devices);
 bool FastllmCudaNaiveHopperGroup(const std::vector<int> &devices);
 bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices, bool requireSm120 = false);
 // Merge rank-major (score bits, logical position) pairs after an all-gather.

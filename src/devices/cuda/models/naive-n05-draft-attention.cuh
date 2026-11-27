@@ -182,18 +182,28 @@ struct ReplicaAttention {
         }
         __syncthreads();
     }
-    __device__ __forceinline__ static void Run(const Args &a, unsigned char *) {
+    template<bool Batched> __device__ __forceinline__ static void RunOwner(Args a) {
         using Op = ReplicaAttention;
         using BF = Op::BF;
         const auto grid = cooperative_groups::this_grid();
+        if constexpr (Batched) {
+            const int owner = blockIdx.y, first = owner * a.rows;
+            a.input += first * Width; a.raw += first * Packed;
+            a.attention += first * Width; a.output += first * Width; a.residual += first * Width;
+            a.positions += first; a.live += owner; a.binding += 2 * owner;
+            a.normScratch += first * (Width / 8);
+            const int maxSplits = (a.window - 1 + a.rows + Chunk - 1) / Chunk;
+            a.partials += size_t(first) * maxSplits * Heads * Stride;
+        }
         BF *key = (BF *)a.binding[0], *value = (BF *)a.binding[1];
-        if (!key || !value || *a.live < 1)
-            return; // Padding is uniform across the cooperative grid.
-        const int base = min(*a.live - 1, a.window - 1), splits = (base + a.rows + Op::Chunk - 1) / Op::Chunk;
+        const bool live = key && value && *a.live > 0;
+        if constexpr (!Batched) if (!live) return;
+        // An idle owner still participates in every cooperative grid barrier.
+        const int base = min(max(*a.live, 1) - 1, a.window - 1), splits = (base + a.rows + Op::Chunk - 1) / Op::Chunk;
         __shared__ __align__(16) unsigned char storage[sizeof(Op::Tile)];
         auto *partials = reinterpret_cast<float *>(storage);
         auto &sharedTile = *reinterpret_cast<Op::Tile *>(storage);
-        for (int tile = blockIdx.x; tile < Op::Packed / 16; tile += gridDim.x) {
+        for (int tile = blockIdx.x; live && tile < Op::Packed / 16; tile += gridDim.x) {
             float lo = 0, hi = 0;
             DraftReplicaProjection::DotTile<8 * Op::Width>(a.qkvWeight + size_t(tile) * 16 * Op::Width, a.input, a.rows,
                                                            tile, partials, lo, hi);
@@ -205,7 +215,7 @@ struct ReplicaAttention {
             __syncthreads();
         }
         // Reuse residual-norm scratch for RoPE until the O projection starts.
-        if (blockIdx.x < a.rows && threadIdx.x < 64) {
+        if (live && blockIdx.x < a.rows && threadIdx.x < 64) {
             const int d = threadIdx.x, r = blockIdx.x;
             BF *cs = reinterpret_cast<BF *>(a.normScratch) + r * 128;
             const float angle = a.positions[r] * powf(a.theta, -float(d) / 64.f);
@@ -213,13 +223,13 @@ struct ReplicaAttention {
             cs[d + 64] = __float2bfloat16_rn(sinf(angle));
         }
         grid.sync();
-        for (int task = blockIdx.x; task < splits * Op::Heads; task += gridDim.x)
+        for (int task = blockIdx.x; live && task < splits * Op::Heads; task += gridDim.x)
             Op::Attend(a, task, base, key, value, sharedTile);
         grid.sync();
-        for (int task = blockIdx.x; task < a.rows * Op::Heads; task += gridDim.x)
+        for (int task = blockIdx.x; live && task < a.rows * Op::Heads; task += gridDim.x)
             Op::Merge(a, task, splits);
         grid.sync();
-        for (int tile = blockIdx.x; tile < Op::Width / 16; tile += gridDim.x) {
+        for (int tile = blockIdx.x; live && tile < Op::Width / 16; tile += gridDim.x) {
             float lo = 0, hi = 0;
             DraftReplicaProjection::DotTile<8 * Op::Width>(a.oWeight + size_t(tile) * 16 * Op::Width, a.attention,
                                                            a.rows, tile, partials, lo, hi);
@@ -246,7 +256,11 @@ struct ReplicaAttention {
             __syncthreads();
         }
         grid.sync();
-        DraftReplicaProjection::Normalize(a.rows, a.residual, a.postNorm, a.eps, a.normScratch, a.output);
+        if (live) DraftReplicaProjection::Normalize(a.rows, a.residual, a.postNorm, a.eps, a.normScratch, a.output);
     }
+    __device__ static void Run(const Args &a, unsigned char *) { RunOwner<false>(a); }
+};
+struct ReplicaAttentionBatch : ReplicaAttention {
+    __device__ static void Run(const Args &a, unsigned char *) { RunOwner<true>(a); }
 };
 } // namespace fastllm_draft_fused

@@ -102,7 +102,7 @@ bool TryCudaDraftHead(const DraftProjectedHead &h, int steps) {
     const int device = h.base.dataDeviceIds.front(), vocab = h.base.dims.back();
     if (h.ids.dims.size() != 2) return false;
     const int rows = h.ids.dims[1];
-    if ((rows < 1 || rows > 8 || (rows > 1 && FastllmCudaRuntimeArch() != 90)) ||
+    if (rows < 1 || rows > 8 ||
         !Resident(h.base, device, BFLOAT16, {1, rows * steps, vocab}) ||
         !Resident(h.embedding, device, BFLOAT16, {vocab, 256}, 16) ||
         !Resident(h.projection, device, BFLOAT16, {vocab, 256}, 16) ||
@@ -141,10 +141,10 @@ bool TryCudaDraftMlp(const DraftLayerParallel &p, int requests, const Data &norm
     const auto &shape = normalized.dims;
     if (shape[1] < 1 || shape[1] > 16 || (shape[0] != 1 && shape[0] != requests)) return false;
     const int rows = shape[0] * shape[1];
-    const bool hopper = FastllmCudaRuntimeArch() == 90;
+    const int arch = FastllmCudaRuntimeArch();
     // A second 16-row cooperative tile costs more than the batched GEMM path.
     if (shape[2] != 4096 || rows > 16 || rows < requests || rows > 8 * requests ||
-        (!hopper && (requests != 1 || rows < 7)) || !Resident(normalized, device, BFLOAT16, shape, 16) ||
+        (arch != 90 && arch != 103 && (requests != 1 || rows < 7)) || !Resident(normalized, device, BFLOAT16, shape, 16) ||
         !Resident(*w.gateUp, device, BFLOAT16, {8192, 4096}, 32) ||
         !Resident(w.down, device, BFLOAT16, {4096, 4096}, 32) ||
         !Resident(residual, device, BFLOAT16, shape, 16) || !Resident(scratch, device, BFLOAT16, shape, 16) ||
@@ -174,19 +174,24 @@ bool TryCudaDraftAttention(const DraftLayerParallel &p, const DraftAttentionGeom
             *collective->storage);
 #endif
 #ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
-    if (p.tpSize != 1 || requests.size() != 1 || p.rank < 0 || size_t(p.rank) >= p.devices.size() ||
+    if (p.tpSize != 1 || requests.empty() || p.rank < 0 || size_t(p.rank) >= p.devices.size() ||
         !w.qkv || normalized.dims.size() != 3 || !std::isfinite(g.eps) || g.eps <= 0 ||
         !std::isfinite(g.theta) || g.theta <= 0) return false;
-    const int device = p.devices[p.rank], rows = normalized.dims[1];
-    if (rows < 7 && FastllmCudaRuntimeArch() != 90) return false;
+    const int total = normalized.dims[1];
+    if (total <= 0 || requests.size() > size_t(total)) return false;
+    const int device = p.devices[p.rank], owners = static_cast<int>(requests.size());
+    if (total % owners) return false;
+    const int rows = total / owners;
+    const int arch = FastllmCudaRuntimeArch();
+    if ((owners > 1 && arch != 103) || (rows < 7 && arch != 90 && arch != 103)) return false;
     int floats = 0;
-    const int blocks = FastllmDraftLocalAttentionPlan(device, rows, g.heads, g.kvHeads, g.headDim, g.window, &floats);
+    const int blocks = FastllmDraftBatchAttentionPlan(device, owners, rows, g.heads, g.kvHeads, g.headDim, g.window, &floats);
     if (!blocks) return false;
     const int width = g.heads * g.headDim, kw = g.kvHeads * g.headDim;
-    const std::vector<int> shape{1, rows, width}, packed{1, rows, width + 2*kw};
+    const std::vector<int> shape{1, total, width}, packed{1, total, width + 2*kw};
     const auto &r = requests.front();
     const auto *table = bindings ? static_cast<const void *const *>(bindings->cudaData) : r.cacheTable;
-    if (!table || (bindings && !Resident(*bindings, device, INT32, {1,4}, 8)) ||
+    if (!table || (bindings && !Resident(*bindings, device, INT32, {owners,4}, 8)) ||
         !r.positions || !r.liveKeys || !Resident(*r.positions, device, FLOAT32, {1,rows}) ||
         !Resident(*r.liveKeys, device, INT32, {1}) || !Resident(normalized, device, BFLOAT16, shape, 16) ||
         !Resident(hidden, device, BFLOAT16, shape, 16) || !Resident(*w.qkv, device, BFLOAT16, {packed[2],width}, 32) ||
@@ -194,21 +199,29 @@ bool TryCudaDraftAttention(const DraftLayerParallel &p, const DraftAttentionGeom
         !Resident(w.kNorm, device, FLOAT32, {g.headDim}) || !Resident(w.postNorm, device, FLOAT32, {width}) ||
         !CanWrite(raw, device, packed) || !CanWrite(attention, device, shape) ||
         !CanWrite(branch, device, shape) || !CanWrite(scratch, device, {floats}, FLOAT32)) return false;
-    if (!r.key || !r.value || r.key->dims != r.value->dims) return false;
-    for (const Data *cache : {r.key, r.value}) {
-        if (cache->isPagedKVCache || cache->multiDeviceData || cache->dataType != BFLOAT16 ||
-            cache->dataDevice != CUDA || cache->dataDeviceIds != normalized.dataDeviceIds ||
-            !cache->cudaData || (reinterpret_cast<uintptr_t>(cache->cudaData) & 15) ||
-            cache->dims.size() != 3 || cache->dims[0] != 1 || cache->dims[1] < 0 || cache->dims[2] != kw ||
-            cache->expansionDims.size() != 3 || cache->expansionDims[0] != 1 ||
-            cache->expansionDims[1] < g.window-1+rows || cache->expansionDims[2] != kw ||
-            cache->strides.size() != 3 || cache->strides[1] != kw || cache->strides[2] != 1) return false;
+    for (int owner = 0; owner < owners; ++owner) {
+        const auto &slot = requests[owner];
+        if (!slot.key || !slot.value || slot.key->dims != slot.value->dims ||
+            !slot.positions || !slot.liveKeys || !Resident(*slot.positions, device, FLOAT32, {1,rows}) ||
+            !Resident(*slot.liveKeys, device, INT32, {1}) ||
+            slot.positions->cudaData != static_cast<const float *>(r.positions->cudaData) + owner * rows ||
+            slot.liveKeys->cudaData != static_cast<const int *>(r.liveKeys->cudaData) + owner ||
+            (!bindings && slot.cacheTable != table + 2 * owner)) return false;
+        for (const Data *cache : {slot.key, slot.value}) {
+            if (cache->isPagedKVCache || cache->multiDeviceData || cache->dataType != BFLOAT16 ||
+                cache->dataDevice != CUDA || cache->dataDeviceIds != normalized.dataDeviceIds ||
+                !cache->cudaData || (reinterpret_cast<uintptr_t>(cache->cudaData) & 15) ||
+                cache->dims.size() != 3 || cache->dims[0] != 1 || cache->dims[1] < 0 || cache->dims[2] != kw ||
+                cache->expansionDims.size() != 3 || cache->expansionDims[0] != 1 ||
+                cache->expansionDims[1] < g.window-1+rows || cache->expansionDims[2] != kw ||
+                cache->strides.size() != 3 || cache->strides[1] != kw || cache->strides[2] != 1) return false;
+        }
     }
     AllocateOutput(raw, device, packed);
     AllocateOutput(attention, device, shape);
     AllocateOutput(branch, device, shape);
     AllocateOutput(scratch, device, {floats}, FLOAT32);
-    FastllmDraftLocalAttentionRun(blocks, {normalized.cudaData, w.qkv->cudaData, w.o.cudaData,
+    FastllmDraftBatchAttentionRun(blocks, owners, {normalized.cudaData, w.qkv->cudaData, w.o.cudaData,
         static_cast<const float *>(w.qNorm.cudaData), static_cast<const float *>(w.kNorm.cudaData),
         static_cast<const float *>(w.postNorm.cudaData), static_cast<const float *>(r.positions->cudaData),
         static_cast<const int *>(r.liveKeys->cudaData), table, raw.cudaData, attention.cudaData, hidden.cudaData,
@@ -259,7 +272,8 @@ bool ExportCudaDraftShardedHead(void *state, const Data &hidden, int steps, int 
         int64_t *ids, float *confidence) {
     const int count = limits.size();
     auto *probabilities = static_cast<float *>(q.cudaData);
-    if (count >= 8 || (count >= 4 && FastllmCudaRuntimeArch() == 90))
+    const int arch = FastllmCudaRuntimeArch();
+    if (count >= 8 || (count >= 4 && (arch == 90 || arch == 103)))
         return FastllmDraftFusedHeadSubmitBatch(state, count, hidden.cudaData,
             temperatures.data(), limits.data(), probabilities, ids, confidence, nullptr);
     for (int row = 0; row < count; ++row) {

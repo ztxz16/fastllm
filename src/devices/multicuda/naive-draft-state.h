@@ -295,14 +295,51 @@ struct NaiveN05FlashModel::DraftWorkspace {
     // request or geometry must drain it before either allocation can be reused.
     struct OwnerReplay {
         std::mutex mutex;
-        std::shared_ptr<DraftContext> request;
+        struct Slot {
+            std::shared_ptr<DraftContext> owner;
+            int anchor, length;
+        };
+        std::vector<Slot> slots;
         std::shared_ptr<DraftWorkspace> bucket;
-        int anchor = -1, length = 0;
+        bool consumed = false;
+        bool Contains(const DraftContext *ctx) const {
+            return std::any_of(slots.begin(), slots.end(), [&](const Slot &s) { return s.owner.get() == ctx; });
+        }
+        bool Matches(const std::vector<int> &rows, const std::vector<DraftContext *> &contexts,
+                     const std::vector<int> &tokens) const {
+            if (!bucket || consumed || slots.size() != rows.size()) return false;
+            for (size_t j = 0; j < rows.size(); ++j) {
+                const int i = rows[j];
+                const Slot &s = slots[j];
+                if (s.owner.get() != contexts[i] || s.anchor != tokens[i] || s.length != contexts[i]->committed + 1)
+                    return false;
+            }
+            return true;
+        }
         void Join() {
             if (bucket) FastllmCudaEventSynchronize(bucket->done);
-            bucket.reset(); request.reset(); anchor = -1;
+            bucket.reset();
+            slots.clear();
+            consumed = false;
         }
     } ownerReplay;
+    // A speculative projection uses the normal vocabulary-shard buffers. The
+    // request registry lock protects its row order and the generation of done.
+    std::vector<std::vector<int>> projectedHeadRows;
+    std::vector<const void *> gatheredHeadBuffers;
+    void *gatheredHeadReady = nullptr;
+    void DrainProjectedHead() {
+        if (projectedHeadRows.empty()) return;
+        const int previous = FastllmCudaGetDevice();
+        for (size_t i = 0; i < tpRanks.size(); ++i) {
+            auto &rank = *tpRanks[i];
+            FastllmCudaSetDevice(rank.device);
+            FastllmCudaEventSynchronize(gatheredHeadBuffers[i] ? rank.gatheredHeadReady : rank.done);
+        }
+        FastllmCudaSetDevice(previous);
+        projectedHeadRows.clear();
+        gatheredHeadBuffers.clear();
+    }
     void *ownerPacket = nullptr;
     bool UploadOwner(const DraftContext &context, int anchor, int length, Data &table) {
         const size_t slots = 2 * context.kv.size(), bytes = (slots + 1) * sizeof(uint64_t);
@@ -438,6 +475,7 @@ struct NaiveN05FlashModel::DraftRound {
     bool greedy = false;
     int sampledAccepted = -1, sampledNext = -1;
     std::vector<std::pair<Data, Data>> *ownerCommitKV = nullptr;
+    const std::vector<std::pair<Data, Data>> *bodyOwnerKey = nullptr;
     bool targetCommitted = false, draftCommitted = false, singleOwnerBody = false;
     bool collectiveDynamicKV = false;
     TargetCapture::FeatureRows feature;

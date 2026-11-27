@@ -45,22 +45,39 @@ void RunReplica(int blocks, typename Op::Args &args, void *stream) {
 }
 } // namespace
 
-extern "C" int FastllmDraftLocalAttentionPlan(int device, int rows, int heads, int kvHeads, int dim,
+extern "C" int FastllmDraftBatchAttentionPlan(int device, int owners, int rows, int heads, int kvHeads, int dim,
         int window, int *partialFloats) {
     using Op = ReplicaAttention;
-    if (rows < 1 || rows > 8 || heads != Op::Heads || kvHeads != Op::KVHeads || dim != Op::Dim ||
-        window < rows || window > 1024) return 0;
-    *partialFloats = ((window - 1 + rows + Op::Chunk - 1) / Op::Chunk) * heads * rows * Op::Stride;
-    return ReplicaBlocks<Op, FusedDraftAttention<Op>>(device);
+    // Above this local row budget, batched GEMM amortizes the projections
+    // better than sharing a single resident grid among more requests.
+    constexpr int cooperativeRows = 24;
+    if (!partialFloats || owners < 1 || rows < 1 || rows > 8 || owners > cooperativeRows / rows ||
+        heads != Op::Heads || kvHeads != Op::KVHeads || dim != Op::Dim || window < rows || window > 1024) return 0;
+    *partialFloats = ((window - 1 + rows + Op::Chunk - 1) / Op::Chunk) * heads * rows * owners * Op::Stride;
+    if (owners == 1) return ReplicaBlocks<Op, FusedDraftAttention<Op>>(device);
+    const int blocks = ReplicaBlocks<ReplicaAttentionBatch, FusedDraftAttention<ReplicaAttentionBatch>>(device) / owners;
+    return blocks >= rows ? blocks : 0;
 }
 
-extern "C" void FastllmDraftLocalAttentionRun(int blocks, const FastllmDraftLocalAttention &x, void *stream) {
+extern "C" void FastllmDraftBatchAttentionRun(int blocks, int owners, const FastllmDraftLocalAttention &x, void *stream) {
     using BF = ReplicaAttention::BF;
     ReplicaAttention::Args a{static_cast<const BF *>(x.input), static_cast<const BF *>(x.qkvWeight),
         static_cast<const BF *>(x.oWeight), x.qNorm, x.kNorm, x.postNorm, x.positions, x.live, x.binding,
         static_cast<BF *>(x.raw), static_cast<BF *>(x.attention), static_cast<BF *>(x.residual),
         static_cast<BF *>(x.output), x.partials, x.normScratch, x.rows, x.window, x.eps, x.theta};
-    RunReplica<ReplicaAttention, FusedDraftAttention<ReplicaAttention>>(blocks, a, stream);
+    if (owners == 1) RunReplica<ReplicaAttention, FusedDraftAttention<ReplicaAttention>>(blocks, a, stream);
+    else {
+        void *params[]{&a};
+        CheckReplica(cudaLaunchCooperativeKernel((const void *)FusedDraftAttention<ReplicaAttentionBatch>,
+            dim3(blocks, owners), ReplicaAttention::Threads, params, 0,
+            stream ? static_cast<cudaStream_t>(stream) : cudaStreamPerThread));
+    }
+}
+extern "C" int FastllmDraftLocalAttentionPlan(int device,int rows,int heads,int kvHeads,int dim,int window,int *floats) {
+    return FastllmDraftBatchAttentionPlan(device,1,rows,heads,kvHeads,dim,window,floats);
+}
+extern "C" void FastllmDraftLocalAttentionRun(int blocks,const FastllmDraftLocalAttention &args,void *stream) {
+    FastllmDraftBatchAttentionRun(blocks,1,args,stream);
 }
 extern "C" int FastllmDraftFusedPairMlpBlocks(int device) {
     return ReplicaBlocks<ReplicaMlpPair, FusedDraftMlp<ReplicaMlpPair>>(device);

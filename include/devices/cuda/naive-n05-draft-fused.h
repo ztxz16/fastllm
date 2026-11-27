@@ -31,6 +31,9 @@ extern "C" {
 int FastllmDraftLocalAttentionPlan(int device, int rows, int heads, int kvHeads, int dim, int window,
     int *partialFloats);
 void FastllmDraftLocalAttentionRun(int blocks, const FastllmDraftLocalAttention &args, void *stream);
+// Blocks per owner. The entire two-dimensional grid must be concurrently resident.
+int FastllmDraftBatchAttentionPlan(int device, int owners, int rows, int heads, int kvHeads, int dim, int window, int *partialFloats);
+void FastllmDraftBatchAttentionRun(int blocks, int owners, const FastllmDraftLocalAttention &args, void *stream);
 // Full-width BF16 replica. One 7- or 8-row request, original row-major weights; the
 // graph owner supplies existing activation buffers. Query on the active device.
 int FastllmDraftFusedLocalMlpBlocks(int device);

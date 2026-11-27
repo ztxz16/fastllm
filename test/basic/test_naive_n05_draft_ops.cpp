@@ -347,6 +347,8 @@ int main() {
         DirectDraftProbabilities(3, 65537, 65537);
         for (int steps : {1, 3, 5, 7}) FusedBatchSampling(33, 257, steps);
         FusedBatchSampling(65, 16385, 3);
+        FusedBatchSampling(64, 65537, 3);
+        FusedBatchSampling(40, 262145, 1);
         FusedBatchSampling(256, 152576, 3);
         int checks = 0;
         // The unchanged two-row GEMV is an exact oracle for the new one-row

@@ -477,6 +477,7 @@ namespace fastllm {
             std::vector<Data> &inputs, &logits;
             bool collectiveDynamicKV = false, ownerBodies = false;
             Data *ownerLogits = nullptr;
+            std::vector<const void *> gatheredBuffers;
         };
         void RunDraftShardedHead(DraftHeadShards &head, const std::vector<std::vector<int>> &requests,
                                  const std::vector<void *> &done, bool waitForOwner);
@@ -514,6 +515,7 @@ namespace fastllm {
             const std::vector<int> &past, const std::vector<int> &counts, int device);
         void PublishTargetCacheLengths(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
             const std::vector<int> &past, const std::vector<int> &counts);
+        void JoinDraftHeadLookahead();
         void JoinDraftLookahead(DraftContext *context = nullptr);
         bool CommitSpeculativeCaches(TargetCapture &capture, const std::vector<int> &lengths,
             const std::vector<int> &counts, const std::vector<DraftContext *> &contexts,

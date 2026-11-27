@@ -28,7 +28,7 @@ bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime) {
 }
 
 int FastllmCudaOwnerDraftFeatureLimit(const std::vector<int> &devices) {
-    return FastllmCudaNaiveHopperGroup(devices) ? kFastllmMtpSmallRejectionMaxBatch : 1;
+    return FastllmCudaNaiveBatchedDraftHeadGroup(devices) ? kFastllmMtpSmallRejectionMaxBatch : 1;
 }
 
 bool FastllmCudaVerifyReduceNormSupported(int rows, const std::vector<int> &devices) {

@@ -16283,27 +16283,40 @@ __global__ void FastllmProposalTileMax(FastllmBF16BiasSoftmaxInput input, const 
     const float maximum = Reduce(storage).Reduce(largest, MaxReduceOp{});
     if (threadIdx.x == 0) maxima[size_t(row) * gridDim.x + blockIdx.x] = maximum;
 }
+// Warps read separate vocabulary stripes in parallel. The first warp then
+// sums each of its 32 lanes in the original order, including across tiles.
+constexpr int kProposalLanes = 32, kProposalThreads = 256, kProposalMaxStripes = 256;
 __global__ void FastllmProposalLaneSums(FastllmBF16BiasSoftmaxInput input, const float *temperatures,
         const float *maxima, float *sums, float *probs, int vocab, int tiles, int stride) {
-    const int row = blockIdx.y;
-    const int lane = blockIdx.x * 128 + threadIdx.x;
+    const int row = blockIdx.y, tid = threadIdx.x;
+    const int lane = blockIdx.x * kProposalLanes + tid % kProposalLanes;
     float maximum = -1.e30f;
-    for (int i = threadIdx.x; i < tiles; i += 128)
+    for (int i = tid; i < tiles; i += kProposalThreads)
         maximum = fmaxf(maximum, maxima[size_t(row) * tiles + i]);
-    using Reduce = cub::BlockReduce<float, 128>;
+    using Reduce = cub::BlockReduce<float, kProposalThreads>;
     __shared__ typename Reduce::TempStorage storage;
     __shared__ float rowMax;
     maximum = Reduce(storage).Reduce(maximum, MaxReduceOp{});
-    if (threadIdx.x == 0) rowMax = maximum;
+    if (tid == 0) rowMax = maximum;
     __syncthreads();
+    extern __shared__ float values[];
     const float invTemp = 1.f / temperatures[row];
+    const int stripes = (vocab - 1) / 1024 + 1;
     float sum = 0.f;
-    for (int i = lane; i < vocab; i += 1024) {
-        const float value = expf(__fmul_rn(input(row, i, vocab), invTemp) - rowMax);
-        sum += value;
-        probs[size_t(row) * stride + i] = value;
+    for (int first = 0; first < stripes; first += kProposalMaxStripes) {
+        const int count = min(stripes - first, kProposalMaxStripes);
+        for (int stripe = tid / kProposalLanes; stripe < count; stripe += kProposalThreads / kProposalLanes) {
+            const int i = (first + stripe) * 1024 + lane;
+            const float value = i < vocab ? expf(__fmul_rn(input(row, i, vocab), invTemp) - rowMax) : 0.f;
+            values[stripe * kProposalLanes + tid % kProposalLanes] = value;
+            if (i < vocab) probs[size_t(row) * stride + i] = value;
+        }
+        __syncthreads();
+        if (tid < kProposalLanes)
+            for (int stripe = 0; stripe < count; ++stripe) sum += values[stripe * kProposalLanes + tid];
+        if (first + count < stripes) __syncthreads();
     }
-    sums[size_t(row) * 1024 + lane] = sum;
+    if (tid < kProposalLanes) sums[size_t(row) * 1024 + lane] = sum;
 }
 __global__ void FastllmNormalizeProposal(const float *sums, float *probs, int *sampleRows,
         int vocab, int stride) {
@@ -18771,9 +18784,10 @@ bool FastllmCudaMtpTryOwnerHeadBatch(void *sampler, const void *base, const void
             return active * props.multiProcessorCount;
         };
         capacity = resident(FusedDraftHeadProposal);
-        pairedCapacity = props.major == 9 && props.minor == 0 ? resident(FusedDraftHeadProposalPaired) : 0;
-        batchCapacity = props.major == 9 && props.minor == 0 ? resident(FusedDraftHeadProposalBatch) : 0;
-        if (props.major == 9 && props.minor == 0) {
+        const bool batched = (props.major == 9 && props.minor == 0) || (props.major == 10 && props.minor == 3);
+        pairedCapacity = batched ? resident(FusedDraftHeadProposalPaired) : 0;
+        batchCapacity = batched ? resident(FusedDraftHeadProposalBatch) : 0;
+        if (batched) {
             groupCapacity[0] = resident(FusedDraftHeadProposalGroup<false>, 256);
             groupCapacity[1] = resident(FusedDraftHeadProposalGroup<true>, 256);
             wideCapacity[0] = resident(FusedDraftHeadProposalWide<3>);
@@ -18902,7 +18916,9 @@ bool FastllmCudaMtpDraftSamplerRunBF16BiasBatch(void *sampler, const void *base,
         int *sampleRows = reinterpret_cast<int *>(sums + size_t(ws.rows) * 1024);
         const cudaStream_t stream = cudaStreamPerThread;
         FastllmProposalTileMax<<<dim3(tiles, ws.rows), 256, 0, stream>>>(input, ws.temperatures, maxima, ws.vocab);
-        FastllmProposalLaneSums<<<dim3(8, ws.rows), 128, 0, stream>>>(
+        const int stripes = std::min((ws.vocab - 1) / 1024 + 1, kProposalMaxStripes);
+        FastllmProposalLaneSums<<<dim3(1024 / kProposalLanes, ws.rows), kProposalThreads,
+            stripes * kProposalLanes * sizeof(float), stream>>>(
             input, ws.temperatures, maxima, sums, proposalProbs, ws.vocab, tiles, probabilityStride);
         FastllmNormalizeProposal<<<dim3(tiles, ws.rows), 1024, 0, stream>>>(
             sums, proposalProbs, sampleRows, ws.vocab, probabilityStride);
