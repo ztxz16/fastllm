@@ -12425,6 +12425,88 @@ __global__ void FastllmSelectExpertFixedTopKKernel(const float *logits, const fl
 }
 
 #ifndef USE_ROCM
+
+namespace {
+// Sort one warp's 32 keys, then merge the upper halves. Keeping 16 per
+// warp preserves the ninth key, needed to detect a tie across the cutoff.
+__global__ void SelectExpertEightRows(const float *probability, const float *bias,
+        int32_t *ids, float *scores, int normalize, float scale) {
+    constexpr int top = 8, experts = 256;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12000
+    // The verify expert can initialize its per-CTA barriers and tensor memory
+    // before its grid dependency wait, while this CTA selects the routes.
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    const int row = blockIdx.x, thread = threadIdx.x, lane = thread % 32, warp = thread / 32;
+    probability += row * experts;
+    ids += row * top;
+    scores += row * top;
+    float key = probability[thread] + bias[thread];
+    if (!isfinite(key)) key = -FLT_MAX;
+    int id = thread;
+    auto exchange = [&](int distance, bool keepHigh) {
+        const float other = __shfl_xor_sync(0xffffffffu, key, distance);
+        const int otherId = __shfl_xor_sync(0xffffffffu, id, distance);
+        const bool higher = other > key || (other == key && otherId < id);
+        if (higher == keepHigh) {
+            key = other;
+            id = otherId;
+        }
+    };
+#pragma unroll
+    for (int width = 2; width <= 32; width *= 2) {
+#pragma unroll
+        for (int d = width / 2; d; d /= 2)
+            exchange(d, ((lane & width) == 0) == ((lane & d) == 0));
+    }
+
+    __shared__ float keys[8][16];
+    __shared__ int indices[8][16];
+    if (lane < 16) {
+        keys[warp][lane] = key;
+        indices[warp][lane] = id;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int stride = 1; stride < 8; stride *= 2) {
+        if (warp % (2 * stride) == 0) {
+            const int source = lane < 16 ? warp : warp + stride;
+            const int position = lane < 16 ? lane : 31 - lane;
+            key = keys[source][position];
+            id = indices[source][position];
+#pragma unroll
+            for (int d = 16; d; d /= 2) exchange(d, (lane & d) == 0);
+            if (lane < 16) {
+                keys[warp][lane] = key;
+                indices[warp][lane] = id;
+            }
+        }
+        __syncthreads();
+    }
+    if (warp != 0) return;
+    const float next = __shfl_down_sync(0xffffffffu, key, 1);
+    if (__any_sync(0xffffffffu, lane < top && key == next)) {
+        __shared__ fastllm::cuda::RouterTopKScratch<top> fallback;
+        fastllm::cuda::SelectRouterTopK<experts, top>(
+            probability, bias, ids, scores, 1, normalize, scale, fallback);
+        return;
+    }
+    float value = probability[id];
+    if (!isfinite(value)) value = 0.f;
+    float sum = 1.f;
+    if (normalize) {
+        sum = 0.f;
+#pragma unroll
+        for (int i = 0; i < top; ++i) sum += __shfl_sync(0xffffffffu, value, i);
+        if (!isfinite(sum) || fabsf(sum) < 1.e-20f) sum = 1.f;
+    }
+    if (lane < top) {
+        ids[lane] = id;
+        scores[lane] = value / sum * scale;
+    }
+}
+}
+
 #include "devices/cuda/fastllm-dsv41-mega.h"
 #include "devices/cuda/fastllm-v41-route-order.cuh"
 // In the common case all six biased winners are unique. Use coalesced loads
@@ -13594,6 +13676,9 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         FastllmSelectExpertFixedTopKKernel<false, 384, 6><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
+    } else if (numExperts == 256 && topk == 8 && n == 8 && hasBias &&
+               (FastllmCudaRuntimeArch() == 100 || FastllmCudaRuntimeArch() == 103)) {
+        SelectExpertEightRows<<<n, 256>>>(cudaLogits, cudaBias, cudaIndex, cudaScore, needNorm, routeScale);
     } else if (numExperts == 256 && topk == 8) {
         // Each CTA handles one row; this specialization has no batch-size limit.
         FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<n, 32>>>(

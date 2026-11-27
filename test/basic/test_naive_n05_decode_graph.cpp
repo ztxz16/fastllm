@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cuda_runtime_api.h>
 #include <cuda_fp8.h>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
@@ -1042,7 +1043,46 @@ static void TestIndexerKeyNorm(int rows) {
     Require(Read<uint16_t>(input) == before, "unsupported Indexer norm changed input");
 }
 
+static void TestEightRowSelection() {
+    constexpr int rows = 8, experts = 256, top = 8;
+    Data logits(FLOAT32), bias(FLOAT32), ids(INT32), scores(FLOAT32), refIds(INT32), refScores(FLOAT32);
+    Upload(logits, {rows, experts}, 215); Upload(bias, {experts}, 216);
+    Upload(ids, {rows, top}, 217); Upload(scores, {rows, top}, 218);
+    Upload(refIds, {rows, top}, 219); Upload(refScores, {rows, top}, 220);
+    for (bool normalize : {false, true}) {
+        Graph graph;
+        graph.Capture([&] {
+            Require(FastllmCudaSelectExpert(logits, &bias, ids, scores, top, normalize, 1.7f), "batched selection");
+        });
+        std::vector<float> values(rows * experts), offsets(experts);
+        for (int pattern = 0; pattern < 5; ++pattern) {
+            for (int e = 0; e < experts; ++e) offsets[e] = pattern == 0 ? (e % 5) * .001f : 0.f;
+            for (int i = 0; i < rows * experts; ++i) {
+                const int e = i % experts;
+                values[i] = pattern == 0 ? std::sin(i * .185f) :
+                    pattern == 1 ? .5f : pattern == 2 ? (i % 17) * .025f :
+                    pattern == 3 ? (e < 7 ? float(8 - e) : .25f) :
+                    (e == 0 ? std::numeric_limits<float>::quiet_NaN() : float(e) / experts);
+            }
+            Cuda(cudaMemcpy(logits.cudaData, values.data(), logits.GetBytes(), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(bias.cudaData, offsets.data(), bias.GetBytes(), cudaMemcpyHostToDevice));
+            graph.Run();
+            for (int row = 0; row < rows; ++row) {
+                Data x(FLOAT32, {1, experts}), idx(INT32, {1, top}), mix(FLOAT32, {1, top});
+                x.FakeFrom(logits, row * experts * sizeof(float));
+                idx.FakeFrom(refIds, row * top * sizeof(int));
+                mix.FakeFrom(refScores, row * top * sizeof(float));
+                Require(FastllmCudaSelectExpert(x, &bias, idx, mix, top, normalize, 1.7f), "reference selection");
+            }
+            Require(Read<int>(ids) == Read<int>(refIds), "batched selection changed an expert");
+            Require(Read<float>(scores) == Read<float>(refScores), "batched selection changed a weight");
+            ++checks;
+        }
+    }
+}
+
 static void TestRouters() {
+    TestEightRowSelection();
     for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 23, 24, 31, 32, 33, 48, 64, 65, 128})
         for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
 }
