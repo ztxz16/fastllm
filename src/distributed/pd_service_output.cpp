@@ -197,8 +197,9 @@ void BindServiceOutput(Handlers &h) {
                                           "ep"_a = size, "rank"_a = rank);
             }
 
-            evidence["states"] = get(r, "_command")("cache");
+            // usage 会按需初始化普通 TP 页池；随后采样，避免首次证据保留初始化前的 page_len=0。
             evidence["usage"] = get(r, "_command")("usage");
+            evidence["states"] = get(r, "_command")("cache");
             replicas.append(evidence);
         }
         return D("health"_a = s.attr("health")(), "requests"_a = requests, "replicas"_a = replicas);

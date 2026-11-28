@@ -16,7 +16,7 @@ from generation_reference import deployment
 from report import run
 
 
-def fixture(size, rank=None):
+def fixture(size, rank=None, *, cold=False, page_len=128):
     attention = rank is not None
     workers = [dict(rank=i, device=2 * i, pid=100 + i) for i in range(size)]
     ready = dict(backend="qwen_moe_attention_dp_ep" if attention else "qwen3_process_generate_cublas_nccl",
@@ -24,13 +24,18 @@ def fixture(size, rank=None):
     session = SimpleNamespace(ready=ready, devices=[2 * rank] if attention else [2 * i for i in range(size)],
                               rank=rank, storage="continuous" if attention else "paged")
     states = [dict(enabled=False, allreduce=dict(enabled=False),
-                   prefix_cache=dict(enabled=False, page_len=0 if attention else 128))
+                   prefix_cache=dict(enabled=False, page_len=0 if attention or cold else page_len))
               for _ in range(1 if attention else size)]
     calls = []
 
     def command(action):
         calls.append(action)
-        return deepcopy(states) if action == "cache" else dict(kv_cache_usage=0.0, workers=[])
+        if action == "cache":
+            return deepcopy(states)
+        if cold and not attention:
+            for state in states:
+                state["prefix_cache"]["page_len"] = page_len
+        return dict(kv_cache_usage=0.0, workers=[])
 
     replica = SimpleNamespace(session=session, config=dict(model_type="qwen2_moe"), _command=command)
     health = dict(healthy=True, role="full", model="model", peer=dict(instance="full", boot="boot", host="host"))
@@ -45,7 +50,7 @@ def snapshot(size, rank=None):
     replica = result["replicas"][0]
     expected = size if rank is None else 1
     assert len(replica["workers"]) == len(replica["states"]) == len(replica["devices"]) == expected
-    assert calls == ["cache", "usage"]
+    assert calls == ["usage", "cache"]
     assert service.replicas[0].session.ready == original, "shared ready metadata was modified"
     if rank is None:
         assert "parallel" not in replica and "group_workers" not in replica
@@ -102,6 +107,16 @@ def check_snapshot(size, rank=None):
                 states=len(result["replicas"][0]["states"]))
 
 
+def cold_paged_snapshot():
+    service, _ = fixture(2, cold=True, page_len=256)
+    first = Service.evidence(service)
+    second = Service.evidence(service)
+    lengths = [state["prefix_cache"]["page_len"] for state in first["replicas"][0]["states"]]
+    assert lengths == [256, 256], "first evidence retained the uninitialized page length"
+    assert first == second, "cold and initialized evidence disagree"
+    return dict(workers=2, page_len=256, cold_matches_initialized=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
@@ -116,9 +131,10 @@ def main():
         ("reject_worker_rank", lambda: reject_rank_device("worker")),
         ("reject_view_device", lambda: reject_rank_device("device")),
         ("reference_parallel_config", config_boundary),
+        ("ordinary_tp2_cold_page_len", cold_paged_snapshot),
     ]
     return run(cases, args.output, backend="production C++ evidence; injected native snapshots",
-               scope="9 个副本证据与基线配置用例；不代表 Attention DP/EP 模型生成或 GPU 验收")
+               scope="10 个副本证据与基线配置用例，含普通 TP 冷启动页大小；不代表模型生成或 GPU 验收")
 
 
 if __name__ == "__main__":
