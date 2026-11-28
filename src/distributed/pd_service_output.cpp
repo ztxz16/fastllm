@@ -175,12 +175,31 @@ void BindServiceOutput(Handlers &h) {
         }
         for (auto r : get(s, "replicas")) {
             O session = get(r, "session");
-            replicas.append(D("model_type"_a = at(get(r, "config"), "model_type"),
-                              "storage"_a = py::getattr(session, "storage", py::str("paged")),
-                              "devices"_a = get(session, "devices"),
-                              "workers"_a = get(session, "ready").attr("get")("workers", L()),
-                              "states"_a = get(r, "_command")("cache"),
-                              "usage"_a = get(r, "_command")("usage")));
+            O ready = get(session, "ready"), workers = ready.attr("get")("workers", L());
+            D evidence("model_type"_a = at(get(r, "config"), "model_type"),
+                       "storage"_a = py::getattr(session, "storage", py::str("paged")),
+                       "devices"_a = get(session, "devices"), "workers"_a = workers);
+
+            // Attention 副本只拥有一个 rank 的状态；共享 EP 组成员单独保留，不能算成 TP。
+            if (str(ready.attr("get")("backend", "")) == "qwen_moe_attention_dp_ep") {
+                I rank = num(get(session, "rank")), size = I(py::len(workers));
+                require(rank >= 0 && rank < size && py::len(get(session, "devices")) == 1,
+                        "invalid Attention DP/EP replica evidence");
+                O worker = item(workers, py::int_(rank));
+                require(num(at(worker, "rank")) == rank &&
+                            equal(at(worker, "device"), item(get(session, "devices"), py::int_(0))),
+                        "Attention DP/EP evidence rank/device mismatch");
+                L local;
+                local.append(worker);
+                evidence["workers"] = local;
+                evidence["group_workers"] = workers;
+                evidence["parallel"] = D("mode"_a = "attention_dp_ep", "attention_dp"_a = size,
+                                          "ep"_a = size, "rank"_a = rank);
+            }
+
+            evidence["states"] = get(r, "_command")("cache");
+            evidence["usage"] = get(r, "_command")("usage");
+            replicas.append(evidence);
         }
         return D("health"_a = s.attr("health")(), "requests"_a = requests, "replicas"_a = replicas);
     };

@@ -30,11 +30,14 @@ def deployment(router, token, role):
             states, ranks = replica["states"], replica["workers"]
             if not states or len(states) != len(ranks):
                 raise ValueError(f"incomplete native rank evidence: {url}")
-            replicas.append(dict(model_type=replica["model_type"], storage=replica["storage"],
+            config = dict(model_type=replica["model_type"], storage=replica["storage"],
                 tp=len(ranks), ranks=[dict(graph=state["enabled"],
                     prefix_cache=state["prefix_cache"]["enabled"],
                     page_len=state["prefix_cache"].get("page_len"),
-                    custom_allreduce=state["allreduce"]["enabled"]) for state in states]))
+                    custom_allreduce=state["allreduce"]["enabled"]) for state in states])
+            if "parallel" in replica:
+                config["parallel"] = replica["parallel"]
+            replicas.append(config)
         if not replicas:
             raise ValueError(f"no native replica evidence: {url}")
         configs.append(dict(model=health["model"], replicas=replicas))
