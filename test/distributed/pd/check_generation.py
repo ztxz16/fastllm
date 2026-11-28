@@ -1,4 +1,4 @@
-"""对已部署的正式 Router 入口做 Token exact 比对；每个部署组合独立执行 15 个 case。"""
+"""正式Router生成验收；exact通过即接受，候选证据缺失时明确失败，不运行numeric。"""
 
 import argparse
 import json
@@ -11,6 +11,8 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from generation_alignment import compare_token_ids
 from report import run
 from generation_reference import ReferenceArchive
 
@@ -46,6 +48,24 @@ def request(url, token, payload):
         return dict(token_ids=ids, deltas=deltas, arrivals_s=times, elapsed_s=time.perf_counter() - began)
 
 
+def compare_output(output, name, payload, actual, reference, generated):
+    """/** 保存正式输出与三级判定；当前HTTP缺少候选证据时不伪造候选PASS。 */"""
+    evidence = dict(request=payload, actual=actual, reference=reference,
+                    candidate_comparison='not available: public endpoint does not export logits')
+    path = output / (name + '.evidence.json')
+    path.write_text(json.dumps(evidence, indent=2, ensure_ascii=False))
+    result = compare_token_ids(actual['token_ids'], reference['token_ids'], generated)
+    evidence['comparison'] = result
+    first = result['first_divergence_token_1based']
+    evidence['first_divergence'] = None if first is None else first - 1
+    path.write_text(json.dumps(evidence, indent=2, ensure_ascii=False))
+    for warning in result['warnings']:
+        print(f'WARNING: {name}: {warning}', flush=True)
+    if result['status'] != 'PASS':
+        raise AssertionError(result['reason'] + f'; first divergence={first}; evidence retained')
+    return result
+
+
 def compare(args, output, name, tokens, *, generated=8, streaming=False, sampling=False, session=None):
     payload = dict(token_ids=tokens, max_new_tokens=generated, top_k=5 if sampling else 0,
         temperature=0.7 if sampling else 0.0, top_p=1.0, seed=20261126, eos_token_ids=[],
@@ -60,19 +80,10 @@ def compare(args, output, name, tokens, *, generated=8, streaming=False, samplin
         return dict(prompt_tokens=len(tokens), output_tokens=len(reference["token_ids"]),
                     scope="reference recording; no PD comparison")
     actual = request(args.router, args.token, payload)
-    expected_ids, actual_ids = reference["token_ids"], actual["token_ids"]
-    first = next((i for i, (a, b) in enumerate(zip(expected_ids, actual_ids)) if a != b),
-                 min(len(expected_ids), len(actual_ids)) if len(expected_ids) != len(actual_ids) else None)
-    evidence = dict(request=payload, reference=reference, actual=actual,
-                    comparison="exact", first_divergence=first,
-                    candidate_comparison="not available: public endpoint does not export logits")
-    (output / (name + ".evidence.json")).write_text(json.dumps(evidence, indent=2, ensure_ascii=False))
-    if len(expected_ids) != generated or len(actual_ids) != generated:
-        raise AssertionError("output length/position mismatch; evidence retained")
-    if expected_ids != actual_ids:
-        raise AssertionError(f"exact FAIL at output {first}; numeric warnings cannot override this failure")
-    return dict(prompt_tokens=len(tokens), output_tokens=generated, exact="PASS",
-                latency_s=actual["elapsed_s"], comparison_scope="actual output token IDs")
+    result = compare_output(output, name, payload, actual, reference, generated)
+    return dict(prompt_tokens=len(tokens), output_tokens=generated, exact=result['exact_status'],
+                accepted_by=result['accepted_by'], latency_s=actual['elapsed_s'],
+                comparison_scope='actual output token IDs; candidate evidence required on mismatch')
 
 
 def main():
@@ -138,11 +149,11 @@ def main():
             reference = (args.archive.obtain(turn_name, payload, request) if args.archive is not None
                          else request(args.reference, args.token, payload))
             actual = None if args.record_reference else request(args.router, args.token, payload)
-            (args.output / (turn_name + ".evidence.json")).write_text(json.dumps(
-                dict(request=payload, actual=actual, reference=reference,
-                     comparison="reference recording only" if args.record_reference else "exact"), indent=2))
-            if actual is not None and (actual["token_ids"] != reference["token_ids"] or len(actual["token_ids"]) != 8):
-                raise AssertionError(f"multi-turn exact FAIL: turn {turn}")
+            if actual is None:
+                (args.output / (turn_name + '.evidence.json')).write_text(json.dumps(
+                    dict(request=payload, actual=actual, reference=reference, comparison='reference recording only'), indent=2))
+            else:
+                compare_output(args.output, turn_name, payload, actual, reference, 8)
             tokens = tokens + (reference if actual is None else actual)["token_ids"] + ids[:4]
         if args.record_reference:
             return dict(turns=3, scope="complete history reference recording; no PD comparison")
@@ -166,7 +177,7 @@ def main():
                             recording=args.record_reference, architecture="see GPU compute_cap above"),
         scope=("15 个正式完整服务用例的离线基线录制，含并发与多轮；不是 PD exact 验收"
                if args.record_reference else
-               "单个部署组合的 15 个正式入口 exact 用例，含并发与多轮；不含故障注入或性能验收"))
+               "单个部署组合的 15 个正式入口生成用例（三级接受；当前HTTP缺少候选证据时失败），含并发与多轮；不含故障注入或性能验收"))
     if args.archive is not None:
         args.archive.finalize(code)
     return code

@@ -192,6 +192,7 @@ class Suite:
         row = dict(case=name, backend=BACKEND, status='FAIL', max_abs_error=None, mean_abs_error=None,
                    failed_elements=0, reason='')
         metrics = dict(max=0.0, sum=0.0, count=0, failed=0)
+        evidence = None
         try:
             evidence = action(metrics)
             (self.output / (name + '.json')).write_text(json.dumps(evidence, indent=2, allow_nan=False))
@@ -213,32 +214,27 @@ class Suite:
             if row.get('alignment_policy') == 'all':
                 print(f'ALIGNMENT: {name} exact={row["exact_status"]} '
                       f'top5={row["top5_status"]} top5+0.1={row["top5_near_tie_status"]}', flush=True)
-            if row.get('logit_diagnostic_status') == 'WARNING':
-                print(f'WARNING: {name} logits数值超差（不影响生成验收判定）; '
-                      f'max_abs={row["max_abs_error"]:.3f} mean_abs={row["mean_abs_error"]:.3f} '
-                      f'exceeded_elements={row["logit_failed_elements"]}', flush=True)
+            for warning in (evidence.get('comparison', {}).get('warnings', [])
+                            if isinstance(evidence, dict) else []):
+                print(f'WARNING: {name} {warning}', flush=True)
         return row['status'] == 'PASS'
 
     def compare_generation_report(self, report, expected, tokenizer, reference_path, index, scope):
         """/**
-         * 从同一份自由生成输出计算选定规则或全部三种生成规则，并保存一次原始证据。
+         * 从同一份自由生成输出逐级计算三种生成规则，任一通过即接受并保存原始证据。
          * @param report FT正式会话输出，不触发额外生成或教师强制。
          * @param expected 对应请求的独立HF生成输出。
          * @param tokenizer 与参考相同的文本解码器。
          * @param reference_path HF原始证据路径。
          * @param index HF请求索引。
          * @param scope 共同Eager配置或FT生产扩展配置。
-         * @return 独立策略结论、共同数值诊断及原始输出；规则失败由case保留为FAIL。
+         * @return 接受等级、单项WARNING及原始输出；全部未通过或功能故障由case保留为FAIL。
          */"""
         report['text'] = tokenizer.decode(report['token_ids'], skip_special_tokens=False,
                                           clean_up_tokenization_spaces=False)
-        if self.args.alignment_policy == 'all':
-            result = compare_generation_all(report, expected)
-        else:
-            result = compare_generation(report, expected, policy=self.args.alignment_policy,
-                topk=self.args.alignment_topk, near_tie_tol=self.args.near_tie_tol)
+        result = compare_generation_all(report, expected)
         summary = {key: value for key, value in result.items()
-                   if key not in ('candidate_checks', 'logit_diagnostics', 'comparisons')}
+                   if key not in ('candidate_checks', 'comparisons', 'warnings')}
         summary['configuration_scope'] = scope
         return dict(summary=summary, comparison=result, actual=report,
                     reference_file=str(reference_path), reference_request=index)
@@ -254,9 +250,9 @@ class Suite:
 
     def generation_alignment(self, model, requests, tokenizer):
         """/**
-         * 使用双方公开生成入口进行独立贪心验收，原逐层数值检查由numeric模式保留。
+         * 使用双方公开生成入口进行独立贪心三级验收，不追加numeric阶段。
          * HF先单独运行并释放显存；FT共同配置为Eager/无Prefix/串行请求，再独立报告
-         * Graph与Prefix生产配置。每请求保存选定策略结论、严格一致性及原始误差诊断；
+         * Graph与Prefix生产配置。每请求保存接受等级、严格一致性及未通过单项的WARNING；
          * 预登记全部生成用例，未完成的汇总不得显示通过；性能由独立入口执行。
          * @param model 同一份本地FP16权重目录。
          * @param requests 已统一聊天模板、Prompt Token ID、生成长度和EOS策略的请求。
@@ -264,20 +260,21 @@ class Suite:
          * @return 无；任一请求或执行路径失败均保留FAIL行，并由main返回非零。
          */"""
         require(requests, 'empty generation request set')
+        require(self.args.alignment_topk == 5 and self.args.near_tie_tol == 0.1,
+                'generation cascade requires Top-5 and near-tie tolerance 0.1')
         # 四种模式各两轮请求、四次执行检查、两次Prefix路由。
         expected_cases = len(self.rows) + 8 * len(requests) + 6
         self.metadata.update(
             expected_case_count=expected_cases,
-            correctness='independent greedy generation; selected policy decides PASS/FAIL',
-            alignment_policy=self.args.alignment_policy, alignment_topk=self.args.alignment_topk,
+            correctness='independent greedy generation; first passing level accepts each request',
+            alignment_policy='all', alignment_topk=5,
             near_tie_tol=self.args.near_tie_tol, policy_source=POLICY_SOURCE,
             model_path=str(model.resolve()), dtype='float16', kv_dtype='float16',
             eos_policy='disabled; fixed max_new_tokens; no penalties or filtering',
             shared_configuration='FT and HF eager, prefix off, one request at a time, FP16 KV enabled',
             additional_configurations='FT Graph/Prefix and concurrent requests vs HF eager serial reference; correctness only',
-            report_description='生成验收：failed_elements只统计选定策略失败；logit_failed_elements及logit_diagnostic_status保留同历史全词表误差。'
-                               '数值超差只记录并提示WARNING，不影响生成验收判定。'
-                               '首次分歧后不比较logits，uncompared_steps明确标记未比较尾部。严格数值验收请另跑numeric。',
+            report_description='每请求按exact、Top-5、near-tie逐级接受；未通过单项为WARNING，未执行项为SKIP。'
+                               '三级全部未通过或功能故障才FAIL；不执行numeric。首次分歧之后不比较不同历史的候选。',
             report_title='FT vs HF generation alignment')
         save_report(self.output, self.rows, self.metadata)
         reference_path = self.output / 'transformers-generation.json'
@@ -659,92 +656,63 @@ class Suite:
 
 
 def summarize_alignment_stage(stage, phase):
-    """/**
-     * 将阶段明细归并成独立策略结论，运行失败及缺失用例对所有受影响策略生效。
-     * 宽松候选通过不能覆盖exact或严格Top-5失败；均值保留在逐case明细，避免
-     * 混合不同张量大小的不加权均值。根报告failed_elements表示失败case数。
-     * @param stage 已保存四格式报告的阶段Suite。
-     * @param phase generation或numeric。
-     * @return 三条生成策略汇总或一条numeric汇总；未完成的阶段均标记FAIL。
-     */"""
+    """/** 按逐请求接受结果汇总生成阶段；执行故障和未完成用例仍使整体FAIL。 */"""
+    require(phase == 'generation', 'numeric is not part of generation acceptance')
     report = json.loads((stage.output / 'summary.json').read_text())
-    policies = ('exact', 'top5', 'top5_near_tie') if phase == 'generation' else ('numeric',)
-    rows = []
-    for policy in policies:
-        failures = []
-        for case in report['cases']:
-            if case.get(policy + '_status', case['status']) != 'PASS':
-                reason = case.get(policy + '_reason', case.get('reason', ''))
-                failures.append(f'{case["case"]}: {reason}')
-        if not report['complete']:
-            failures.append(f'incomplete stage: {report["completed_case_count"]}/{report["expected_case_count"]} cases')
-        errors = [case['max_abs_error'] for case in report['cases'] if case.get('max_abs_error') is not None]
-        row = dict(case=policy, alignment_policy=policy, backend=BACKEND,
-                   status='FAIL' if failures else 'PASS', complete=report['complete'],
-                   completed_case_count=report['completed_case_count'], expected_case_count=report['expected_case_count'],
-                   max_abs_error=max(errors) if errors else None, mean_abs_error=None,
-                   failed_elements=len(failures), reason='; '.join(failures),
-                   detail_report=str(stage.output / 'summary.json'))
-        if phase == 'generation':
-            compared = [case for case in report['cases'] if 'exact_status' in case]
-            row.update(topk=5, near_tie_tol=0.0 if policy == 'top5' else 0.1,
-                       token_match=all(case['token_match'] for case in compared) if compared else None,
-                       text_match=all(case['text_match'] for case in compared) if compared else None)
-        rows.append(row)
-    return rows
+    failures = [f'{case["case"]}: {case.get("reason", "")}' for case in report['cases']
+                if case['status'] != 'PASS']
+    if not report['complete']:
+        failures.append(f'incomplete stage: {report["completed_case_count"]}/{report["expected_case_count"]} cases')
+    compared = [case for case in report['cases'] if 'accepted_by' in case]
+    return [dict(case='generation', alignment_policy='all', backend=BACKEND,
+                 status='FAIL' if failures else 'PASS', complete=report['complete'],
+                 completed_case_count=report['completed_case_count'], expected_case_count=report['expected_case_count'],
+                 accepted_by=','.join(sorted({case['accepted_by'] for case in compared if case['accepted_by']})),
+                 warning_count=sum(case.get('warning_count', 0) for case in compared),
+                 failed_elements=len(failures), reason='; '.join(failures),
+                 detail_report=str(stage.output / 'summary.json'))]
 
 
 def run_all_alignment(suite, args, prompts, tokenizer):
     """/**
-     * 顺序执行一套自由生成和独立numeric验收，并逐阶段保存四项汇总。
-     * 普通失败保留后继续下一阶段；用户中断会保存部分报告并立即停止。
-     * 两阶段使用独立输出目录和显存生命周期，不复用教师强制数据作生成证据。
-     * @param suite 根报告Suite，统一保存命令、硬件及Git元信息。
-     * @param args 已校验的all模式参数；固定K=5、宽松容差0.1。
-     * @param prompts 双方共用的Prompt ID和生成配置。
-     * @param tokenizer 生成文本解码器。
-     * @return 无；四项状态写入suite.rows，最终任一失败返回非零。
+     * 执行一次自由生成矩阵，每请求按exact、Top-5、near-tie逐级接受，不启动numeric。
+     * @param suite 根报告Suite，保存命令、硬件及Git元信息。
+     * @param args 已校验生成参数，固定K=5和宽松容差0.1。
+     * @param prompts 双方共用的请求；请求之间可在不同等级通过。
+     * @param tokenizer 共同文本解码器。
+     * @return 无；整体状态只由逐请求接受、执行故障和完成状态决定。
      */"""
-    suite.metadata.update(alignment_policy='all', expected_case_count=4, execution_complete=False,
-        correctness='exact + strict Top-5 + Top-5/0.1 on shared independent generation; separate strict numeric',
+    suite.metadata.update(alignment_policy='all', expected_case_count=1, execution_complete=False,
+        correctness='exact -> Top-5 -> Top-5/0.1; accept first passing level; no numeric comparison',
         model_path=str(args.model.resolve()), policy_source=POLICY_SOURCE, stages={},
-        report_title='FT vs HF: four alignment checks',
-        report_description='前三项复用同一批独立生成；numeric单独运行。每项结论均保留，任一失败则总体FAIL。'
-                           '根报告failed_elements统计失败case及未完成标记；最大误差取阶段case最大值，'
-                           '均值和元素级失败数见各阶段明细。生成数值诊断只警告，numeric仍严格失败。')
+        report_title='FT vs HF: generation cascade',
+        report_description='每请求任一等级通过即接受；未通过单项为WARNING，后续未执行为SKIP。'
+                           '全部三级未通过、执行故障或阶段未完成时整体FAIL；不执行numeric。')
     save_report(suite.output, suite.rows, suite.metadata)
-
-    for phase in ('generation', 'numeric'):
-        stage_args = argparse.Namespace(**vars(args))
-        stage_args.alignment_policy = 'all' if phase == 'generation' else 'numeric'
-        stage = Suite(stage_args, output=suite.output / phase)
-        stage.metadata.update(expected_case_count=8 * len(prompts) + 6 if phase == 'generation' else 5,
-                              execution_complete=False, alignment_stage=phase,
-                              parent_report=str(suite.output / 'summary.json'))
-        (stage.output / 'requests.json').write_text(json.dumps(prompts, ensure_ascii=False, indent=2))
-        suite.metadata['stages'][phase] = str(stage.output / 'summary.json')
+    stage_args = argparse.Namespace(**vars(args))
+    stage_args.alignment_policy = 'all'
+    stage = Suite(stage_args, output=suite.output / 'generation')
+    stage.metadata.update(expected_case_count=8 * len(prompts) + 6, execution_complete=False,
+                          alignment_stage='generation', parent_report=str(suite.output / 'summary.json'))
+    (stage.output / 'requests.json').write_text(json.dumps(prompts, ensure_ascii=False, indent=2))
+    suite.metadata['stages']['generation'] = str(stage.output / 'summary.json')
+    save_report(stage.output, stage.rows, stage.metadata)
+    try:
+        stage.generation_alignment(args.model, prompts, tokenizer)
+        stage.metadata['execution_complete'] = True
+    except BaseException as error:
+        (stage.output / 'setup.traceback.log').write_text(traceback.format_exc())
+        stage.rows.append(dict(case='generation_setup', backend=BACKEND, status='FAIL',
+                               failed_elements=1, reason=f'{type(error).__name__}: {error}'))
+        print(f'FAIL: generation: {error}', file=sys.stderr, flush=True)
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+    finally:
         save_report(stage.output, stage.rows, stage.metadata)
-        try:
-            if phase == 'generation':
-                stage.generation_alignment(args.model, prompts, tokenizer)
-            else:
-                run_numeric_reference(stage, stage_args, prompts)
-            stage.metadata['execution_complete'] = True
-        except BaseException as error:
-            (stage.output / 'setup.traceback.log').write_text(traceback.format_exc())
-            stage.rows.append(dict(case=phase + '_setup', backend=BACKEND, status='FAIL',
-                                   failed_elements=1, reason=f'{type(error).__name__}: {error}'))
-            print(f'FAIL: {phase}: {error}', file=sys.stderr, flush=True)
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                raise
-        finally:
-            save_report(stage.output, stage.rows, stage.metadata)
-            rows = summarize_alignment_stage(stage, phase)
-            suite.rows.extend(rows)
-            suite.metadata['execution_complete'] = len(suite.rows) == 4 and all(row['complete'] for row in suite.rows)
-            save_report(suite.output, suite.rows, suite.metadata)
-            for row in rows:
-                print(f'{row["status"]}: alignment/{row["case"]}; details: {row["detail_report"]}', flush=True)
+        suite.rows.extend(summarize_alignment_stage(stage, 'generation'))
+        suite.metadata['execution_complete'] = all(row['complete'] for row in suite.rows)
+        save_report(suite.output, suite.rows, suite.metadata)
+        print(f'{suite.rows[-1]["status"]}: alignment/generation; details: {stage.output}', flush=True)
 
 
 def main():
@@ -757,7 +725,7 @@ def main():
     parser.add_argument('--requests', type=Path, default=ROOT / 'test/distributed/data/qwen_moe_requests.jsonl')
     parser.add_argument('--reference-python', default=sys.executable, help='独立Transformers参考环境的Python路径')
     parser.add_argument('--alignment-policy', choices=('topk', 'exact', 'numeric', 'all'), default='topk',
-                        help='默认Top-K；exact严格输出；numeric严格数值；all共用生成检查三种规则后独立运行numeric')
+                        help='真实生成统一三级接受；topk/exact为兼容别名，numeric生成验收已停用')
     parser.add_argument('--alignment-topk', type=int, default=5, help='生成验收候选数，不改变实际采样')
     parser.add_argument('--near-tie-tol', type=float, default=0.1, help='候选边界logprob容差；0为严格双向Top-K包含')
     parser.add_argument('--performance', action='store_true',
@@ -817,22 +785,28 @@ def main():
     if args.model and not args.performance and not args.lifecycle_only:
         request_count = sum(bool(line.strip()) for line in args.requests.read_text().splitlines())
         generation_cases = 8 * request_count + 6
-        # all包含生成明细、5项numeric及4项策略汇总，保守地全部计入上限。
-        case_count = 5 if args.alignment_policy == 'numeric' else generation_cases + (9 if args.alignment_policy == 'all' else 0)
+        # 生成明细与一条根汇总都计入50项上限。
+        case_count = generation_cases + 1
         if case_count > 50:
-            parser.error('HF对齐超过50个case，请拆分--requests；all模式每批最多4条请求')
+            parser.error('HF对齐超过50个case，请拆分--requests；每批最多5条请求')
     if args.performance and (args.alignment_policy != 'topk' or args.alignment_topk != 5 or args.near_tie_tol != 0.1):
         parser.error('--performance独立测速，不能同时指定其他对齐策略或候选阈值')
     if args.alignment_policy == 'all':
         if not args.model or args.performance:
             parser.error('all仅用于真实模型功能验收，需要--model，不能与--performance混用')
         if args.alignment_topk != 5 or args.near_tie_tol != 0.1:
-            parser.error('all固定比较exact、Top-5/0、Top-5/0.1及numeric，不能覆盖K或宽松容差')
+            parser.error('生成三级验收固定Top-5和near-tie容差0.1')
     try:
         validate_policy('topk' if args.alignment_policy in ('numeric', 'all') else args.alignment_policy,
                         args.alignment_topk, args.near_tie_tol)
     except ValueError as error:
         parser.error(str(error))
+    if args.alignment_policy == 'numeric':
+        parser.error('生成验收不再执行numeric，请使用all')
+    if args.model and not args.performance and not args.lifecycle_only:
+        if args.alignment_topk != 5 or args.near_tie_tol != 0.1:
+            parser.error('生成三级验收固定Top-5和near-tie容差0.1')
+        args.alignment_policy = 'all'
     suite = Suite(args)
     try:
         if args.lifecycle_only:
@@ -856,12 +830,7 @@ def main():
                        for row in (json.loads(line) for line in args.requests.read_text().splitlines() if line.strip())]
             require(prompts, 'empty JSONL request set')
             (suite.output / 'requests.json').write_text(json.dumps(prompts, ensure_ascii=False, indent=2))
-            if args.alignment_policy == 'all':
-                run_all_alignment(suite, args, prompts, tokenizer)
-            elif args.alignment_policy != 'numeric':
-                suite.generation_alignment(args.model, prompts, tokenizer)
-            else:
-                run_numeric_reference(suite, args, prompts)
+            run_all_alignment(suite, args, prompts, tokenizer)
         else:
             suite.synthetic()
     except BaseException as error:

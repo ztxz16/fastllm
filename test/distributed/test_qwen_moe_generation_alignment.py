@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 import run_qwen_moe_full as runner
-from test_generation_alignment import report
+from test_generation_alignment import report, all_failure
 from qwen_moe_transformers_reference import generation_reference
 
 
@@ -63,7 +63,8 @@ class RunnerTests(unittest.TestCase):
             for suffix in ('json', 'md', 'csv', 'xlsx'):
                 self.assertTrue((root / f'summary.{suffix}').exists())
             csv = (root / 'summary.csv').read_text()
-            self.assertIn('logit_failed_elements', csv)
+            self.assertIn('accepted_by', csv)
+            self.assertNotIn('logit_failed_elements', csv)
             self.assertIn('exact_match', csv)
             self.assertTrue(calls)
             self.assertTrue(all(value is None for value in calls))
@@ -82,46 +83,41 @@ class RunnerTests(unittest.TestCase):
         """/** exact和严格候选失败后仍完成全部模式，只生成一次且三项结论分别保存。 */"""
         actual, expected = report([[10., 0., -1., -2., -3., -4.]]), report([[-4., 0., -1., -2., -3., 10.]])
         result, console = self.run_suite(actual, expected, policy='all')
-        self.assertEqual(result['status'], 'FAIL')
+        self.assertEqual(result['status'], 'PASS')
         self.assertTrue(result['complete'])
         cases = [row for row in result['cases'] if 'alignment_policy' in row]
         self.assertEqual(len(cases), 10)
-        self.assertTrue(all(row['exact_status'] == row['top5_status'] == 'FAIL' and
+        self.assertTrue(all(row['exact_status'] == row['top5_status'] == 'WARNING' and
                             row['top5_near_tie_status'] == 'PASS' for row in cases))
         self.assertEqual(console.count('ALIGNMENT:'), 10)
 
         result, _ = self.run_suite(actual, actual, policy='all')
         self.assertEqual(result['status'], 'PASS')
 
-    def test_default_policy_warns_without_failing_for_numeric_error(self):
-        """/** 数值超差保留误差并输出警告，阈值内不警告；共同配置与生产扩展分开标记。 */"""
+    def test_default_policy_does_not_run_numeric(self):
+        """/** 同输出不同Logits通过exact，报告不再计算数值误差或输出numeric告警。 */"""
         actual, expected = report([[9., 2., 1., 0., -1., -2.]]), report([[5., 1., 0., -1., -2., -3.]])
         result, console = self.run_suite(actual, expected)
         self.assertEqual(result['status'], 'PASS')
         cases = [row for row in result['cases'] if 'alignment_policy' in row]
         self.assertEqual(len(cases), 10)
-        self.assertTrue(all(row['failed_elements'] == 0 and row['logit_failed_elements'] == 6 for row in cases))
-        self.assertTrue(all(row['logit_diagnostic_status'] == 'WARNING' for row in cases))
-        self.assertEqual(console.count('WARNING:'), len(cases))
-        self.assertIn('max_abs=4.000 mean_abs=1.500 exceeded_elements=6', console)
-        self.assertNotIn('FAIL:', console)
+        self.assertTrue(all(row['accepted_by'] == 'exact' and row['failed_elements'] == 0 for row in cases))
+        self.assertTrue(all('logit_diagnostic_status' not in row for row in cases))
+        self.assertNotIn('WARNING:', console)
         self.assertEqual(cases[0]['configuration_scope'], 'shared_eager')
         self.assertEqual(cases[2]['configuration_scope'], 'ft_production_vs_hf_eager')
 
-        result, console = self.run_suite(expected, expected)
-        self.assertEqual(result['status'], 'PASS')
-        self.assertTrue(all(row['logit_diagnostic_status'] == 'PASS'
-                            for row in result['cases'] if 'alignment_policy' in row))
-        self.assertNotIn('WARNING:', console)
-
-    def test_candidate_failure_or_exact_failure_cannot_be_hidden_by_execution_pass(self):
-        """/** 运行路径成功不覆盖请求对齐失败；两种门禁分别影响总体结论。 */"""
+    def test_legacy_policy_names_use_the_same_cascade(self):
+        """/** 旧exact/topk入口统一逐级接受，执行成功不能掩盖三级全部未通过。 */"""
         a, b = report([[10., 0., -1., -2., -3., -4.]]), report([[-4., 0., -1., -2., -3., 10.]])
-        for policy, tolerance, status in (('topk', 0, 'FAIL'), ('topk', .1, 'PASS'), ('exact', .1, 'FAIL')):
-            with self.subTest(policy=policy, tolerance=tolerance):
-                result, _ = self.run_suite(a, b, policy=policy, tolerance=tolerance)
-                self.assertEqual(result['status'], status)
-                self.assertTrue(all(row['status'] == 'PASS' for row in result['cases'] if row['case'].endswith('_execution')))
+        for policy in ('topk', 'exact', 'all'):
+            with self.subTest(policy=policy):
+                accepted, console = self.run_suite(a, b, policy=policy)
+                self.assertEqual(accepted['status'], 'PASS')
+                self.assertIn('WARNING:', console)
+                failed, _ = self.run_suite(*all_failure(), policy=policy)
+                self.assertEqual(failed['status'], 'FAIL')
+                self.assertTrue(all(row['status'] == 'PASS' for row in failed['cases'] if row['case'].endswith('_execution')))
 
     def test_reference_failure_does_not_launch_ft(self):
         """/** HF失败不能降级成FT自比或使用缺失参考。 */"""

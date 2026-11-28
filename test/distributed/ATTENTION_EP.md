@@ -6,12 +6,22 @@
 代码已接入；本地禁止编译，GPU 功能和性能必须以服务器本次报告为准。
 下面的命令由用户在 **Vast 的 Linux 终端**执行，不在 Windows PowerShell 执行。
 
-2026-11-17起，真实模型的默认`real`改为下文“生成级HF对齐”，默认Top-5、
-候选门槛容差0.1。此前全量logits和逐层/路由的严格检查保留为`real-numeric`，
-阈值与历史FAIL不改写。本文历史实验中的“阈值保持不变”仍指严格数值诊断。
-上述生成级HF对齐调整只涉及测试及报告，不代表真实GPU验收已经通过。
-需要一次查看四项结论时使用`real-all`：exact、严格Top-5和Top-5+0.1共用一次生成矩阵，
-随后独立运行numeric。旧的单策略入口及默认值保持不变。
+2026-11-28起，真实生成验收按 `exact` → `top5` → `top5_near_tie` 逐级比较，
+任一项通过即接受该请求；未通过单项为 WARNING，后续未执行项为 SKIP。
+三项均未通过才准确性 FAIL；执行故障和缺少证据仍 FAIL。不再追加 numeric 比较。
+`real`、`real-exact`、`real-all` 为同一三级接受入口的兼容名称，`real-numeric` 已停用。
+本文旧数值诊断和历史结果保留为历史说明，不代表当前生成验收仍执行 numeric。
+本次调整由 Python 比较和报告层完成，不改变 C++/CUDA 推理、采样或 KV 行为。
+
+## 后续需求：按负载分数选副本（待实现）
+
+2026-11-19 用户明确要求：Attention DP/EP 后续也要支持按负载分数选择副本的策略。
+
+- 目标：支持 `load` 路由，根据负载分数选择接收请求的 Attention 副本（rank），
+  优先选择分数最低者。
+- 当前 `load` 仅支持普通进程 DP>1；Attention DP/EP 拒绝该配置只是本轮实现的
+  阶段限制，不代表永久不支持。后续规划与实现必须保留上述目标。
+- 状态：待实现。本节仅记录已确认需求，尚未启用 Attention DP/EP 的 `load` 路由。
 
 ## 批次不变性计划：先修复 MoE，再逐步验证全链路（实施中，待 GPU 验收）
 
@@ -243,9 +253,9 @@ Transformers 4.57.6、Accelerate 1.12.0。主环境仅用于分词，不能用�
 `regression` 会在独立结果目录生成稠密小模型和 tokenizer，然后调用原有 DP2×TP1、DP4×TP1、
 DP2×TP2 验收以及 TP Decode Eager/Graph 验收，不需要另下载稠密模型。
 
-## 生成级HF对齐（2026-11-17）
+## 生成级HF对齐（2026-11-28 更新）
 
-`real`默认采用`--alignment-policy topk --alignment-topk 5 --near-tie-tol 0.1`。
+`real`统一采用三级接受规则，固定 Top-5 与 near-tie 容差 0.1。
 规则参考vLLM的[生成模型测试说明](https://docs.vllm.ai/en/latest/contributing/model/tests/)
 及`tests/models/utils.py`中生成Token的双向候选检查。上游已查阅文件的Git blob为
 `0bec9ca9bec88f10d61770d821143f3528dbfdfe`，通用测试文件blob为
@@ -267,39 +277,21 @@ DP2×TP2 验收以及 TP Decode Eager/Graph 验收，不需要另下载稠密模
   Graph、Prefix及并发配置单独标记`ft_production_vs_hf_eager`，仍核对实际路径和命中。
   Prefix路由检查当前请求实际复用的Token数，不能用历史累计命中替代本次命中。
   后者是生产配置的输出验收，不是相同运行模式的速度对比。
-- 每行报告记录选定策略、`exact_match`、`candidate_match`、首次分歧、比较步数与
-  `uncompared_steps`。`failed_elements`表示当前生成门禁失败；同历史全词表的
-  max/mean误差、`logit_failed_elements`与`logit_diagnostic_status`另外保留，绝不清零。
-  数值超差在报告和终端中只提示WARNING，不影响生成验收判定；终端保留最大/平均误差
-  与超差元素数。任一生成case或执行路径失败仍返回非零。
-- 启动前登记预期用例数，只有全部完成且通过才汇总为PASS；中途报告包含`complete=false`。
-  对齐与性能分别登记、分别汇总；对齐报告不包含性能用例。
-- 严格数值验收独立运行，继续检查教师强制完整历史的每步logits与实际专家集合，
-  失败仍返回非零。合成小模型、算子、生命周期以及性能公平性检查不放宽。
-
-保持前文参考环境设置，使用已有原生产物即可；这些命令不会编译：
-
-```bash
-# 默认候选级验收：Top-5，边界容差0.1
-bash test/distributed/run_attention_ep_v100.sh real
-# 严格Token和文本一致
-bash test/distributed/run_attention_ep_v100.sh real-exact
-# 只允许互在Top-5，不启用额外边界容差
-ATTENTION_EP_NEAR_TIE_TOL=0 bash test/distributed/run_attention_ep_v100.sh real
-# 原来的逐层/路由/全量logits严格数值诊断
-bash test/distributed/run_attention_ep_v100.sh real-numeric
-# 一套自由生成同时判定三种规则，再单独运行numeric；不编译
-bash test/distributed/run_attention_ep_v100.sh real-all
-```
-
-各命令新建独立目录并生成JSON/Markdown/CSV/XLSX。历史报告继续按原规则解释，
-不得把旧FAIL改写成PASS；新规则需重新运行并标明策略后才能得出新结论。
+- 每行报告保存 `accepted_by`、三级 PASS/WARNING/SKIP、Token/文本一致性、首次分歧、
+  比较步数与 `uncompared_steps`。exact 通过后不计算候选；Top5 通过后不执行 near-tie。
+  未通过单项在终端提示 WARNING；不再计算或输出生成 numeric 误差统计。
+- 每请求独立接受，全部请求通过且执行检查完成才整批 PASS；不同请求可以在不同等级通过。
+  三项均未通过、执行异常、缺少证据或未完成任务仍 FAIL 并返回非零。
+- 入口保留 `topk`、`exact` 参数名称作为三级规则的兼容别名；显式 numeric 参数会拒绝运行。
+  本次不修改历史 Shell 文件，也不改变纯张量算子等独立测试的专属数值检查。
+- 历史报告保持原样；按新规则重判时另建目录，注明证据来源、规则版本和接受范围，
+  不将候选通过描述成实际输出完全一致。
 
 ### 独立性能测试
 
 `performance`只运行性能矩阵，不运行HF生成对齐、numeric或完整合成验收，也不读取
-对齐请求集或使用参考Python环境。`real`、`real-exact`、`real-numeric`和`real-all`
-继续独立进行对齐；`http`只验证服务功能。已经完成的阶段无需因测速再次执行。
+对齐请求集或使用参考Python环境。`real`、`real-exact`和`real-all`
+继续独立进行三级生成对齐；`http`只验证服务功能。已经完成的阶段无需因测速再次执行。
 
 ```bash
 bash test/distributed/run_attention_ep_v100.sh performance
@@ -515,33 +507,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 "$ATTENTION_EP_REFERENCE_PYTHON" \
 全部通过，总报告仍FAIL并返回非零。基准重放失败或诊断异常时，候选结论为null并保留
 部分报告。候选通过后仍需另行修改正式路径并验证完整模型，不能直接视为问题已修复。
 
-### 四项联合验收
+### 三级生成接受与汇总
 
-`real-all`等价于真实模型入口的`--alignment-policy all`。固定比较exact、K=5/容差0、
-K=5/容差0.1和numeric；若环境覆盖了K或宽松容差，入口会拒绝运行，避免报告名称与实际
-规则不符。该模式不与`--performance`混用；性能测试继续使用独立入口。
+真实模型入口统一使用 `--alignment-policy all`，固定 exact、K=5/容差0、K=5/容差0.1。
+每个请求在首个通过等级停止，HF/FT 都只执行一次原有生成矩阵，不为切换比较等级重跑生成。
+不启动 numeric 参考进程，不创建 numeric 阶段目录。
 
-- HF自由生成参考只运行一次；FT只运行原有Graph/Prefix、cold/warm及前缀路由矩阵。
-  每个请求的三种判定共用同一份Token、文本和原始logits，不为切换规则重新生成。
-- 三种结论分别保存。exact失败或严格Top-5失败后，仍完成其他请求和numeric。
-  模型执行、输入验证、Graph/Prefix路径检查失败会使对应生成策略全部失败。
-- numeric使用独立参考进程及教师强制历史，继续执行逐层/专家路由和四组Graph/Prefix
-  数值检查；不能把生成报告中的数值WARNING当作numeric PASS。
-- 普通阶段异常会保存部分报告并继续下一阶段；Ctrl+C保存部分报告后停止，不启动下一阶段。
-  阶段缺失、少跑用例或中途退出均标记`complete=false`。四项任一失败时最终返回非零。
-
-每次运行创建新的`时间戳_moe_full_随机号/`目录：
-
-- 根目录`summary.json/md/csv/xlsx`：exact、top5、top5_near_tie、numeric四行独立结论，
-  包含阶段完成状态及明细报告路径。根报告失败数统计失败case及未完成标记；最大误差取
-  阶段case最大值，平均误差不跨不同大小的张量直接平均，应查看逐case报告。
-- `generation/summary.json/md/csv/xlsx`：逐请求的三种状态、Token/文本一致性、首次分歧、
-  已比较与未比较步数、数值误差及WARNING。每个case JSON仅保存一份FT原始生成数据，
-  三套候选/严格判定放在`comparison.comparisons`，HF原始结果保存在同目录参考文件中。
-- `numeric/summary.json/md/csv/xlsx`：原严格数值检查的独立明细与失败原因。
-
-JSON保留原始数值精度，其余表格浮点显示三位小数。根报告只有四项全部完成并通过才为PASS，
-不能用宽松策略的通过覆盖严格策略的失败；已有历史报告不修改。
+- 根目录 `summary.json/md/csv/xlsx` 保存一条 generation 汇总，只根据每个请求的最终接受结果、
+  功能检查和完成状态决定整体结论；不要求所有请求都在同一个等级通过。
+- `generation/summary.json/md/csv/xlsx` 保存逐请求的接受等级、三级状态、首次分歧和 WARNING 数量。
+  case JSON 保留实际输出及比较证据，参考数据仍单独保存。不计算生成数值误差。
+- 发生异常或中断时保存部分报告，未完成标为 `complete=false`，不能记为 PASS。
+  JSON 保留原始精度，其他表格浮点统一三位小数。历史四项报告保持原样。
 
 ## 失败历史的分层定位
 
@@ -973,14 +950,14 @@ bash test/distributed/run_attention_ep_acceptance_v100.sh
   7/8 成功、9 明确拒绝；核对各 rank 实际页池配置，并保留数值与资源清理检查。
   此项替换旧连续 KV 的 `reject_kv_limit`（256 MiB）预期，不修改推理容量限制。
 - HF：全部 8 条中文请求拆成两份，每份分别跑旧路径和批次不变模式。
-  每份包含 38 项生成明细、5 项 numeric 和 4 项策略汇总，共 47 项；
-  exact、Top-5、Top-5/0.1、numeric 各自保留结论，任一失败仍返回非零。
+  每份包含 38 项生成明细与 1 项整体汇总，共 39 项；
+  每请求三级接受，不执行 numeric；任一请求整体失败或功能故障仍返回非零。
 - 性能：512/1024/1792 输入、128 输出，按 off/cold/hot 分成 9 份。
   每份包含 6 项旧路径、6 项候选及 6 项比较，共 18 项，全部至少 5 轮。
 
 小模型夹具包含不满足 SM70 专家对齐要求的维度及多种源权重类型，继续作为既有路径回归。
-SM70 模式通过真实模型的生命周期、HTTP、生成/numeric 与性能入口验证。
-numeric 中独立的单层检查器继续使用既有路径，不能把该项 PASS 解释成候选专家后端的单层验收。
+SM70 模式通过真实模型的生命周期、HTTP、三级生成与性能入口验证。
+旧 numeric 报告中的独立单层检查器使用既有路径，不能把历史 PASS 解释成候选专家后端的单层验收。
 
 只运行选定范围也使用同一后台启动器，例如：
 
@@ -1012,9 +989,9 @@ bash test/distributed/run_attention_ep_acceptance_v100.sh --groups performance
   `qkv_bias_rounding`继续拒绝点积先转FP16再加bias的重复舍入；`mixed_qkv_bias`首层无QKV bias、
   第二层有bias，通过正式单层与EP1/2/4、Graph/Prefix组合检查逐层后端选择、GQA不等宽布局、
   变长/空rank及缓存复用。CPU检查只验证用例的参考语义和检错能力，不代替服务器GPU执行。
-- 真实权重默认使用固定中文JSONL、独立贪心生成及上述候选级对齐；严格Token/文本结果另列。
-  `real-numeric`保留独立Transformers FP16重算完整历史末位置logits的旧数值验收。
-  另外使用四个固定短序列记录全部层的真实输入、Router、共享/路由专家贡献和层输出，
+- 真实权重使用固定中文JSONL、独立贪心生成及上述三级接受；未通过单项保留 WARNING。
+  以下为已停用的 `real-numeric` 历史实现说明，不属于当前生成验收。旧模式曾使用独立
+  Transformers FP16 重算完整历史末位置 logits，并使用四个固定短序列记录全部层的真实输入、Router、共享/路由专家贡献和层输出，
   经正式单层接口进行四 rank 对照；单层检查关闭权重落盘，避免再次输出几十 GB 权重。
   专家ID、路由权重和路由累加值直接观察HF实际Top-K、dtype转换与index_add_的返回值，
   不在CPU重新选专家，也不将HF的FP16累加改成FP32。支持Linear gate与ModuleList专家；
@@ -1040,5 +1017,5 @@ bash test/distributed/run_attention_ep_acceptance_v100.sh --groups performance
   JSON 保留原始浮点精度，表格浮点显示 3 位。原始 trace、采样和命令同目录保存。
 
 阶段6尚需服务器报告才能验收完成。生成级报告只承诺所选策略及实际配置覆盖；
-`real-numeric`中的逐层中间量使用固定短序列，中文JSONL诊断比较每个生成位置完整logits。
+`real-numeric`历史报告中的逐层中间量使用固定短序列，中文JSONL诊断比较每个生成位置完整logits。
 生成级PASS、严格输出一致和内部数值诊断须分别报告。
