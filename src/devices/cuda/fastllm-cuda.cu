@@ -26536,8 +26536,9 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         // GDN and full attention run sequentially on the same worker stream.
         // The cuBLAS handle has a separate workspace; borrow the attention
         // float arena without changing the chunk window or GEMM arithmetic.
+        bool scratchOwn = false;
         uint8_t *scratch = (uint8_t *)FastllmBorrowCudaTempBuffer(
-            vBytes + qBytes + kBytes + gBytes + lastBytes, nullptr, nullptr);
+            vBytes + qBytes + kBytes + gBytes + lastBytes, nullptr, &scratchOwn);
         fastllm::AssertInFastLLM(scratch != nullptr,
                                "CUDA chunk GDN workspace allocation failed.\n");
         vNewData = scratch;
@@ -26765,6 +26766,7 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                     1.0f, 1.0f);
             }
         }
+        FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
     } else {
         const int BVHSmall = 16;
         const int BVHLarge = 32;

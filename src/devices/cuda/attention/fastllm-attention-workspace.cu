@@ -1,4 +1,5 @@
 #include "fastllm-attention-workspace.cuh"
+#include <thread>
 
 static size_t ParseSizeFromEnv(const char* env_name, size_t default_size) {
     const char* val = std::getenv(env_name);
@@ -130,7 +131,20 @@ static std::mutex s_fastllmCudaTempBuffersMapLock;
 // 其它 rank 又卡在等待这把全局锁，从而形成跨 rank 死锁。
 static std::map<int, std::unique_ptr<std::mutex>> s_fastllmCudaTempBufferDeviceLocks;
 
-static FastllmCudaTempDeviceBuffer *FastllmGetCudaTempBufferHolder(int id, std::mutex **outDeviceLock) {
+// The shared temp storage (FlashInfer float arena or holder) of one device is
+// used by the scheduler thread and TP worker threads, each on its own
+// cudaStreamPerThread. One user at a time; the next user from another stream
+// waits on the previous user's release event. Guarded by the device lock.
+struct FastllmCudaTempLease {
+    void *leasedPtr = nullptr;
+    cudaEvent_t released = nullptr;
+    bool releasePending = false;
+    std::thread::id releaser;
+};
+static std::map<int, FastllmCudaTempLease> s_fastllmCudaTempLeases;
+
+static FastllmCudaTempDeviceBuffer *FastllmGetCudaTempBufferHolder(
+        int id, std::mutex **outDeviceLock, FastllmCudaTempLease **outLease = nullptr) {
     std::lock_guard<std::mutex> guard(s_fastllmCudaTempBuffersMapLock);
     auto &holder = s_fastllmCudaTempBuffers[id];
     if (holder == nullptr) {
@@ -142,6 +156,9 @@ static FastllmCudaTempDeviceBuffer *FastllmGetCudaTempBufferHolder(int id, std::
     }
     if (outDeviceLock != nullptr) {
         *outDeviceLock = deviceLock.get();
+    }
+    if (outLease != nullptr) {
+        *outLease = &s_fastllmCudaTempLeases[id];
     }
     return holder.get();
 }
@@ -163,48 +180,88 @@ void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outO
     cudaError_t state = cudaGetDevice(&id);
     checkCudaErrors("Error: CUDA error when find device!", state);
 
-    size_t workspaceBytes = 0;
-    void *workspace = TryGetFlashInferFloatWorkspace(id, &workspaceBytes);
-    if (workspace != nullptr && workspaceBytes >= needBytes) {
-        if (outBytes != nullptr) {
-            *outBytes = workspaceBytes;
-        }
-        return workspace;
-    }
-
     std::mutex *deviceLock = nullptr;
-    FastllmCudaTempDeviceBuffer *holderPtr = FastllmGetCudaTempBufferHolder(id, &deviceLock);
-    std::lock_guard<std::mutex> guard(*deviceLock);
-    FastllmCudaTempDeviceBuffer &holder = *holderPtr;
-
-    size_t allocBytes = FastllmCudaTempAlignBytes(needBytes);
-    if (holder.size < allocBytes) {
-        if (holder.data != nullptr) {
-            FastllmCudaDirectFree(holder.data);
-            holder.data = nullptr;
-            holder.size = 0;
-        }
-        holder.data = FastllmCudaDirectMalloc(allocBytes);
-        if (holder.data == nullptr) {
-            holder.size = 0;
-            if (outBytes != nullptr) {
-                *outBytes = 0;
+    FastllmCudaTempLease *lease = nullptr;
+    FastllmCudaTempDeviceBuffer *holderPtr = FastllmGetCudaTempBufferHolder(id, &deviceLock, &lease);
+    void *ret = nullptr;
+    size_t retBytes = 0;
+    cudaEvent_t waitEvent = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(*deviceLock);
+        if (lease->leasedPtr == nullptr) {
+            FastllmCudaTempDeviceBuffer &holder = *holderPtr;
+            size_t allocBytes = FastllmCudaTempAlignBytes(needBytes);
+            if (holder.size < allocBytes) {
+                if (holder.data != nullptr) {
+                    FastllmCudaDirectFree(holder.data);
+                    holder.data = nullptr;
+                    holder.size = 0;
+                }
+                holder.data = FastllmCudaDirectMalloc(allocBytes);
+                holder.size = holder.data == nullptr ? 0 : allocBytes;
             }
-            return nullptr;
+            ret = holder.data;
+            retBytes = holder.size;
+            if (ret == nullptr) {
+                if (outBytes != nullptr) {
+                    *outBytes = 0;
+                }
+                return nullptr;
+            }
+            lease->leasedPtr = ret;
+            if (lease->releasePending && lease->releaser != std::this_thread::get_id()) {
+                waitEvent = lease->released;
+            }
         }
-        holder.size = allocBytes;
     }
 
-    if (outBytes != nullptr) {
-        *outBytes = holder.size;
+    if (ret == nullptr) {
+        // Leased by another stream or an outer borrow on this thread: private pool memory.
+        ret = FastllmCudaMalloc(needBytes);
+        retBytes = ret == nullptr ? 0 : needBytes;
+        if (ret != nullptr && outOwn != nullptr) {
+            *outOwn = true;
+        }
+    } else if (waitEvent != nullptr && !FastllmCudaGraphIsCapturingFast()) {
+        checkCudaErrors("Error: CUDA error when waiting for temp buffer release!",
+                        cudaStreamWaitEvent(cudaStreamPerThread, waitEvent, 0));
     }
-    return holder.data;
+    if (outBytes != nullptr) {
+        *outBytes = retBytes;
+    }
+    return ret;
 }
 
 void FastllmReleaseCudaTempBuffer(void *ptr, bool own) {
-    if (own && ptr != nullptr) {
-        FastllmCudaFree(ptr);
+    if (ptr == nullptr) {
+        return;
     }
+    if (own) {
+        if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr);
+        return;
+    }
+
+    int id = -1;
+    checkCudaErrors("Error: CUDA error when find device!", cudaGetDevice(&id));
+    std::mutex *deviceLock = nullptr;
+    FastllmCudaTempLease *lease = nullptr;
+    FastllmGetCudaTempBufferHolder(id, &deviceLock, &lease);
+    std::lock_guard<std::mutex> guard(*deviceLock);
+    if (ptr != lease->leasedPtr) {
+        return;
+    }
+    // cudaEventRecord/cudaStreamWaitEvent across a capture boundary would invalidate it.
+    if (!FastllmCudaGraphIsCapturingFast()) {
+        if (lease->released == nullptr) {
+            checkCudaErrors("Error: CUDA error when creating temp buffer event!",
+                            cudaEventCreateWithFlags(&lease->released, cudaEventDisableTiming));
+        }
+        checkCudaErrors("Error: CUDA error when recording temp buffer release!",
+                        cudaEventRecord(lease->released, cudaStreamPerThread));
+        lease->releasePending = true;
+        lease->releaser = std::this_thread::get_id();
+    }
+    lease->leasedPtr = nullptr;
 }
 
 void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outOwn) {
