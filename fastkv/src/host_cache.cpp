@@ -358,12 +358,14 @@ struct HostCache::Impl {
         for (auto &worker : workers) if (worker.joinable()) worker.join();
     }
     ~Impl() { Stop(); }
-    std::shared_ptr<Entry> Match(const std::string &name, const std::vector<int> &tokens) const {
+    std::shared_ptr<Entry> Match(const std::string &name, const std::vector<int> &tokens,
+                                 size_t maxTokens = SIZE_MAX) const {
+        const size_t limit = std::min(tokens.size(), maxTokens);
         uint64_t hash = Namespace(name);
         size_t position = 0;
         std::shared_ptr<Entry> best;
         for (const auto &length : entries) {
-            if (length.first > tokens.size()) break;
+            if (length.first > limit) break;
             for (; position < length.first; ++position) hash = Hash(hash, uint32_t(tokens[position]));
             const auto range = length.second.equal_range(hash);
             for (auto it = range.first; it != range.second; ++it)
@@ -540,8 +542,11 @@ struct HostCache::Impl {
 HostCache::HostCache(Options options) : impl(new Impl(options)) {}
 HostCache::~HostCache() = default;
 HostCache::Hit HostCache::Find(const std::string &name, const std::vector<int> &tokens) const {
+    return Find(name, tokens, tokens.size());
+}
+HostCache::Hit HostCache::Find(const std::string &name, const std::vector<int> &tokens, size_t maxTokens) const {
     std::lock_guard<std::mutex> lock(impl->mutex);
-    auto entry = impl->Match(name, tokens);
+    auto entry = impl->Match(name, tokens, maxTokens);
     if (entry) entry->accessed = ++impl->clock;
     Hit hit; hit.entry = std::move(entry);
     return hit;

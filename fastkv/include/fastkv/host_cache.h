@@ -68,6 +68,7 @@ class HostCache {
     // Metadata-only probe. Find pins a complete checkpoint; no materialization.
     size_t ProbeTokens(const std::string &name, const std::vector<int> &tokens) const;
     Hit Find(const std::string &name, const std::vector<int> &tokens) const;
+    Hit Find(const std::string &name, const std::vector<int> &tokens, size_t maxTokens) const;
     // Source buffers MUST be immutable, ready and lifetime-owned. On busy the
     // caller can skip this optional backup. Publication is atomic after copy.
     bool PublishAsync(const std::string &name, std::vector<int> tokens,

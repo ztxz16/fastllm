@@ -641,6 +641,14 @@ struct PDRuntime {
         }
         return cache ? cache->ProbeTokens(identity, input) : 0;
     }
+    fastkv::HostCache::Hit FindHostPrefix(const PrefillRequest &request) const {
+        // A KV checkpoint has no logits. Leave the final position for this request's sampler.
+        const size_t limit = request.sampling ? request.input.size() - 1 : request.input.size();
+        return hostCache->Find(identity, request.input, limit);
+    }
+    bool CanSampleFirstToken(const basellm &model) const {
+        return residentPrefix && model.SupportsPDFirstToken();
+    }
     double HostRestoreBytesPerSecond() const {
         const double measured = hostCache ? hostCache->RestoreBytesPerSecond() : 0;
         return measured > 0 ? std::max(1.0, measured) : 1e10;
@@ -664,7 +672,7 @@ struct PDRuntime {
         request->work = workload;
         // Keep the lease for the final DP placement. Charge the waiting queue
         // for the tier we expect to use, including a recomputed L1 tail.
-        if (hostCache) request->hostHit = hostCache->Find(identity, request->input);
+        if (hostCache) request->hostHit = FindHostPrefix(*request);
         size_t cached = 0;
         if (request->hostHit) {
             cached = CachedTokens(model, request->input, request->metadata.sessionKey);
@@ -751,8 +759,10 @@ struct PDRuntime {
                         const auto reply = future.get();
                         Check(reply.buffers.empty(), "routing reply contains payload");
                         fastkv::Reader reader(reply.metadata);
-                        const auto kind = pending.probeKinds[i];
-                        Check(reader.U32() == kind, "invalid routing reply");
+                        const auto asked = pending.probeKinds[i];
+                        const auto kind = reader.U32();
+                        Check(kind == asked || (asked == PDFirstTokenProbe && kind == PDUsageProbe),
+                              "invalid routing reply");
                         auto &e = pending.estimates[i];
                         e.cachedTokens = reader.U64(); e.pendingTokens = reader.U64();
                         e.tokensPerSecond = reader.U64();
@@ -779,6 +789,7 @@ struct PDRuntime {
                             if (pending.shardedPeers.empty()) pending.shardedPeers.resize(peers.size());
                             pending.shardedPeers[i] = true;
                         }
+                        pending.probeKinds[i] = kind;
                         e.available = true; pending.probed[i] = true;
                     } catch (const std::exception &) {
                         if (pending.probeKinds[i] > 2)
@@ -1348,7 +1359,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     continue;
                 }
                 if (hostCache) {
-                    auto latest = hostCache->Find(identity, request->input);
+                    auto latest = FindHostPrefix(*request);
                     if (latest.Tokens() > request->hostHit.Tokens()) request->hostHit = std::move(latest);
                 }
                 const size_t residentTokens = request->hostHit && residentPrefix
@@ -2179,8 +2190,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 if (kind != 1) metadata.sessionKey = reader.String(512);
                 std::optional<GenerationConfig> sampling;
                 if (kind == PDFirstTokenPrefill) {
-                    Check(SupportsPDFirstToken() && raw->residentPrefix && !raw->hostCache && !raw->cache,
-                          "sampled PD handoff unsupported");
+                    Check(raw->CanSampleFirstToken(*this), "sampled PD handoff unsupported");
                     const auto last = reader.U32();
                     Check(last <= INT_MAX, "invalid final prompt token");
                     tokens.push_back(last);
@@ -2194,11 +2204,11 @@ void basellm::ConfigurePD(const json11::Json &config) {
             }, [this, raw = runtime.get()](const fastkv::Message &request, fastkv::Message &reply) {
                 if (request.metadata.size() < 4) return false;
                 fastkv::Reader reader(request.metadata);
-                const auto kind = reader.U32();
+                auto kind = reader.U32();
                 if (kind != 2 && kind != 4 && kind != 6 && kind != 7 && kind != 8 && kind != PDUsageProbe && kind != PDFirstTokenProbe) return false;
                 const auto requested = reader.String();
-                // Only the usage probe can negotiate a sharded response.
-                Check(requested == raw->identity || ((kind == PDUsageProbe || kind == 7) && raw->Accepts(requested)),
+                Check(requested == raw->identity ||
+                      ((kind == PDUsageProbe || kind == PDFirstTokenProbe || kind == 7) && raw->Accepts(requested)),
                       "incompatible routing identity");
                 if (kind == 7) {
                     const auto session = reader.String(512);
@@ -2216,9 +2226,12 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 const auto session = kind >= 6 ? reader.String(512) : std::string(); reader.End();
                 Check(!tokens.empty() && tokens.size() < size_t(max_positions), "invalid routing prompt");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds routing peer capacity");
-                if (kind == PDFirstTokenProbe)
-                    Check(SupportsPDFirstToken() && raw->residentPrefix && !raw->hostCache && !raw->cache &&
-                          tokens.size() < raw->tokenCapacity, "sampled PD handoff unsupported");
+                // Return the usable mode and route estimate in the same reply.
+                // A layout or capacity limit is an ordinary routing decision.
+                if (kind == PDFirstTokenProbe) {
+                    const bool fits = tokens.size() < raw->tokenCapacity && tokens.size() + 1 < size_t(max_positions);
+                    if (requested != raw->identity || !raw->CanSampleFirstToken(*this) || !fits) kind = PDUsageProbe;
+                }
                 fastkv::Writer writer;
                 const size_t resident = raw->CachedTokens(*this, tokens, session);
                 const auto forwardRate = uint64_t(std::max(1.0, raw->workload->tokensPerSecond.load()));

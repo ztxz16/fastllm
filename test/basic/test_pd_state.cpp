@@ -77,6 +77,7 @@ static void TestAlternateLayout() {
         }
     } producer;
     struct Consumer : StateModel {
+        bool SupportsPDFirstToken() const override { return true; }
         std::string PDLayout() const override { return "alternate"; }
         struct Receive : PDReceiveState {
             std::vector<std::vector<fastkv::Buffer>> Targets(const fastkv::Bytes &,
@@ -113,6 +114,11 @@ static void TestAlternateLayout() {
     try { probe(consumer.PDLayout()); }
     catch (const std::exception &) { rejected = true; }
     Check(rejected, "legacy probe selected a layout it cannot import");
+    fastkv::Writer offer;
+    offer.U32(12); offer.String("alternate-test:gpu-state-v2:" + consumer.PDLayout());
+    offer.Ints({3,7}); offer.String("same");
+    auto reply = client.Call(endpoint, {std::move(offer.bytes), {}});
+    Check(fastkv::Reader(reply.metadata).U32() == 10, "unsupported first-token mode needs a normal route reply");
     consumer.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","alternate-test"},
         {"transport","tcp"},{"prefill",json11::Json::array{endpoint}}});
     for (int pass = 0; pass < 2; ++pass) {
@@ -1612,7 +1618,7 @@ static void TestPDPrefillLookahead(int independentRows, bool saturated = true) {
     std::cout << "PASS PD prefill lookahead and gated publication, independent rows=" << independentRows << ", saturated=" << saturated << "\n";
 }
 
-static void TestSampledFirstToken() {
+static void TestSampledFirstToken(bool hostCache) {
     struct Model : StateModel {
         bool SupportsPDFirstToken() const override { return true; }
         int Forward(const Data &ids, const Data &mask, const Data &pos,
@@ -1622,8 +1628,10 @@ static void TestSampledFirstToken() {
             if (cfg.prefill_chunk_remaining == 0) {
                 Check(cfg.do_sample && cfg.top_k == 7 && cfg.temperature == 0.75f &&
                       cfg.top_p == 0.875f && cfg.repeat_penalty == 1.25f, "first-step sampling changed");
-                Check(cfg.tool_call_token_mask && cfg.tool_call_token_mask->at(0) == (1u << 17),
+                Check(cfg.tool_call_token_mask && (cfg.tool_call_token_mask->at(0) == (1u << 17) ||
+                      cfg.tool_call_token_mask->at(0) == (1u << 18)),
                       "first-step mask changed");
+                return cfg.tool_call_token_mask->at(0) == (1u << 18) ? 18 : 17;
             }
             return 17;
         }
@@ -1633,11 +1641,29 @@ static void TestSampledFirstToken() {
     const auto address = port.Address();
     port.Stop();
     p.residentHistory = true;
+    p.max_positions = 6;
     p.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","sample"},{"transport","tcp"},
-                                      {"listen",address},{"cache_bytes",0},{"chunk_tokens",2}});
+                                      {"listen",address},{"cache_bytes",hostCache ? 65536 : 0},{"chunk_tokens",2}});
     d.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","sample"},{"transport","tcp"},
                                       {"prefill",json11::Json::array{address}}});
-    for (int mode = 0; mode < 4; ++mode) {
+    fastkv::Service client;
+    auto waitForHostCheckpoint = [&](const std::vector<int> &tokens) {
+        fastkv::Writer query;
+        query.U32(10); query.String("sample:gpu-state-v2:" + p.PDLayout()); query.Ints(tokens); query.String("");
+        for (int i = 0; i < 1000; ++i) {
+            auto reply = client.Call(address, {query.bytes, {}});
+            fastkv::Reader reader(reply.metadata);
+            Check(reader.U32() == 10, "missing cache usage reply");
+            reader.U64(); reader.U64(); reader.U64(); reader.U64(); reader.String(512);
+            if (reader.U64() == tokens.size()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error("test host checkpoint was not published");
+    };
+    // First repeat the full prompt with a different sampler. Then publish an
+    // N-1 checkpoint via ordinary decode and require its reuse on the next hit.
+    enum Case { Normal, SingleToken, ReturnLogits, StopToken };
+    for (Case mode : {Normal, SingleToken, ReturnLogits, StopToken}) {
         ResponseContext ctx;
         ctx.Init(1, FLOAT32, FLOAT32);
         ctx.allTokens = ctx.currentTokens = {1, 2, 3, 4, 5};
@@ -1645,25 +1671,36 @@ static void TestSampledFirstToken() {
         auto &cfg = ctx.generationConfig;
         cfg.do_sample = true; cfg.top_k = 7; cfg.temperature = 0.75f;
         cfg.top_p = 0.875f; cfg.repeat_penalty = 1.25f;
-        cfg.tool_call_token_mask = std::make_shared<std::vector<uint32_t>>(1, 1u << 17);
-        cfg.output_token_limit = mode == 1 ? 1 : 3;
-        if (mode == 2) cfg.stop_token_ids.insert(17);
-        if (mode == 3) cfg.output_logits = true;
+        const int expectedToken = mode == SingleToken ? 18 : 17;
+        cfg.tool_call_token_mask = std::make_shared<std::vector<uint32_t>>(1, 1u << expectedToken);
+        cfg.output_token_limit = mode == SingleToken ? 1 : 3;
+        if (mode == StopToken) cfg.stop_token_ids.insert(17);
+        if (mode == ReturnLogits) cfg.output_logits = true;
         d.BeginPD(&ctx);
         for (int i = 0; i < 3000 && ctx.HasPendingPD() && !ctx.isEnding; ++i) {
             d.PollPD(&ctx);
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         Check(ctx.error == ResponseContextErrorNone && !ctx.HasPendingPD(), "first-token handoff failed");
-        const bool sampled = mode != 3;
+        const bool sampled = mode != ReturnLogits;
         Check(ctx.preTokens == (sampled ? 5 : 4) && d.forwards == 0, "incorrect first-token KV boundary");
         Check(((float *)ctx.pastKeyValues[0].first.cpuData)[0] == (sampled ? 55 : 30), "incorrect target state");
-        Check(ctx.isEnding == (mode == 1 || mode == 2), "incorrect first-token stopping condition");
+        Check(ctx.isEnding == (mode == SingleToken || mode == StopToken), "incorrect first-token stopping condition");
         d.PollPD(&ctx);
-        Check(ctx.resultTokenQueue.size() == (mode < 2 ? 1 : 0), "unexpected first-token count");
-        if (mode < 2) Check(ctx.currentTokens == std::vector<int>{17} && ctx.allTokens.back() == 17 &&
+        const bool emitted = mode == Normal || mode == SingleToken;
+        Check(ctx.resultTokenQueue.size() == (emitted ? 1 : 0), "unexpected first-token count");
+        if (emitted) Check(ctx.currentTokens == std::vector<int>{expectedToken} && ctx.allTokens.back() == expectedToken &&
                             ctx.curTokens == 1 && ctx.intParams["index"] == 0, "incorrect next decode input");
+        if (hostCache && (mode == Normal || mode == ReturnLogits))
+            waitForHostCheckpoint(std::vector<int>(ctx.allTokens.begin(), ctx.allTokens.begin() + ctx.preTokens));
+        if (hostCache && mode == StopToken) Check(ctx.pdCachedInputTokens == 4, "sampled request lost its L2 prefix");
     }
+    // P can process N-1 but cannot accept N. Use ordinary decode without a
+    // failed probe or an overlong model request.
+    fastkv::Writer limit;
+    limit.U32(12); limit.String("sample:gpu-state-v2:" + p.PDLayout()); limit.Ints({1,2,3,4,5}); limit.String("");
+    auto reply = client.Call(address, {std::move(limit.bytes), {}});
+    Check(fastkv::Reader(reply.metadata).U32() == 10, "first-token probe ignored P context limit");
 }
 
 static void TestPDResidentPrefixHints() {
@@ -1718,7 +1755,8 @@ int main(int argc, char **argv) {
             TestGPUAllocatorPressure();
             return 0;
         }
-        TestSampledFirstToken();
+        TestSampledFirstToken(false);
+        TestSampledFirstToken(true);
         TestPDResidentPrefixHints();
         TestDeferredPDResidentRestore();
         TestPDPrefillLookahead(0);
