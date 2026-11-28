@@ -1,7 +1,8 @@
 # PD 分离设计与实现清单
 
-本文汇总已确认的 PD 分离设计、功能清单与框架图。框架图表示设计方案，
-不代表功能已经实现或通过验收；各项实现与验收状态以对应条目的记录为准。
+本文汇总已确认的 PD 分离设计、功能清单与流程图。图 1～4 表示设计方案，
+图 5、6 说明当前短 Prompt Pull 的代码流程；图示本身不代表通过验收，
+各项实现与验收状态以对应条目的记录为准。
 待办内容和状态继续在 [项目待办](../../project/TODO.md#pd-分离实现清单) 中维护。
 实施顺序与阶段交付条件见[单机 PD 分离实施计划](IMPLEMENTATION_PLAN.md)。
 当前代码范围、尚未完成事项及服务器验证入口见[实现状态与运行说明](RUNNING.md)。
@@ -26,6 +27,7 @@ Router 选择 P/D 服务、协调交接并统一输出；KV 数据由 P/D 之间
 | [并行模式](#并行模式)与 [KV 重分片](#kv-重分片) | P/D 部署组合、分片映射及职责边界。 |
 | [Router 与现有调度](#routerproxy-与现有调度复用) | 服务选择、策略、健康检查、重试和容量背压。 |
 | [请求交接流程（图 2）](#kv-推送与拉取) | 短 Prompt 推送/拉取，以及长 Prompt 逐层传输。 |
+| [Pull 元信息检查（图 5）](#pull-metadata-checks)与 [传输 ID（图 6）](#pull-transfer-id) | 当前短 Prompt Pull 的检查阶段、ID 生成与分发时机。 |
 | [服务内部架构（图 3）](#异步传输任务管理) | 调度、交接接口、异步完成通知及资源生命周期。 |
 | [多轮 KV 复用（图 4）](#kv-回传与多轮复用) | 下一轮 P 从上一轮 D 拉取历史 KV。 |
 | [准确性比对与验收原则](#准确性比对与验收原则) | 比较优先级、FAIL 与 WARNING 的边界。 |
@@ -495,6 +497,52 @@ FT 的 PD Router 采用以下命令行配置项与默认值：
 
 更新日期：2026-11-25。状态：短 Prompt 基础时序及长 Prompt 逐层交接流程已确认，待实现，尚无验收结果。
 具体配置、接口与传输后端接入细节后续补充。
+
+<a id="pull-metadata-checks"></a>
+
+### Pull 元信息检查发生在哪里（图 5）
+
+以下两张图按 **2026-11-28 当前代码的短 Prompt、P→D Pull 流程**绘制。
+Router 依次请求 P Prefill、D 准备接收空间、D 拉取，见
+[pd_router.cpp:76](../../src/distributed/pd_router.cpp#L76)。长 Prompt 的准备调用采用并发时序，
+见 [pd_router.cpp:87](../../src/distributed/pd_router.cpp#L87)，不能直接套用图中的串行步骤。
+后文的 [Pull 接收流程统一](#pull-unified-receive) 仍是待讨论方案。
+
+![图 5：Pull 元信息检查阶段，红圈 A/B 为 D 端检查，紫圈 C 为独立测试](images/05_pull_metadata_checks.png)
+
+图 5 从已完成 P/D 配对开始。P 的源 meta 描述“从哪里读”，D 在第 3 步准备目标空间，
+生成自己的目标 meta，描述“写到哪里”。检查位置如下：
+
+| 图中位置 | 检查内容 | 当前代码 |
+|---|---|---|
+| A：第 5 步收到源 meta 后、第 6 步申请读取占用前 | 解析元信息；用传输 ID 查 D 本地记录，再核对完整请求身份；核对源描述与配对预留的模型、布局、GPU 和 Head 范围。 | [service.py:238](../../tools/fastllm_pytools/pd/service.py#L238)、[pd_service.cpp:55](../../src/distributed/pd_service.cpp#L55)、[pd_pairing.cpp:152](../../src/distributed/pd_pairing.cpp#L152) |
+| B：第 6 步成功后、第 7 步实际拷贝前 | 同时使用 P 源 meta 和 D 目标 meta，复查身份、模型/KV 语义、前缀和 Token 范围；检查源覆盖、目标范围重复及缺失，生成拷贝映射。 | 调用入口 [pd_service_transfer.cpp:250](../../src/distributed/pd_service_transfer.cpp#L250)；身份/布局 [pd_metadata.cpp:109](../../src/distributed/pd_metadata.cpp#L109)；目标重复 [pd_metadata.cpp:141](../../src/distributed/pd_metadata.cpp#L141)；源覆盖 [pd_metadata.cpp:166](../../src/distributed/pd_metadata.cpp#L166)；目标完整性 [pd_metadata.cpp:193](../../src/distributed/pd_metadata.cpp#L193) |
+| C：独立测试，不是线上额外步骤 | 将 meta 转成 JSON，再解析回来，断言前后对象一致。 | [check_protocol.py:280](../../test/distributed/pd/check_protocol.py#L280) |
+
+“目标范围重复”检查的是 **D 的目标区域描述**：同一 rank、同一层、同一 K/V 分量内，
+Token 和 Head 范围不能同时重叠，并非检查 P 源 meta 是否重复。
+第 6 步申请读取占用用于保护 P 源 KV；检查失败会报错，不提交拷贝，已取得的占用进入释放处理，
+见 [pd_service_transfer.cpp:231](../../src/distributed/pd_service_transfer.cpp#L231) 和
+[pd_service_transfer.cpp:234](../../src/distributed/pd_service_transfer.cpp#L234)。
+
+<a id="pull-transfer-id"></a>
+
+### Pull 传输 ID 在哪里生成（图 6）
+
+![图 6：Router 在第 0 步生成传输 ID，早于 P/D 配对和 Prefill](images/06_pull_transfer_id.png)
+
+**红圈第 0 步生成传输 ID，早于选择 P/D、配对和 Prefill。** 图中的 `T001` 是示例，
+实际生成 UUID；同一次尝试的 P、D 使用同一个传输 ID，重试时生成新 ID。
+
+| 阶段 | 行为 | 当前代码 |
+|---|---|---|
+| 第 0 步：开始本次请求尝试 | Router 调用重试预算的开始方法，通过预算检查后生成 UUID。 | [pd_router.cpp:10](../../src/distributed/pd_router.cpp#L10)、[pd_resources.cpp:29](../../src/distributed/pd_resources.cpp#L29)、[pd_resources.cpp:36](../../src/distributed/pd_resources.cpp#L36) |
+| 选择服务后 | 把已有传输 ID 与请求 ID、P/D 身份写入本次交接身份，再放入发给双方的请求体；此处不再生成 ID。 | [pd_router.cpp:57](../../src/distributed/pd_router.cpp#L57)、[pd_router.cpp:60](../../src/distributed/pd_router.cpp#L60) |
+| 前置配对与预留 | Router 向 P 发起配对；P 携带同一身份向 D 申请目标副本预留。此时只预留副本，D 的目标 KV 空间在图中第 3 步准备。 | [pd_router.cpp:72](../../src/distributed/pd_router.cpp#L72)、[pd_pairing.cpp:259](../../src/distributed/pd_pairing.cpp#L259) |
+| 第 5 步收到 P 源 meta | D 使用 meta 中的传输 ID 查询之前建立的记录，并核对完整身份；因此不需要等第 6 步向 P 申请读取占用后才知道 ID。 | [pd_service_transfer.cpp:222](../../src/distributed/pd_service_transfer.cpp#L222)、[pd_service.cpp:55](../../src/distributed/pd_service.cpp#L55) |
+
+两图中的蓝色箭头表示控制消息或元信息，绿色箭头表示 KV 数据；实际 KV 从 P 直接传到 D，
+不经过 Router。图中代码行号对应上述日期的版本，后续代码调整时需同步更新图示与文字定位。
 
 <a id="pull-unified-receive"></a>
 
