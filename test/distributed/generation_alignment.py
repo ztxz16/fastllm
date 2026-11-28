@@ -94,104 +94,130 @@ def candidate_check(token, own, other, tolerance):
                 other_cutoff_logprob=cutoff, relaxed_cutoff_logprob=cutoff - tolerance)
 
 
-def compare_generation(actual, expected, *, policy='topk', topk=5, near_tie_tol=0.1,
-                       diagnostic_atol=0.05, diagnostic_rtol=0.01):
-    """/**
-     * 比较独立生成的完整输出，候选检查只到首次分歧；全量logits误差仅诊断相同历史。
-     * 两侧共用原始Prompt ID、固定长度和贪心语义。即使候选容差通过，也保留严格
-     * 不一致、首个分歧及未比较尾部长度；数值超差记录为非阻断WARNING并保留误差。
-     * @param actual FT公开会话的自由生成报告，logits为每步完整词表的一维浮点列表。
-     * @param expected HF公开generate的独立生成报告，字段含义相同。
-     * @param policy exact要求Token与文本完全一致；topk要求双向候选规则通过。
-     * @param topk 候选数，默认5；不会影响实际生成采样。
-     * @param near_tie_tol 候选门槛的logprob余量，默认0.1，可显式设0。
-     * @param diagnostic_atol 原始logits绝对误差诊断阈值，不作为生成验收门槛。
-     * @param diagnostic_rtol 原始logits相对误差诊断阈值。
-     * @return 选定策略的PASS/FAIL、严格一致性、候选证据和独立数值诊断。
-     */"""
-    validate_policy(policy, topk, near_tie_tol)
-    for value in (diagnostic_atol, diagnostic_rtol):
-        if not math.isfinite(value) or value < 0:
-            raise ValueError('diagnostic tolerances must be finite and non-negative')
+def _pair(actual, expected, topk):
+    """/** 校验完整生成证据并定位共同历史，绝不计算两侧Logits的数值误差。 */"""
     actual_vocab = validate_output(actual, topk)
     expected_vocab = validate_output(expected, topk)
     if actual_vocab != expected_vocab or actual['request'] != expected['request']:
         raise ValueError('model vocabulary, prompt IDs or generation configuration differ')
-
     token_match = actual['token_ids'] == expected['token_ids']
     text_match = actual['text'] == expected['text']
-    exact_match = token_match and text_match
-    divergence, checks, diagnostics = None, [], []
-    error_sum, error_count, error_max, bad_logits = 0.0, 0, 0.0, 0
-    candidate_match = True
-    for index, (left, right) in enumerate(zip(actual['steps'], expected['steps'])):
-        errors = [abs(a - b) for a, b in zip(left['logits'], right['logits'])]
-        if not all(math.isfinite(error) for error in errors):
-            raise ValueError(f'step={index}: nonfinite logits difference')
-        bad = sum(error > diagnostic_atol + diagnostic_rtol * abs(value)
-                  for error, value in zip(errors, right['logits']))
-        worst = max(range(len(errors)), key=errors.__getitem__)
-        diagnostics.append(dict(step=index, max_abs_error=errors[worst],
-                                mean_abs_error=math.fsum(errors) / len(errors),
-                                failed_elements=bad, worst_vocab_id=worst))
-        error_sum += math.fsum(errors)
-        error_count += len(errors)
-        error_max = max(error_max, errors[worst])
-        bad_logits += bad
-        if left['token_id'] != right['token_id']:
-            divergence = index + 1
-            a, b = top_logprobs(left['logits'], topk), top_logprobs(right['logits'], topk)
-            checks = [dict(direction='ft_to_hf', **candidate_check(left['token_id'], a, b, near_tie_tol)),
-                      dict(direction='hf_to_ft', **candidate_check(right['token_id'], b, a, near_tie_tol))]
-            candidate_match = all(check['accepted'] for check in checks)
-            break
+    divergence = next((i + 1 for i, (a, b) in enumerate(zip(actual['token_ids'], expected['token_ids']))
+                       if a != b), None)
+    compared = divergence or len(actual['token_ids'])
+    return dict(exact_match=token_match and text_match, token_match=token_match, text_match=text_match,
+                first_divergence_token_1based=divergence, compared_steps=compared,
+                uncompared_steps=len(actual['token_ids']) - compared)
 
-    passed = exact_match if policy == 'exact' else candidate_match
-    reason = '' if passed else ('generated token IDs or text differ' if policy == 'exact'
-                               else f'first divergence at token {divergence}: mutual candidate check failed')
-    return dict(status='PASS' if passed else 'FAIL', alignment_policy=policy, topk=topk,
-                near_tie_tol=near_tie_tol, exact_match=exact_match, token_match=token_match,
-                text_match=text_match, candidate_match=candidate_match,
-                first_divergence_token_1based=divergence, compared_steps=len(diagnostics),
-                uncompared_steps=len(actual['steps']) - len(diagnostics),
-                near_tie_accepted_directions=sum(check['near_tie_accepted'] for check in checks),
-                max_abs_error=error_max, mean_abs_error=error_sum / error_count,
-                failed_elements=int(not passed), logit_failed_elements=bad_logits,
-                logit_diagnostic_status='WARNING' if bad_logits else 'PASS', reason=reason,
-                candidate_checks=checks, logit_diagnostics=diagnostics)
+
+def _level(base, name, checks=None):
+    """/** 保存已执行等级的PASS或WARNING；未通过单项不决定最终验收状态。 */"""
+    passed = base['exact_match'] if name == 'exact' else all(c['accepted'] for c in checks)
+    return dict(status='PASS' if passed else 'WARNING',
+                reason='' if passed else ('generated token IDs or text differ' if name == 'exact'
+                    else 'mutual candidate check did not pass'),
+                candidate_checks=checks or [],
+                near_tie_accepted_directions=sum(c['near_tie_accepted'] for c in (checks or [])))
+
+
+def _candidates(actual, expected, base, topk):
+    """/** 只在首个Token分歧处计算双侧Top-K，禁止沿已分歧的后续历史比较。 */"""
+    position = base['first_divergence_token_1based']
+    if position is None:
+        return None
+    i = position - 1
+    return (actual['token_ids'][i], expected['token_ids'][i],
+            top_logprobs(actual['steps'][i]['logits'], topk),
+            top_logprobs(expected['steps'][i]['logits'], topk))
+
+
+def _checks(candidates, tolerance):
+    """/** 对固定的双侧候选执行指定容差检查，调用方决定是否需要本等级。 */"""
+    if candidates is None:
+        return []
+    left, right, a, b = candidates
+    return [dict(direction='ft_to_hf', **candidate_check(left, a, b, tolerance)),
+            dict(direction='hf_to_ft', **candidate_check(right, b, a, tolerance))]
+
+
+def compare_generation(actual, expected, *, policy='topk', topk=5, near_tie_tol=0.1):
+    """/**
+     * 检查单个生成等级，供诊断或三级判定的调用方使用；不运行numeric。
+     * @param actual 实际完整生成及原始Logits证据。
+     * @param expected 同输入与配置的完整参考生成。
+     * @param policy exact或topk；该接口不代表三级整体接受结论。
+     * @param topk 候选数，必须在词表范围内。
+     * @param near_tie_tol 候选门槛容差；零仅检查集合互包含。
+     * @return 已执行单项的PASS/WARNING与证据；输入或执行证据非法时抛出异常。
+     */"""
+    validate_policy(policy, topk, near_tie_tol)
+    base = _pair(actual, expected, topk)
+    checks = None if policy == 'exact' else _checks(_candidates(actual, expected, base, topk), near_tie_tol)
+    level = _level(base, policy, checks)
+    return dict(base, **level, alignment_policy=policy, topk=topk, near_tie_tol=near_tie_tol,
+                candidate_match=None if checks is None else all(c['accepted'] for c in checks),
+                failed_elements=0)
 
 
 def compare_generation_all(actual, expected):
     """/**
-     * 对同一份独立生成证据同时给出exact、严格Top-5及Top-5+0.1结论。
-     * 完整输入验证、同历史logits诊断和Top-K计算仅执行一次。严格候选规则
-     * 只读取真实集合成员关系，不能沿用宽松门槛的通过结果；数值诊断仍只警告。
-     * @param actual FT公开会话保存的完整生成报告。
-     * @param expected HF公开generate保存的独立生成报告。
-     * @return 含三项独立结论及共同证据的报告；任一项失败则总体失败。
+     * 按exact、Top-5、Top-5+0.1逐级验收，任一通过即停止，全部未通过才FAIL。
+     * 完整证据始终校验；未通过单项记WARNING，未执行项记SKIP，不运行numeric。
+     * @param actual 实际完整自由生成报告，不接受教师强制轨迹。
+     * @param expected 同输入与配置的完整参考生成报告。
+     * @return 整体状态、接受等级、单项告警和首次分歧；证据非法时抛出异常。
      */"""
-    relaxed = compare_generation(actual, expected, policy='topk', topk=5, near_tie_tol=0.1)
-    strict_checks = [dict(check, accepted=check['in_other_topk'], near_tie_accepted=False,
-                          relaxed_cutoff_logprob=check['other_cutoff_logprob'])
-                     for check in relaxed['candidate_checks']]
-    strict_pass = all(check['accepted'] for check in strict_checks)
-    strict = dict(relaxed, near_tie_tol=0.0, candidate_checks=strict_checks,
-                  near_tie_accepted_directions=0, candidate_match=strict_pass,
-                  status='PASS' if strict_pass else 'FAIL', failed_elements=int(not strict_pass),
-                  reason='' if strict_pass else
-                  f'first divergence at token {relaxed["first_divergence_token_1based"]}: mutual candidate check failed')
-    exact = dict(relaxed, alignment_policy='exact',
-                 status='PASS' if relaxed['exact_match'] else 'FAIL',
-                 failed_elements=int(not relaxed['exact_match']),
-                 reason='' if relaxed['exact_match'] else 'generated token IDs or text differ')
-    comparisons = dict(exact=exact, top5=strict, top5_near_tie=relaxed)
-
-    failures = [f'{name}: {result["reason"]}' for name, result in comparisons.items()
-                if result['status'] != 'PASS']
-    result = dict(relaxed, alignment_policy='all', comparisons=comparisons,
-                  status='FAIL' if failures else 'PASS', failed_elements=int(bool(failures)),
-                  reason='; '.join(failures))
-    for name, comparison in comparisons.items():
-        result[name + '_status'] = comparison['status']
-        result[name + '_reason'] = comparison['reason']
+    base = _pair(actual, expected, 5)
+    names = ('exact', 'top5', 'top5_near_tie')
+    levels = {name: dict(status='SKIP', reason='earlier level accepted', candidate_checks=[],
+                        near_tie_accepted_directions=0) for name in names}
+    levels['exact'] = _level(base, 'exact')
+    accepted = 'exact' if base['exact_match'] else None
+    candidates = None
+    if accepted is None:
+        candidates = _candidates(actual, expected, base, 5)
+        levels['top5'] = _level(base, 'top5', _checks(candidates, 0.0))
+        if levels['top5']['status'] == 'PASS':
+            accepted = 'top5'
+        else:
+            levels['top5_near_tie'] = _level(base, 'top5_near_tie', _checks(candidates, 0.1))
+            if levels['top5_near_tie']['status'] == 'PASS':
+                accepted = 'top5_near_tie'
+    last = levels[accepted or 'top5_near_tie']
+    warnings = [f'{name}: {levels[name]["reason"]}' for name in names if levels[name]['status'] == 'WARNING']
+    result = dict(base, status='PASS' if accepted else 'FAIL', alignment_policy='all',
+                  policy_version='generation_cascade_20261128', accepted_by=accepted,
+                  topk=5, near_tie_tol=0.1, comparisons=levels, warnings=warnings,
+                  warning_count=len(warnings), failed_elements=int(accepted is None),
+                  reason='' if accepted else 'all three generation comparisons did not pass',
+                  candidate_checks=last['candidate_checks'],
+                  candidate_match=None if accepted == 'exact' else last['status'] == 'PASS',
+                  near_tie_accepted_directions=last['near_tie_accepted_directions'])
+    for name, level in levels.items():
+        result[name + '_status'] = level['status']
+        result[name + '_reason'] = level['reason']
     return result
+
+
+def compare_token_ids(actual, expected, count):
+    """/**
+     * 检查仅包含Token ID的正式入口输出；exact未通过且缺少候选证据时不得猜测接受。
+     * @param actual 实际输出Token ID列表。
+     * @param expected 同输入及生成配置的参考Token ID列表。
+     * @param count 约定输出数量；长度或ID非法属于功能故障。
+     * @return 三级规则证据；exact通过即PASS，否则因候选证据缺失而FAIL并保留exact WARNING。
+     */"""
+    if type(count) is not int or count < 1:
+        raise ValueError('invalid expected output length')
+    for ids in (actual, expected):
+        if not isinstance(ids, list) or len(ids) != count or any(type(t) is not int or t < 0 for t in ids):
+            raise ValueError('invalid token IDs or output length')
+    same = actual == expected
+    first = next((i + 1 for i, (a, b) in enumerate(zip(actual, expected)) if a != b), None)
+    return dict(status='PASS' if same else 'FAIL', policy_version='generation_cascade_20261128',
+                accepted_by='exact' if same else None, exact_status='PASS' if same else 'WARNING',
+                top5_status='SKIP' if same else 'NOT_RUN',
+                top5_near_tie_status='SKIP' if same else 'NOT_RUN',
+                first_divergence_token_1based=first,
+                warnings=[] if same else ['exact: generated token IDs differ'],
+                reason='' if same else 'candidate evidence missing; cannot complete generation cascade')

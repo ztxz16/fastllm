@@ -40,6 +40,14 @@
 
 ## 已确认的后续需求
 
+### Attention DP/EP 按负载分数选副本
+
+- 2026-11-19 用户明确要求：后续 Attention DP/EP 也要支持按负载分数
+  选择副本的 `load` 策略。
+- 当前仅普通进程 DP>1 支持 `load`；Attention DP/EP 拒绝该配置是
+  本轮实现的阶段限制，不代表永久不支持。后续规划与实现应保留上述目标。
+- 状态：待实现。本次仅记录需求，未启用 Attention DP/EP 的 `load` 路由。
+
 ### Attention DP/EP 批次不变性实施顺序
 
 - 2026-11-19 用户确认：先解决已定位的 MoE 差异，再逐步完成全链路不变性验证。
@@ -58,6 +66,52 @@
 - 现象、服务器证据及待讨论方向见 [项目待办](project/TODO.md)。
 - 2026-11-20 新增的前缀逐层诊断代码已按用户要求回退；该问题尚未修复，
   完整批次不变性验收尚未通过。
+
+## Waiting
+
+When only waiting remains, save the current state and the next step. If an
+automation tool is available, schedule and verify a heartbeat before ending
+the turn. Check status once per heartbeat. If nothing needs action, end quietly
+and check less often. Resume work on completion, failure, or a stall. Disable
+the heartbeat when the task ends.
+
+If no automation tool is available, use supported wait or notification tools
+and avoid frequent polling. Do not claim that a heartbeat is scheduled or that
+work will resume automatically unless that mechanism has been verified.
+
+## 下载规范
+
+- 文件下载默认使用 `aria2c`，包括模型权重、数据集、安装包和归档文件；
+  实际执行下载及提供给用户的服务器下载命令都应遵守。
+- 默认启用断点续传和多连接，可使用
+  `-c -x 16 -s 16 -k 1M --file-allocation=none`，并按下载源限制调整并发。
+- 多个独立 URL 同时下载时使用 `-Z -j 2` 或输入文件列表；重试应复用下载
+  目录和断点文件。下载源提供校验值时，应在使用或安装前校验文件完整性。
+- 对可取得直接下载地址的 `.deb` 等安装包，优先用 aria2 下载；下载
+  完成后必须使用本地文件安装，避免包管理器重新从远端下载同一包。
+- `.deb` 优先使用 `dpkg -i` 安装；如缺少依赖，先解析依赖并用 aria2
+  下载所需安装包，再继续安装，不得强制忽略依赖检查。
+- aria2 尚未安装、下载源不支持或认证协议不兼容时，说明原因后可使用
+  其他下载方式；API 查询、Git 操作和包管理器索引更新不属于本规则范围。
+
+## 核心逻辑与算子实现语言
+
+- 核心推理流程、调度、KV 管理、通信协议和资源生命周期管理，优先采用 C++ 实现。
+- GPU 算子可以采用 CUDA C++ 或 Triton。Triton 的 kernel 定义、编译及必要的
+  Python 调用代码属于允许范围。
+- Python 可用于服务入口、配置、接口适配、测试及工具脚本；其他核心逻辑采用
+  Python 时，应说明必要性。
+- 无论采用 CUDA C++ 还是 Triton，都必须接入正式推理流程，遵守统一的数值语义、
+  同步、缓存及资源管理要求。
+- 功能实现时，应在对应功能文档和交付说明中逐模块列明职责、实现语言及技术，
+  例如 C++、CUDA C++、Triton、Python；说明必须与实际代码一致。
+- 同一模块采用多种语言或技术时，应分别说明各部分的职责和调用边界，不能只标注
+  为“混合实现”；核心逻辑使用 Python 的部分仍须说明必要性。
+
+## 第三方代码保护
+
+- 禁止修改 `third_party/` 下的代码或文件；如已修改，必须回退相关改动，恢复到
+  修改前的状态。所需功能适配应在 `third_party/` 之外实现。
 
 ## 功能实现 Review 规则
 
@@ -105,8 +159,8 @@
 - 后台任务须记录 PID 或会话标识、完整命令、标准输出、标准错误和最终退出码；
   日志仍归入 `test/distributed/results/` 下本次运行的独立目录。
 - 后台启动成功不代表测试通过；完成后依据实际退出码和汇总报告判定，
-  任一 case 的 FAIL 必须保留证据并返回非零状态；仅数值性比对的
-  WARNING 按下述规则处理，不计为失败。
+  任一 case 的 FAIL 必须保留证据并返回非零状态；比较单项的
+  WARNING 按下述逐级接受规则处理，不单独计为 case 失败。
 
 ### 主流程一致性
 
@@ -120,24 +174,25 @@
 
 ### 准确性比对优先级与告警规则
 
-- 2026-11-26 用户确认：本规则适用于全项目准确性比对，包括 PD、非 PD、模型、
+- 2026-11-28 用户更新：本规则适用于全项目准确性比对，包括 PD、非 PD、模型、
   算子及不同后端或执行配置的对照，不限于浮点数值诊断。
-- 比对优先级为 `exact` → `top5` → `top5_near_tie` → 数值性比对（`numeric`）。
-  优先检查实际输出是否完全一致，再考虑候选 Token 比较，浮点误差比较放最后。
-  仅有张量输出的算子等场景不强套 Token Top-K，采用适用的精确或数值比较并说明范围。
-- `exact`、`top5`、`top5_near_tie` 比对不通过仍判 `FAIL`，纳入 case、汇总及非零退出码
-  的失败判定。只有数值性比对（`numeric`）不通过时记录 `WARNING`，不因该项数值差异
-  将 case 或汇总判为 `FAIL`、中断后续检查或返回非零退出码。
-- 各项结论分别保留。后续宽松比较通过不能抹去前项差异或已判定的 FAIL；报告保存原始证据、首次分歧、
-  比较范围、阈值及数值误差统计，不把 WARNING 改写成完全一致或准确性通过。
+- Token 生成按 `exact` → `top5` → `top5_near_tie` 逐级比较，任一项通过即接受该请求，
+  整体记 `PASS` 并记录通过等级；不继续执行后续等级，未执行项记 `SKIP`，不得写成通过。
+- 未通过的已执行单项记 `WARNING` 并保留差异；只有三项均未通过时，准确性整体才记
+  `FAIL` 并影响 case、汇总及非零退出码。不能把某一请求通过扩大为整批请求通过。
+- 该生成验收链不再执行 `numeric` 比较，不以数值误差统计作为额外门槛或回退步骤。
+  仅有张量输出的算子等场景不强套 Token Top-K，采用专属的精确或数值比较并说明范围；
+  其数值超差仍按专属规则记录 WARNING，不自动追加到生成验收。
+- 保留原始输出、已执行的单项结论、首次分歧、候选范围、阈值及接受等级。候选级 PASS
+  不等于实际输出完全一致，不能抹去先前 WARNING；历史报告原样保留，重判另建报告并注明规则版本。
 - 执行异常、超时、崩溃、输出或证据缺失、形状非法、协议及资源管理错误等功能故障仍判
   `FAIL`；未完成的比对不能记为通过。历史报告保持原样，新规则不等于历史问题已修复。
 
 ### 功能测试
 
 - 功能测试必须验证实际输出，不得只验证 kernel 成功启动。
-- 数值检查至少记录最大绝对误差、平均绝对误差、超阈值元素数量及 PASS/WARNING；
-  `exact`、`top5`、`top5_near_tie` 使用 PASS/FAIL，功能或执行故障仍记 FAIL。
+- 专属张量数值检查至少记录最大绝对误差、平均绝对误差、超阈值元素数量及 PASS/WARNING；
+  Token 生成三级单项使用 PASS/WARNING/SKIP，三级均未通过或功能/执行故障时整体记 FAIL。
 - 测试应覆盖支持的数据类型、有无 bias、量化与 scale 布局、分支边界值
   及边界两侧、非法输入和拒绝路径。
 - 有后端状态或缓存的算子还应覆盖首次选择、后端固定、运行失败、资源释放、
@@ -189,9 +244,19 @@
 ### 可复现性
 
 - 测试输入应固定随机种子或保存输入文件，每个 case 应有稳定且唯一的名称。
+- 测试 case 的日志、诊断证据和汇总报告统一保存到仓库的
+  `test/distributed/results/`；当前服务器绝对路径为
+  `/home/project/vllm_fastllm/test/distributed/results`。提供服务器测试命令时，
+  额外采集的终端日志也应放入该目录下的本次运行子目录。
+- 每次运行新建独立目录，沿用现有 MoE 测试的命名格式：
+  `YYYYMMDDTHHMMSSZ_<测试阶段>_<8位随机十六进制ID>`。时间使用 UTC，
+  `Z` 表示 UTC；随机 ID 用于区分运行，不是 Git 提交号。
+- 单个 case 的证据文件沿用稳定的参数化 case 名称，例如
+  `perf_prompt1024_output128_graph1_cache_off_concurrency4.json`；
+  对应的标准输出、标准错误及汇总报告均归属本次运行目录。
 - 日志目录不得覆盖历史结果。
-- 测试脚本必须在任意 case 出现 FAIL 时返回非零状态，包括精确/候选比对失败和功能或执行故障；
-  只有数值性比对 WARNING 时不得据此返回非零状态。
+- 测试脚本必须在任意 case 出现 FAIL 时返回非零状态，包括生成三级比较均未通过和功能或执行故障；
+  单项 WARNING 后在后续等级通过时不得据此返回非零状态，专属数值 WARNING 也不单独导致非零。
 - 即使测试提前失败，也应尽可能生成已经执行部分的汇总报告。
 
 ## 代码定位规范

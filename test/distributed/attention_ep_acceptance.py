@@ -99,7 +99,7 @@ def jobs_for(args, output):
             flags = ['--batch-invariant'] if mode == 'candidate' else []
             add(f'hf_{mode}_part{offset // 4 + 1}', 'validation', 'run_qwen_moe_full.py',
                 [*common, '--model', args.model, '--requests', path, '--reference-python', args.reference_python,
-                 '--alignment-policy', 'all', *flags], 8 * len(selected) + 15)
+                 '--alignment-policy', 'all', *flags], 8 * len(selected) + 7)
 
     for length in (512, 1024, 1792):
         for cache in ('off', 'cold', 'hot'):

@@ -38,6 +38,29 @@ class AcceptanceTests(unittest.TestCase):
             for job in jobs:
                 if 'candidate' in job['name']:
                     self.assertIn('--batch-invariant', job['command'])
+                if job['name'].startswith('hf_'):
+                    self.assertEqual(job['expected_report_rows'], 39)
+
+    def test_generation_cascade_counts_root_and_requests_without_numeric(self):
+        """/** 逐请求可在不同等级接受；WARNING不使整批失败，缺少请求仍失败。 */"""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request_rows = [dict(case=f'request{i}', status='PASS', accepted_by=level,
+                                 exact_status='PASS' if level == 'exact' else 'WARNING')
+                            for i, level in enumerate(('exact', 'top5', 'top5_near_tie'))]
+            directory = root / 'reports/one/generation'
+            directory.mkdir(parents=True)
+            parent = directory.parent / 'summary.json'
+            child = directory / 'summary.json'
+            runner.write_json(parent, dict(status='PASS', complete=True, expected_case_count=1,
+                                          cases=[dict(case='generation', status='PASS')]))
+            runner.write_json(child, dict(status='PASS', complete=True, expected_case_count=3,
+                                         cases=request_rows))
+            job = dict(name='hf', directory=temp, expected_report_rows=4)
+            self.assertEqual(runner.inspect_job(job, 0)['status'], 'PASS')
+            runner.write_json(child, dict(status='PASS', complete=True, expected_case_count=3,
+                                         cases=request_rows[:2]))
+            self.assertEqual(runner.inspect_job(job, 0)['status'], 'FAIL')
 
     def test_missing_report_cannot_pass_with_zero_exit(self):
         with tempfile.TemporaryDirectory() as temp:
