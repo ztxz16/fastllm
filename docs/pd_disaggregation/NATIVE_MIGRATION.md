@@ -36,6 +36,19 @@ GPU 测试的 `cuda_fixture.py` 仅在测试所有者进程分配、上传和读
 测试中的 KV 传输、映射与完成判断全部调用正式 C++/CUDA 后端。
 没有新增 Python 核心回退，也没有新增 CPU KV 中转。
 
+### 2026-11-28：Attention 副本与 EP 组证据
+
+`pd_service_output.cpp` 的 C++ 证据接口按 Attention 副本选择对应 worker，
+使 `workers`、`devices` 与该副本的 `states` 一一对应。完整 EP 成员保留在
+`group_workers`，`parallel` 记录 Attention DP、EP 规模与组内 rank；不改变共享
+组的启动信息、原生计算轮次或调度。普通 TP/DP 保持原有证据格式。
+
+Python 测试适配 `generation_reference.py` 将 `parallel` 纳入离线基线配置，
+避免把 EP 规模误算成 TP，或把不同 EP 组配置视为相同配置。
+`check_evidence.py` 调用正式 C++ 证据接口检查 9 个控制用例，原生状态由测试注入；
+通过 `launch.py evidence` 后台执行并生成 Markdown/CSV/JSON/XLSX。
+这些控制检查不能替代 Attention DP/EP 的真实模型与传输验收。
+
 ### 2026-11-27：局部 P2P 拓扑的副本配对
 
 解决 P/D 分别选副本后可能选中不可达 GPU 对的问题。Router 仍按既定策略选择服务；
