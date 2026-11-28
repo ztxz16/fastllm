@@ -28,6 +28,7 @@ Router 选择 P/D 服务、协调交接并统一输出；KV 数据由 P/D 之间
 | [Router 与现有调度](#routerproxy-与现有调度复用) | 服务选择、策略、健康检查、重试和容量背压。 |
 | [请求交接流程（图 2）](#kv-推送与拉取) | 短 Prompt 推送/拉取，以及长 Prompt 逐层传输。 |
 | [Pull 元信息检查（图 5）](#pull-metadata-checks)与 [传输 ID（图 6）](#pull-transfer-id) | 当前短 Prompt Pull 的检查阶段、ID 生成与分发时机。 |
+| [Pull 校验前移（调整计划）](#pull-validate-before-lease) | 先完成完整性校验与映射，再申请源 KV 读取占用；实施项 PD-35。 |
 | [Push 元信息检查（图 7）](#push-metadata-checks)与 [传输 ID（图 8）](#push-transfer-id) | 当前短 Prompt Push 的并发准备、P 端检查及 ID 生成与分发时机。 |
 | [服务内部架构（图 3）](#异步传输任务管理) | 调度、交接接口、异步完成通知及资源生命周期。 |
 | [多轮 KV 复用（图 4）](#kv-回传与多轮复用) | 下一轮 P 从上一轮 D 拉取历史 KV。 |
@@ -526,6 +527,9 @@ Token 和 Head 范围不能同时重叠，并非检查 P 源 meta 是否重复�
 见 [pd_service_transfer.cpp:231](../../src/distributed/pd_service_transfer.cpp#L231) 和
 [pd_service_transfer.cpp:234](../../src/distributed/pd_service_transfer.cpp#L234)。
 
+图 5、6 保留当前实现的顺序；后续将 B 前移到第 6 步之前的要求见
+[Pull 校验前移](#pull-validate-before-lease)。
+
 <a id="pull-transfer-id"></a>
 
 ### Pull 传输 ID 在哪里生成（图 6）
@@ -598,6 +602,50 @@ Token 和 Head 范围不能同时重叠；Push 由 P 检查这些描述。
 图中省略 HTTP 响应和 Router 发往 D 的生成请求，后者见
 [pd_router.cpp:104](../../src/distributed/pd_router.cpp#L104)。图中代码行号对应上述日期的版本，
 后续代码调整时需同步更新图示与文字定位。
+
+<a id="pull-validate-before-lease"></a>
+
+### Pull 完整性校验前移至读取占用之前（调整计划）
+
+2026-11-28 用户要求将此调整记入实现清单；实施与验收状态统一见
+[PD-35](../../project/TODO.md#pd-35)。本次仅记录要求，图 5、6 仍反映当前代码。
+
+当前流程先申请读取占用，再进行 B 阶段的完整校验和映射计算，见
+[pd_service_transfer.cpp:231](../../src/distributed/pd_service_transfer.cpp#L231)、
+[pd_service_transfer.cpp:250](../../src/distributed/pd_service_transfer.cpp#L250)。
+现有 B 校验失败会发送解除占用通知，见
+[pd_service_transfer.cpp:238](../../src/distributed/pd_service_transfer.cpp#L238)；P 收到后清除读取占用，
+见 [pd_service_transfer.cpp:210](../../src/distributed/pd_service_transfer.cpp#L210)。
+此次调整用于避免非法交接先取得占用、随后再依赖解除消息回收。
+
+在 D 的目标空间和双方 meta 已具备后，拟采用以下顺序：
+
+```text
+A：解析元信息、核对请求身份与配对预留
+    ↓
+B：完整性校验、计算拷贝映射（纯校验失败直接拒绝，不申请读取占用）
+    ↓
+⑥ 向 P 申请源 KV 读取占用，并确认成功
+    ↓
+注册传输任务，按对应 KV 就绪情况发布并提交拷贝
+    ↓
+⑦ D 主动读取 KV
+```
+
+- 前移部分由 **C++** 实现，覆盖身份、模型/KV 语义、前缀与 Token 范围一致性、源范围覆盖、
+  目标范围缺失/重复及映射计算，复用 [pd_metadata.cpp:107](../../src/distributed/pd_metadata.cpp#L107)
+  的既有逻辑。Python 继续用于接口适配与测试。
+- 将纯校验和映射计算与有副作用的任务注册、就绪发布分开；不能把整个提交函数直接前移，
+  后者还包含 [pd_service_transfer.cpp:253](../../src/distributed/pd_service_transfer.cpp#L253)
+  的任务注册与后续发布。占用申请成功前不得开始实际拷贝。
+- 纯校验通过不代表源 KV 仍可用，也不代表数据已算完；P 的占用准入检查和对应层就绪判断
+  必须保留，见 [pd_service_transfer.cpp:205](../../src/distributed/pd_service_transfer.cpp#L205)、
+  [pd_service_transfer.cpp:259](../../src/distributed/pd_service_transfer.cpp#L259)。
+- 保留占用申请结果不确定、占用后提交失败及取消的收尾处理；解除通知发送失败仍须补发，
+  在途传输结束后才能回收。原有通知暂存入口见
+  [pd_service.cpp:62](../../src/distributed/pd_service.cpp#L62)。
+- 本项独立于 [Pull 接收流程统一](#pull-unified-receive)；后续如合并接收接口，也应遵守
+  “先完整校验、后占用、再提交”的顺序。定向验证与回归范围见 PD-35，不能沿用旧 PASS 宣称新顺序已验收。
 
 <a id="pull-unified-receive"></a>
 
