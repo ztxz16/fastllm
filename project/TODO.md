@@ -3,6 +3,8 @@
 状态整理日期：2026-11-28；实现梳理参照 `9849a51f`，各次服务器验收的具体 Git 提交待补充。先看下方状态表，点击编号定位详情，再展开原始需求、验收条件与证据。
 **实现、验证、验收分开判断：有代码、有脚本、局部 PASS，均不等于整项验收成功。**
 
+跨会话继续测试先读 [PD 测试交接记录](PD_TEST_HANDOFF.md)。其中保存部署快照、命令归档与接续方法；当前状态仍以本文件主表为准。
+
 **2026-11-27 用户确认：本次 C++/CUDA 版本的编译与加载、protocol 41/41、Router 20/20、GPU IPC 24/24 均已通过。**
 后续用户回传非 PD 基线 1/1，以及 TP1→TP1、Graph/Prefix 关闭的 pull、push 生成对照各 15/15 exact PASS。
 同配置的 push、pull 取消与资源释放用例也分别回传 7/7 PASS、退出码 0。
@@ -22,7 +24,7 @@
 随后 TP2→TP2、Graph 关闭 / 双端 Prefix 开启的 pull 回传 15/15 exact PASS；P 各 rank 的 NCCL 增加 504 次、前缀命中增加 2 次、原生复用增加 512 Token，服务级本轮新请求 local_reused=1664；D 各 rank 的 Eager Decode 增加 161 次、NCCL 增加 3864 次。两端 Graph 捕获/回放增量均为 0，D 本轮拉取 1008 批、1290338304 字节，生成及总退出码均为 0。
 同配置 TP2→TP2 push 随后回传 15/15 exact PASS；P 各 rank 的 NCCL 增加 504 次、前缀命中增加 2 次、原生复用增加 768 Token，服务级本轮新请求 local_reused=3584；D 各 rank 的 Eager Decode 增加 161 次、NCCL 增加 3864 次。两端 Graph 捕获/回放增量均为 0，P 本轮推送 1008 批、1290338304 字节，生成及总退出码均为 0。
 以上各自约定范围均标记“验收成功”，直接列在 [PD 分离状态表](#pd-分离) 最前面；依据为用户服务器结果，本地未代跑。
-当前重点：**原计划第 6 步的普通 TP1→TP1 基础矩阵已完成：Graph 关闭/开启 × Prefix 关闭/开启 × pull/push 共 8 种组合，各 15/15 exact PASS（PD-V06/V07/V10/V11/V12/V13/V14/V15）。第 7 步：非 PD TP2 离线基线（PD-V16）及 P=[0,2]、D=[1,3]、Graph/Prefix 关闭的 TP2→TP2 pull（PD-V17）、push（PD-V18）均已通过。Graph 开启 / Prefix 关闭的非 PD TP2 基线（PD-V19）及 D Graph 开启的 TP2→TP2 pull（PD-V20）、push（PD-V21）也已通过；Graph/Prefix 均开启的非 PD TP2 基线（PD-V22）及 P/D 均开启 Prefix、P Eager / D Graph 的 TP2→TP2 pull（PD-V23）、push（PD-V24）均已通过；TP2 Eager/Prefix 非 PD 基线（PD-V25）及对应 pull（PD-V26）、push（PD-V27）均已通过。至此当前 TP2→TP2 部署的 D Graph 开关 × 双端 Prefix 开关 × pull/push 共 8 种配置各 15/15 exact PASS，P 保持 Eager；普通 DP2×TP1 的 load、Graph/Prefix 关闭配置下 pull（PD-V29）与 push（PD-V31）均已通过；普通 DP2 Graph 基线（PD-V32）及 P Eager / D Graph、Prefix 关闭的 pull（PD-V33）与 push（PD-V34）均已通过；普通 DP2 Graph/Prefix 均开启的非 PD 基线（PD-V35）及双端 Prefix 开启、P Eager / D Graph 的 pull（PD-V36）、push（PD-V37）均已由用户确认全部 PASS。普通 DP2 Eager/Prefix 非 PD 基线（PD-V38）及对应 pull（PD-V39）、push（PD-V40）均已由用户确认全部 PASS；至此当前普通 DP2×TP1、load 部署的 D Graph 开关 × 双端 Prefix 开关 × pull/push 共 8 种配置全部通过，P 保持 Eager、回传关闭。Attention DP2/EP2→Attention DP2/EP2 的 load、Eager、Prefix 关闭 pull（PD-V45）与 push（PD-V46）均已通过；对应 D Graph 开启 / Prefix 关闭的 pull（PD-V48）与 push（PD-V49）也均已通过；Graph+Prefix 非 PD 基线（PD-V50）及双端 Prefix 开启的 pull（PD-V51）、push（PD-V52）均已通过，Eager/Prefix 非 PD 基线（PD-V53）也已通过，双端 Eager/Prefix pull（PD-V54）与 push（PD-V55）均已通过；至此 Attention DP2/EP2、load、P Eager 的 D Graph 开关 × 双端 Prefix 开关 × pull/push 八种基础配置全部验收成功。下一项先验证普通 TP1→TP2、Eager、Prefix 关闭的 pull；异构 TP 其余方向、普通模式与 Attention DP/EP 混合部署及其他规模与策略保留待验。第 8 步 Graph/Prefix 关闭的 TP1 push、pull 各 7/7 已通过；其他组合、回传、压力、故障及性能仍待验。Attention DP/EP 前缀缓存一致性仍失败。**
+当前重点：**原计划第 6 步的普通 TP1→TP1 基础矩阵已完成：Graph 关闭/开启 × Prefix 关闭/开启 × pull/push 共 8 种组合，各 15/15 exact PASS（PD-V06/V07/V10/V11/V12/V13/V14/V15）。第 7 步：非 PD TP2 离线基线（PD-V16）及 P=[0,2]、D=[1,3]、Graph/Prefix 关闭的 TP2→TP2 pull（PD-V17）、push（PD-V18）均已通过。Graph 开启 / Prefix 关闭的非 PD TP2 基线（PD-V19）及 D Graph 开启的 TP2→TP2 pull（PD-V20）、push（PD-V21）也已通过；Graph/Prefix 均开启的非 PD TP2 基线（PD-V22）及 P/D 均开启 Prefix、P Eager / D Graph 的 TP2→TP2 pull（PD-V23）、push（PD-V24）均已通过；TP2 Eager/Prefix 非 PD 基线（PD-V25）及对应 pull（PD-V26）、push（PD-V27）均已通过。至此当前 TP2→TP2 部署的 D Graph 开关 × 双端 Prefix 开关 × pull/push 共 8 种配置各 15/15 exact PASS，P 保持 Eager；普通 DP2×TP1 的 load、Graph/Prefix 关闭配置下 pull（PD-V29）与 push（PD-V31）均已通过；普通 DP2 Graph 基线（PD-V32）及 P Eager / D Graph、Prefix 关闭的 pull（PD-V33）与 push（PD-V34）均已通过；普通 DP2 Graph/Prefix 均开启的非 PD 基线（PD-V35）及双端 Prefix 开启、P Eager / D Graph 的 pull（PD-V36）、push（PD-V37）均已由用户确认全部 PASS。普通 DP2 Eager/Prefix 非 PD 基线（PD-V38）及对应 pull（PD-V39）、push（PD-V40）均已由用户确认全部 PASS；至此当前普通 DP2×TP1、load 部署的 D Graph 开关 × 双端 Prefix 开关 × pull/push 共 8 种配置全部通过，P 保持 Eager、回传关闭。Attention DP2/EP2→Attention DP2/EP2 的 load、Eager、Prefix 关闭 pull（PD-V45）与 push（PD-V46）均已通过；对应 D Graph 开启 / Prefix 关闭的 pull（PD-V48）与 push（PD-V49）也均已通过；Graph+Prefix 非 PD 基线（PD-V50）及双端 Prefix 开启的 pull（PD-V51）、push（PD-V52）均已通过，Eager/Prefix 非 PD 基线（PD-V53）也已通过，双端 Eager/Prefix pull（PD-V54）与 push（PD-V55）均已通过；至此 Attention DP2/EP2、load、P Eager 的 D Graph 开关 × 双端 Prefix 开关 × pull/push 八种基础配置全部验收成功。普通 TP1→TP2、Eager/Prefix 关闭的 pull（PD-V56）随后通过：15/15 exact PASS，分片配对、D 双 rank 执行、释放及拉取核查通过。同配置 push（PD-V57）也已通过：15/15 exact PASS，P 推送、双目标 rank、配对、释放及模型服务不变核查通过。反向 TP2→TP1 pull（PD-V58）修正设备分配后续验通过：15/15 exact PASS，双源 rank、分片合并、Eager、释放及 D 拉取核查通过；使用在线同配置普通 TP1 对照。同配置反向 push（PD-V59）随后通过：15/15 exact PASS，双源 rank、分片合并、Eager、释放及 P 推送核查通过。普通 TP1→TP2 与 TP2→TP1、Eager/Prefix 关闭的 pull/push 四种组合均已验收成功；混合部署 P Attention DP2/EP2 → D 普通 TP1、Eager/Prefix 关闭的 pull（PD-V60）随后通过：15/15 exact PASS，双源副本、连续到分页 KV、完成释放及 D 拉取核查通过；同配置 push（PD-V61）随后通过：15/15 exact PASS，双源副本、连续到分页 KV、完成释放、P 推送及模型服务不变核查通过。普通 TP1 → Attention DP2/EP2 pull（PD-V62）已回传 13/15 PASS、2 个 exact FAIL，独立运行核查未完成；同配置 push（PD-V63）待验。当前先只读提取失败响应文本、讨论验收口径；其他配置、规模与策略继续单列待验。第 8 步 Graph/Prefix 关闭的 TP1 push、pull 各 7/7 已通过；其他组合、回传、压力、故障及性能仍待验。Attention DP/EP 前缀缓存一致性仍失败。**
 第 7 步的普通 DP2×TP1 非 PD 离线基线（PD-V28）已由用户回传通过：正式 `load` 调度、Graph/Prefix 关闭，15/15 录制用例 PASS，GPU 1、3 的两个副本各增加 70 次 Eager Decode，基线完整性与 P 保持不变核查通过，录制及总退出码均为 0。该项不代表 DP 的 PD exact 或负载策略全量验收。
 第 7 步普通 DP 的配对缺口已补入正式 C++ 路径：按实际分片传输边筛选候选，再选副本并绑定本次交接；调度预留不提前分配 D 的 KV。用户服务器已完成新核心构建；35 个配对控制用例（PD-V30）补齐测试输入后复验 35/35 PASS、退出码 0，首次缺字段失败保留为历史。随后 P=[0,2]、D=[1,3] 的 DP2×TP1→DP2×TP1、load、pull、Graph/Prefix/回传关闭（PD-V29）回传 15/15 exact PASS；两端各副本承接请求数均为 [11,10]，D 的 Eager Decode 增量为 [81,80]，D 本轮拉取 504 批、1290338304 字节；配对与实际执行核查通过，生成与总退出码均为 0。本机仅 0↔1、2↔3 支持 P2P，本次核查确认请求只走对应可达配对。
 配对修复后的既有回归已由用户回传：protocol 41/41、Router 20/20 全部 PASS，两项退出码均为 0（PD-V02/PD-V03）。上述控制回归与 PD-V29 的真实模型 pull 分别记录验收。同配置普通 DP push（PD-V31）随后由用户回传 15/15 exact PASS；修正核查脚本的角色条件后，对原始快照离线复核 PASS、退出码 0：双方请求分配均为 [10,11]，各 21 次交接均完成并释放，D 的 Eager Decode 增量为 [80,81]，P 推送 504 批、1290338304 字节。原始脚本误报的 FAIL 保留。普通 DP2×TP1、Graph 开启 / Prefix 关闭的非 PD 基线（PD-V32）随后由用户回传 15/15 录制 PASS；两个副本各新增捕获 10 次、回放 70 次，基线完整性与 P 保持不变核查通过，录制及总退出码均为 0。随后普通 DP2、P Eager / D Graph、Prefix 关闭的 pull（PD-V33）由用户回传 15/15 exact PASS；两端请求分配均为 [11,10]，D 捕获增量 [11,10]、回放增量 [81,80]，P 捕获/回放增量均为 0，D 拉取 504 批、1290338304 字节，生成及总退出码均为 0。同配置 push（PD-V34）随后回传 15/15 exact PASS；两端请求分配均为 [10,11]，D 捕获增量 [10,11]、回放增量 [80,81]，P 捕获/回放增量均为 0，P 推送 504 批、1290338304 字节；配对、完成释放及实际执行核查通过，生成及总退出码均为 0。普通 DP2 Graph+Prefix 非 PD 基线（PD-V35）随后由用户明确确认“已经全部pass”，按约定的录制与运行核查范围验收；详细运行目录与计数尚未回传。随后用户明确确认 PD-V36“全部pass”，按双端 Prefix 开启、P Eager / D Graph 的普通 DP2 pull 约定范围验收：15 个 exact 用例及双副本前缀复用、Graph、配对、完成释放和实际拉取核查；详细运行目录与计数尚未回传。同配置 push（PD-V37）随后由用户明确确认“全部pass了”，按约定的 15 个 exact 用例及双副本前缀复用、D Graph、配对、完成释放、P 端实际推送与服务保持不变核查验收；详细运行目录与计数尚未回传。普通 DP2×TP1、Graph 关闭 / Prefix 开启的非 PD 基线（PD-V38）随后由用户明确确认“全部pass”，按约定的 15 个录制用例及双副本 Eager/前缀复用、Graph 关闭、基线完整性和 P/Router 不变核查验收；详细运行目录与计数尚未回传。随后同配置普通 DP pull（PD-V39）由用户明确确认“全部pass”，按约定的 15 个 exact 用例及双副本前缀复用、D Eager、Graph 关闭、配对、完成释放、D 端实际拉取和 P/Router 不变核查验收；详细运行目录与计数尚未回传。同配置普通 DP push（PD-V40）随后由用户明确确认“全部pass”，按约定的 15 个 exact 用例及双副本前缀复用、D Eager、两端 Graph 关闭、配对、完成释放、P 端实际推送与服务保持不变核查验收；详细运行目录与计数尚未回传。当前普通 DP2×TP1、load 的基础八种配置全部通过；异构 TP、Attention DP/EP、其他规模与策略、回传及压力/性能继续保留待验。
@@ -41,12 +43,14 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 - 表格括号内注明适用范围；旧版、局部或模拟结果不能替代当前版本的真实模型/GPU 验收。
 - 更新事项时在主表维护当前状态，详情保存验收范围、证据与历史，不另建当前状态入口；历史报告、FAIL 与原始证据不改写。
 
+**当前问题（2026-11-28 用户回传）**：PD-V62 已完成部署并进入生成，13/15 case PASS；固定种子采样与并发 4 的实际输出 Token 不一致，生成及总退出码均为 1。接续时再次回传的目录与报告属于同一次已结束的失败运行，没有新复验结果。下一步只读核对现场进程并提取已保存响应文本，不重复启动或进入 PD-V63；详见 [PD-V62](#pd-v62)。
+
 ## 状态总览
 
 ### PD 分离
 
 **PD-V01～PD-V40 的各自约定范围已验收成功；PD-V31 的原始核查脚本 FAIL 保留，PD-V32/V35/V38 仅为非 PD 基线验收，PD-V35～V40 来源为用户明确确认全部 PASS。** PD- 编号行是功能事项；已有通过范围的标记“部分验收”，剩余范围列在“下一步”。
-2026-11-28 服务器重装后，四个原生目标重新编译成功（PD-V41）；随后用户确认 protocol 41 个用例全部 PASS（PD-V42），原生扩展已能执行该组检查，具体加载路径与摘要待报告归档。用户回传新环境四卡两两 NV2、P2P 读写全部 OK，旧机器跨组不可达限制不再适用于新环境；环境检查时无服务监听。Attention 副本证据修正的 9 个回归用例已由用户回传全部 PASS、退出码 0（PD-V43）。Attention DP2/EP2、load、Eager、Prefix 关闭的非 PD 基线随后通过：15 个录制用例全部 PASS，双 rank 的 Eager Decode 各增加 70，归档完整，生成与总退出码均为 0（PD-V44）。同配置 Attention DP2/EP2→Attention DP2/EP2 的 pull 对照随后通过（PD-V45）：15/15 exact PASS，两端副本请求数均为 [11,10]，D 的 Eager Decode 增量为 [81,80]，D 拉取 504 批、1271660544 字节；配对、执行与释放核查通过，生成及总退出码均为 0。同配置 push 随后通过（PD-V46）：15/15 exact PASS，两端副本请求数均为 [10,11]，P 的 Eager Decode 增量为 [0,0]、D 为 [80,81]，P 推送 504 批、1271660544 字节；配对、执行与释放核查通过，生成及总退出码均为 0。Attention DP2/EP2、Graph 开启 / Prefix 关闭的非 PD 基线已通过（PD-V47）：15/15 录制 PASS，双 rank 各捕获 +1、回放 +140，归档完整且 P 不变。同配置 pull / D Graph 对照也已通过（PD-V48）：15/15 exact PASS，D 双 rank 捕获各 +1、回放各 +160，两端副本请求数均为 [11,10]，D 拉取 504 批、1271660544 字节，生成及总退出码均为 0；原端口编排失败证据保留。同配置 push / D Graph 对照随后通过（PD-V49）：15/15 exact PASS，两端副本请求数均为 [10,11]；D 双 rank 各复用已有 1 次捕获，新增捕获均为 0、回放各 +161、Eager Decode 增量均为 0；P 推送 504 批、1271660544 字节，生成及总退出码均为 0。Attention DP2/EP2 Graph+Prefix 非 PD 基线（PD-V50）随后通过：15/15 录制 PASS，两个 rank 各捕获 +1、回放 +140、Eager Decode +0，前缀命中增加 [9,7]、复用 Token 增加 [2190,1674]；归档完整、P/PD Router 不变，生成及总退出码均为 0；本项不代表 PD exact 已通过。同配置双端 Prefix 开启的 pull（PD-V51）随后通过：15/15 exact PASS，两端副本请求数均为 [11,10]，P 原生前缀命中增量 [9,6]、复用 Token 增量 [2190,1163]，另列请求级 local_reused [2045,1023]；D 双 rank 捕获各 +1、回放各 +161，D 拉取 504 批、1271660544 字节，生成及总退出码均为 0。此前验收保留为 2026-11-27 环境的结论，不要求因此重跑全部矩阵；当前 Attention DP2/EP2、load、Prefix 关闭的 D Graph 开关 × pull/push 共四种配置已通过，双端 Prefix 开启 / D Graph 的 pull 也已通过；同配置 push（PD-V52）随后通过：15/15 exact PASS，P/D 请求数均为 [10,11]；P 前缀命中增量 [7,8]、原生复用 Token 增量 [2182,2199]、请求级 local_reused 各 1534；D 各复用 1 次已有捕获、回放各 +161，P 推送 504 批、1271660544 字节，生成与总退出码 0、模型服务保持不变。至此 Attention 基础矩阵六种 PD 配置通过。随后 Eager/Prefix 非 PD 基线（PD-V53）回传 15/15 录制 PASS：双 rank 的 Eager Decode 各 +70、捕获/回放增量均 0，前缀命中增加 [9,7]、复用 Token 增加 [2190,1674]；归档完整、P/PD Router 不变，生成及总退出码均 0。随后双端 Eager/Prefix pull（PD-V54）回传 15/15 exact PASS：两端请求数均 [11,10]；P 前缀命中增加 [9,7]、原生复用 Token 增加 [2710,2182]，请求级 local_reused [2045,1534]；D Eager Decode 增量 [81,80]，两端捕获/回放增量 0，D 拉取 504 批、1271660544 字节，P 不重启，生成与总退出码 0。随后同配置 push（PD-V55）由用户回传 15/15 exact PASS：两端请求数均 [10,11]；P 前缀命中增加 [8,8]、原生复用 Token 增加 [2704,2199]，请求级 local_reused [2045,1534]；D Eager Decode 增量 [80,81]，两端捕获/回放增量 0，P 推送 504 批、1271660544 字节，模型服务保持不变，生成与总退出码 0。当前 Attention 基础矩阵 8/8 配置验收成功；第 7 步的异构 TP、普通模式与 Attention DP/EP 混合部署及其他规模与策略仍单独待验。
+2026-11-28 服务器重装后，四个原生目标重新编译成功（PD-V41）；随后用户确认 protocol 41 个用例全部 PASS（PD-V42），原生扩展已能执行该组检查，具体加载路径与摘要待报告归档。用户回传新环境四卡两两 NV2、P2P 读写全部 OK，旧机器跨组不可达限制不再适用于新环境；环境检查时无服务监听。Attention 副本证据修正的 9 个回归用例已由用户回传全部 PASS、退出码 0（PD-V43）。Attention DP2/EP2、load、Eager、Prefix 关闭的非 PD 基线随后通过：15 个录制用例全部 PASS，双 rank 的 Eager Decode 各增加 70，归档完整，生成与总退出码均为 0（PD-V44）。同配置 Attention DP2/EP2→Attention DP2/EP2 的 pull 对照随后通过（PD-V45）：15/15 exact PASS，两端副本请求数均为 [11,10]，D 的 Eager Decode 增量为 [81,80]，D 拉取 504 批、1271660544 字节；配对、执行与释放核查通过，生成及总退出码均为 0。同配置 push 随后通过（PD-V46）：15/15 exact PASS，两端副本请求数均为 [10,11]，P 的 Eager Decode 增量为 [0,0]、D 为 [80,81]，P 推送 504 批、1271660544 字节；配对、执行与释放核查通过，生成及总退出码均为 0。Attention DP2/EP2、Graph 开启 / Prefix 关闭的非 PD 基线已通过（PD-V47）：15/15 录制 PASS，双 rank 各捕获 +1、回放 +140，归档完整且 P 不变。同配置 pull / D Graph 对照也已通过（PD-V48）：15/15 exact PASS，D 双 rank 捕获各 +1、回放各 +160，两端副本请求数均为 [11,10]，D 拉取 504 批、1271660544 字节，生成及总退出码均为 0；原端口编排失败证据保留。同配置 push / D Graph 对照随后通过（PD-V49）：15/15 exact PASS，两端副本请求数均为 [10,11]；D 双 rank 各复用已有 1 次捕获，新增捕获均为 0、回放各 +161、Eager Decode 增量均为 0；P 推送 504 批、1271660544 字节，生成及总退出码均为 0。Attention DP2/EP2 Graph+Prefix 非 PD 基线（PD-V50）随后通过：15/15 录制 PASS，两个 rank 各捕获 +1、回放 +140、Eager Decode +0，前缀命中增加 [9,7]、复用 Token 增加 [2190,1674]；归档完整、P/PD Router 不变，生成及总退出码均为 0；本项不代表 PD exact 已通过。同配置双端 Prefix 开启的 pull（PD-V51）随后通过：15/15 exact PASS，两端副本请求数均为 [11,10]，P 原生前缀命中增量 [9,6]、复用 Token 增量 [2190,1163]，另列请求级 local_reused [2045,1023]；D 双 rank 捕获各 +1、回放各 +161，D 拉取 504 批、1271660544 字节，生成及总退出码均为 0。此前验收保留为 2026-11-27 环境的结论，不要求因此重跑全部矩阵；当前 Attention DP2/EP2、load、Prefix 关闭的 D Graph 开关 × pull/push 共四种配置已通过，双端 Prefix 开启 / D Graph 的 pull 也已通过；同配置 push（PD-V52）随后通过：15/15 exact PASS，P/D 请求数均为 [10,11]；P 前缀命中增量 [7,8]、原生复用 Token 增量 [2182,2199]、请求级 local_reused 各 1534；D 各复用 1 次已有捕获、回放各 +161，P 推送 504 批、1271660544 字节，生成与总退出码 0、模型服务保持不变。至此 Attention 基础矩阵六种 PD 配置通过。随后 Eager/Prefix 非 PD 基线（PD-V53）回传 15/15 录制 PASS：双 rank 的 Eager Decode 各 +70、捕获/回放增量均 0，前缀命中增加 [9,7]、复用 Token 增加 [2190,1674]；归档完整、P/PD Router 不变，生成及总退出码均 0。随后双端 Eager/Prefix pull（PD-V54）回传 15/15 exact PASS：两端请求数均 [11,10]；P 前缀命中增加 [9,7]、原生复用 Token 增加 [2710,2182]，请求级 local_reused [2045,1534]；D Eager Decode 增量 [81,80]，两端捕获/回放增量 0，D 拉取 504 批、1271660544 字节，P 不重启，生成与总退出码 0。随后同配置 push（PD-V55）由用户回传 15/15 exact PASS：两端请求数均 [10,11]；P 前缀命中增加 [8,8]、原生复用 Token 增加 [2704,2199]，请求级 local_reused [2045,1534]；D Eager Decode 增量 [80,81]，两端捕获/回放增量 0，P 推送 504 批、1271660544 字节，模型服务保持不变，生成与总退出码 0。当前 Attention 基础矩阵 8/8 配置验收成功；普通 TP1→TP2、Eager/Prefix 关闭的 pull（PD-V56）续验随后通过：15/15 exact PASS，双端各 21 次请求，D 两个 rank 的 Eager Decode 各 +161、NCCL 各 +3864，D 拉取 1008 批、1290338304 字节，生成及总退出码均为 0。同配置 push（PD-V57）随后由用户回传 15/15 exact PASS：双端各 21 次请求，P rank 0 的 NCCL +504、Eager Decode +0，D 双 rank 的 NCCL 各 +3864、Eager Decode 各 +161，P 推送 1008 批、1290338304 字节；配对、释放及模型服务不变核查通过，生成与总退出码均 0。反向 TP2→TP1 pull（PD-V58）随后由用户回传续验成功：15/15 exact PASS；P 双 rank 的 NCCL 各 +504，D 的 Eager Decode +161、完整 TP1 对照 +140；三端各 21 次请求，D 拉取 1008 批、1290338304 字节，配对、释放、在线对照配置一致及 Router 不变核查通过，生成与总退出码均为 0。原 GPU 分配错误导致的启动失败保留为历史。同配置反向 push（PD-V59）随后由用户回传 15/15 exact PASS：P 双 rank 的 NCCL 各 +504、Eager Decode 各 +0；D Eager Decode +161、完整 TP1 对照 +140；三端各 21 次请求，P 推送 1008 批、1290338304 字节，配对、合并、释放、在线对照配置一致及模型服务不变核查通过，生成与总退出码均为 0。至此普通 TP1→TP2 与 TP2→TP1、Eager/Prefix 关闭的 pull/push 共四种组合全部验收成功；普通模式与 Attention DP/EP 混合部署及其他配置、规模与策略仍单独待验。
 “验证状态”的通过结论只适用于括号中列明的检查或用例。
 **测试步骤号沿用[原 13 步计划](../docs/pd_disaggregation/TESTING.md#测试步骤编号)**：第 6 步为生成正确性，第 7 步为并行模式组合，第 8 步为取消与资源释放。`PD-Vxx` 是验收对象编号，不是步骤号；PD-V06/V07、PD-V10/V11、PD-V12/V13 和 PD-V14/V15 对应第 6 步的不同配置，PD-V08/V09 对应第 8 步的两个组合。提前执行第 8 步不代表第 6、7 步的其余范围已经完成。
 
@@ -66,9 +70,16 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-V52](#pd-v52) | 第 7 步并行组合：Attention DP2/EP2→Attention DP2/EP2、load、push、P Eager / D Graph、双端 Prefix 开启 | 已接入（C++ 调度/EP 协调与前缀复用，CUDA Graph/IPC；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；双副本复用、D Graph、配对、释放、P 推送及模型服务不变核查通过，生成及总退出码 0） | 验收成功 | Eager/Prefix 基线与 pull/push 已分别通过 PD-V53/V54/V55；本组合不关闭既有 Attention 前缀一致性问题 |
 | [PD-V53](#pd-v53) | 第 7 步准备：Attention DP2/EP2 非 PD 离线基线，load、Graph 关闭 / Prefix 开启 | 已接入（C++ 调度/EP 协调及前缀缓存，CUDA Eager；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 录制 PASS；双 rank Eager/前缀复用、归档及 P/PD Router 不变核查通过，生成及总退出码 0） | 验收成功 | 已用于 PD-V54 pull 与 PD-V55 push 对照通过；本项仅为该配置非 PD 基线验收 |
 | [PD-V54](#pd-v54) | 第 7 步并行组合：Attention DP2/EP2→Attention DP2/EP2、load、pull、双端 Eager / Prefix 开启 | 已接入（C++ 调度/EP 协调与前缀复用，CUDA Eager/IPC；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；双副本复用、Eager、配对、释放、D 拉取及 P 不重启核查通过，生成及总退出码 0） | 验收成功 | 同配置 PD-V55 push 已通过；当前 Attention 基础矩阵 8/8 配置验收成功，其他并行组合及既有前缀一致性问题独立待验 |
-| [PD-V55](#pd-v55) | 第 7 步并行组合：Attention DP2/EP2→Attention DP2/EP2、load、push、双端 Eager / Prefix 开启 | 已接入（C++ 调度/EP 协调与前缀复用，CUDA Eager/IPC；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；双副本复用、Eager、配对、释放、P 推送及模型服务不变核查通过，生成及总退出码 0） | 验收成功 | 本配置完成，Attention 基础矩阵 8/8 配置通过；下一项普通 TP1→TP2 pull 单列 PD-V56，其他并行范围独立待验 |
-| [PD-V56](#pd-v56) | 第 7 步并行组合：普通 TP1→TP2、pull、双端 Eager / Prefix 关闭 | 已接入（C++ 调度/分片映射与资源管理，CUDA Eager/IPC；Python 后台编排与证据核查） | 未通过（2026-11-28 用户回传：D 首次快照两 rank 的 page_len=0、基线=128；其余配置相同，编排退出码 1，尚未提交生成） | 未通过 | 证据采集顺序修正另列 PD-E01；保留当前服务，重新采集并严格核对实际配置后续验，保留原 FAIL 与历史基线 |
-| [PD-E01](#pd-e01) | 普通 TP 冷启动证据：页池初始化后采集页大小 | 已修正（C++ 采集顺序；Python 冷启动回归） | 待验证（本地静态 Review/语法/差异检查；未编译、未运行原生回归） | 未验收 | 服务器更新原生产物后执行 evidence 共 10 个控制用例；既有 PD-V43 的 9 个历史 PASS 保留，不新增并行部署矩阵 |
+| [PD-V55](#pd-v55) | 第 7 步并行组合：Attention DP2/EP2→Attention DP2/EP2、load、push、双端 Eager / Prefix 开启 | 已接入（C++ 调度/EP 协调与前缀复用，CUDA Eager/IPC；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；双副本复用、Eager、配对、释放、P 推送及模型服务不变核查通过，生成及总退出码 0） | 验收成功 | 本配置完成，Attention 基础矩阵 8/8 配置通过；普通 TP1→TP2 pull 已单列 PD-V56 验收，其他并行范围独立待验 |
+| [PD-V56](#pd-v56) | 第 7 步并行组合：普通 TP1→TP2、pull、双端 Eager / Prefix 关闭 | 已接入（C++ 调度/分片映射与资源管理，CUDA Eager/IPC；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传续验 15/15 exact PASS；分片配对、D 双 rank Eager/NCCL、释放与实际拉取核查通过，生成及总退出码 0） | 验收成功 | 原冷启动配置 FAIL 保留；同配置 push 已单列 PD-V57 验收成功；反向同配置 pull/push 见 PD-V58/V59，混合部署另验；本次沿用已加载的服务版本 |
+| [PD-V57](#pd-v57) | 第 7 步并行组合：普通 TP1→TP2、push、双端 Eager / Prefix 关闭 | 已接入（C++ 调度/分片映射与资源管理，CUDA Eager/IPC；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；分片配对、D 双 rank Eager/NCCL、完成释放、P 推送及模型服务不变核查通过，生成及总退出码 0） | 验收成功 | 本项完成；反向同配置 pull/push 已通过 PD-V58/V59；不包含其他执行配置或混合部署 |
+| [PD-V58](#pd-v58) | 第 7 步并行组合：普通 TP2→TP1、pull、双端 Eager / Prefix 关闭 | 已接入（C++ 调度/分片映射与资源管理，CUDA Eager/IPC；Python 编排，设备选择已修正） | 已通过（2026-11-28 用户回传续验 15/15 exact PASS；在线 TP1 对照、双源 rank、分片合并、Eager、释放及 D 拉取核查通过，生成及总退出码 0；原启动失败保留） | 验收成功 | 本项完成；同配置反向 push（PD-V59）也已通过，不扩大为其他配置或第 7 步整体验收 |
+| [PD-V59](#pd-v59) | 第 7 步并行组合：普通 TP2→TP1、push、双端 Eager / Prefix 关闭 | 已接入（C++/CUDA 正式路径；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；在线 TP1 对照、双源 rank、分片合并、Eager、释放、P 推送及模型服务不变核查通过，生成及总退出码 0） | 验收成功 | 本项完成；TP1→TP2 与 TP2→TP1 的 Eager/Prefix 关闭 pull/push 四种组合均通过，下一项混合部署 pull 见 PD-V60；其他配置/规模与策略分别待验 |
+| [PD-V60](#pd-v60) | 第 7 步混合部署：P Attention DP2/EP2 → D 普通 TP1、pull、Eager / Prefix 关闭 | 已接入（C++ 调度/协议/布局适配、CUDA 计算与 IPC；Python 后台编排及证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；双源副本、连续到分页 KV、Eager、完成释放及 D 拉取核查通过，生成及总退出码 0） | 验收成功 | 本项完成；P=[0,2]、D=[3]、完整 TP1=[1]，D/full/8001 不变；同配置 push 另列 PD-V61，其他混合方向/配置待验 |
+| [PD-V61](#pd-v61) | 第 7 步混合部署：P Attention DP2/EP2 → D 普通 TP1、push、Eager / Prefix 关闭 | 已接入（C++/CUDA 正式路径；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；双源副本、连续到分页 KV、Eager、完成释放、P 推送及模型服务不变核查通过，生成及总退出码 0） | 验收成功 | 本方向 pull/push 均通过；下一项反向普通 TP1 → Attention DP2/EP2 pull/push 见 PD-V62/V63，其他配置/规模待验 |
+| [PD-V62](#pd-v62) | 第 7 步混合部署：P 普通 TP1 → D Attention DP2/EP2、pull、Eager / Prefix 关闭 | 已接入（C++/CUDA 正式路径；Python 后台切换与证据核查） | 未通过（2026-11-28 用户回传 13/15 exact PASS；固定种子采样 output 3、并发 4 output 6 首差，生成及总退出码 1；后续独立运行核查未完成） | 未验收 | 接续回传确认是原失败运行且任务已结束，无新复验结果；先只读核对现场进程、提取响应文本并讨论口径，原 exact FAIL 保留 |
+| [PD-V63](#pd-v63) | 第 7 步混合部署：P 普通 TP1 → D Attention DP2/EP2、push、Eager / Prefix 关闭 | 已有正式路径；测试编排待准备 | 待验证（15 个 exact 用例及独立运行核查） | 未验收 | 接续 PD-V62；验双目标副本、分页到连续 KV、完成释放及 P 推送 |
+| [PD-E01](#pd-e01) | 普通 TP 冷启动证据：页池初始化后采集页大小 | 已修正（C++ 采集顺序；Python 冷启动回归） | 已通过（2026-11-28 用户回传 evidence 10/10 PASS、退出码 0；冷启动双 rank 页长 256，首次与后续快照一致） | 验收成功 | 本项控制回归完成；真实模型生成已独立通过 PD-V56；该控制回归不替代服务重启后的冷启动 GPU 验证 |
 | [PD-V01](#pd-v01) | C++/CUDA 编译与加载 | 已实现 | 已通过（2026-11-27 用户确认） | 验收成功 | 重装后编译与 protocol 分列 PD-V41/V42，实际加载路径与摘要待归档 |
 | [PD-V02](#pd-v02) | 协议与逻辑映射（protocol） | 已实现 | 已通过（配对修复后用户回传 41/41 PASS，退出码 0） | 验收成功 | 本次控制回归完成；真实模型集成见 PD-V29/PD-02 |
 | [PD-V03](#pd-v03) | Router 重试边界（router） | 已实现 | 已通过（配对修复后用户回传 20/20 PASS，退出码 0） | 验收成功 | 本次重试边界回归完成；真实服务故障矩阵见 PD-13 |
@@ -115,9 +126,9 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-04](#pd-04) | GGUF 完整版本升级与 AVX 兼容 | 已接入（上游完整组件） | 部分通过（静态完整性） | 未验收 | 服务器构建，复验元数据、量化及正式模型 |
 | [PD-05](#pd-05) | GGUF IQK R4 指令集兼容 | 已接入（随完整版本升级） | 部分通过（静态 Review） | 未验收 | 与 PD-04 一并验证 CPU 能力选择及普通点积 |
 | [PD-06](#pd-06) | PD 准确性判定规则 | 部分实现（规范已定） | 待验证 | 未验收 | 适配比较、报告和退出码 |
-| [PD-07](#pd-07) | 普通 DP×TP / Attention DP/EP 四种组合 | 已接入 | 部分通过（普通 TP1→TP1 八种执行配置及 TP2→TP2 Eager 无前缀 pull/push、D Graph 无前缀 pull/push、D Graph/双端 Prefix pull/push 及 Eager/双端 Prefix pull/push；TP2 见 PD-V17/V18/V20/V21/V23/V24/V26/V27；普通 DP2×TP1 load、Eager pull/push、D Graph pull/push 及双端 Prefix 开启的 D Graph pull/push 和 Eager pull/push 见 PD-V29/PD-V31/PD-V33/PD-V34/PD-V36/PD-V37/PD-V39/PD-V40；Attention DP2/EP2→Attention DP2/EP2 load、Eager、Prefix 关闭 pull/push 见 PD-V45/V46，D Graph 开启 / Prefix 关闭 pull/push 见 PD-V48/V49；双端 Prefix 开启 / D Graph pull/push 见 PD-V51/V52，双端 Eager/Prefix pull/push 见 PD-V54/V55） | 部分验收 | 先验证普通 TP1→TP2、Eager/Prefix 关闭的 pull；普通 DP 其他规模与策略、异构 TP 其余方向及普通模式与 Attention DP/EP 混合组合分别待验 |
-| [PD-08](#pd-08) | Qwen2 MoE 普通进程 DP×TP | 已接入 | 已通过（构建、普通 TP1/TP2 基线，含 TP2 Graph/Prefix 开启及 Eager/Prefix 开启；TP1 PD 生成及 TP2 Eager 无前缀 pull/push、D Graph 无前缀 pull/push、D Graph/双端 Prefix pull/push 及 Eager/双端 Prefix pull/push；普通 DP2×TP1 非 PD 基线及双副本实际执行通过，普通 DP2×TP1 load、Eager pull/push、D Graph pull/push 及双端 Prefix 开启的 D Graph pull/push 和 Eager pull/push 也通过，见 PD-V16～V40） | 部分验收 | 补普通 DP 其他规模与策略、其他 TP 规模与混合部署 |
-| [PD-09](#pd-09) | KV 重分片、映射与布局对齐 | 已接入 | 已通过（protocol / IPC 用例；同 TP 的真实模型交接，含 PD-V17/V18 TP2 pull/push） | 部分验收 | 先核对既有非 PD TP2 离线基线能否复用，再验证普通 TP1→TP2、Eager/Prefix 关闭的 pull；其余真实模型重分片、布局互转与副本隔离分别待验 |
+| [PD-07](#pd-07) | 普通 DP×TP / Attention DP/EP 四种组合 | 已接入 | 部分通过（普通 TP1→TP1 八种执行配置及 TP2→TP2 Eager 无前缀 pull/push、D Graph 无前缀 pull/push、D Graph/双端 Prefix pull/push 及 Eager/双端 Prefix pull/push；TP2 见 PD-V17/V18/V20/V21/V23/V24/V26/V27；普通 DP2×TP1 load、Eager pull/push、D Graph pull/push 及双端 Prefix 开启的 D Graph pull/push 和 Eager pull/push 见 PD-V29/PD-V31/PD-V33/PD-V34/PD-V36/PD-V37/PD-V39/PD-V40；Attention DP2/EP2→Attention DP2/EP2 load、Eager、Prefix 关闭 pull/push 见 PD-V45/V46，D Graph 开启 / Prefix 关闭 pull/push 见 PD-V48/V49；双端 Prefix 开启 / D Graph pull/push 见 PD-V51/V52，双端 Eager/Prefix pull/push 见 PD-V54/V55；普通 TP1→TP2 Eager/Prefix 关闭的 pull/push 见 PD-V56/V57，反向 TP2→TP1 pull/push 见 PD-V58/V59；混合 P Attention DP2/EP2 → D 普通 TP1、Eager/Prefix 关闭 pull/push 见 PD-V60/V61） | 部分验收 | 本轮四卡基础方向反向 pull（PD-V62）生成 13/15 PASS、2 个 exact FAIL 待定位，独立运行核查未完成；push（PD-V63）待验；其余配置/规模/策略另列，不扩大收尾矩阵 |
+| [PD-08](#pd-08) | Qwen2 MoE 普通进程 DP×TP | 已接入 | 已通过（构建、普通 TP1/TP2 基线，含 TP2 Graph/Prefix 开启及 Eager/Prefix 开启；TP1 PD 生成及 TP2 Eager 无前缀 pull/push、D Graph 无前缀 pull/push、D Graph/双端 Prefix pull/push 及 Eager/双端 Prefix pull/push；普通 DP2×TP1 非 PD 基线及双副本实际执行通过，普通 DP2×TP1 load、Eager pull/push、D Graph pull/push 及双端 Prefix 开启的 D Graph pull/push 和 Eager pull/push 也通过，见 PD-V16～V40；普通 TP1→TP2 Eager/Prefix 关闭 pull/push 已通过 PD-V56/V57，反向 TP2→TP1 pull/push 已通过 PD-V58/V59） | 部分验收 | 补异构 TP 其他执行配置、普通 DP 其他规模与策略及混合部署 |
+| [PD-09](#pd-09) | KV 重分片、映射与布局对齐 | 已接入 | 已通过（protocol / IPC 用例；同 TP 的真实模型交接，含 PD-V17/V18 TP2 pull/push；普通 TP1→TP2 Eager/Prefix 关闭 pull/push 的真实分片交接见 PD-V56/V57，TP2→TP1 pull/push 真实分片合并见 PD-V58/V59） | 部分验收 | 其余真实模型重分片、布局互转与副本隔离分别待验 |
 | [PD-10](#pd-10) | Router 服务路由、P/D 配对 | 已接入 | 已通过（配对修复后 Router 20/20；新增副本配对控制 35/35，普通 DP2×TP1 load、Eager pull/push、D Graph pull/push 及双端 Prefix 开启的 D Graph pull/push 和 Eager pull/push 真实配对与生成通过，见 PD-V03/PD-V30/PD-V29/PD-V31/PD-V33/PD-V34/PD-V36/PD-V37/PD-V39/PD-V40） | 部分验收 | 补其他部署和策略的真实配对联调 |
 | [PD-11](#pd-11) | 服务注册与健康检查 | 已接入 | 已通过（健康/重启用例；用户确认 full0 实服务就绪） | 部分验收 | 补周期探测、配置覆盖与服务恢复验收 |
 | [PD-12](#pd-12) | 八种服务级 Router 策略 | 已接入 | 已通过（八策略基本用例） | 部分验收 | 核对完整策略语义及 P/D 独立配置 |
@@ -2981,6 +2992,24 @@ Attention DP2/EP2 同布局基础矩阵，不扩展为第 7 步所有并行组�
 <details>
 <summary>PD-V56｜第 7 步并行组合：普通 TP1→TP2 pull、双端 Eager / Prefix 关闭</summary>
 
+**续验服务器证据（用户回传，2026-11-28）**：
+
+- 总流程：`test/distributed/results/20261128T093742Z_pd_tp1_tp2_pull_resume_cd844223`。
+- 生成报告：`test/distributed/results/20261128T093743Z_pd_generation_377fded2`。
+- 保留 P=GPU 0（TP1）、D=GPU 2、3（TP2）及 8000 pull Router，重新采集的
+  真实配置与原普通 TP2 离线基线严格一致，未更改基线或绕过页大小检查。
+- 15/15 正式入口用例全部 exact PASS，含 1/128/511/512/513 Token、流式与
+  非流式、首 Token、固定种子、并发 2/4 和三轮完整历史；生成退出码 0。
+- `tp1_tp2_pull_runtime` PASS，总退出码 0、`passed=true`，标准错误为空；
+  双端各 21 次请求，源 TP1 到目标 TP2 的分片配对、完成释放及服务身份保持
+  不变核查通过。P rank 0 的 NCCL 调用 +504、Eager Decode +0；D rank 0/1
+  的 NCCL 调用各 +3864、Eager Decode 各 +161。
+- D 端本轮真实拉取增量：1008 个传输批次、1290338304 字节。通过范围仅为
+  本项 TP1→TP2 pull、Eager/Prefix 关闭，不延伸为 push、反向 TP 或其他组合。
+- 依据为用户服务器回传，代理未本地运行 GPU 或编译。现有服务未重启，仍沿用
+  已加载的原生版本；独立 evidence 测试的新扩展回归另见 PD-E01，不混同为本次
+  模型服务已切换新扩展。首次失败证据保留如下，当前状态统一见主表。
+
 **首次服务器运行（用户回传，2026-11-28）**：
 
 - 目录：`test/distributed/results/20261128T085912Z_pd_tp1_tp2_pull_d70982a5`。
@@ -2997,7 +3026,7 @@ Attention DP2/EP2 同布局基础矩阵，不扩展为第 7 步所有并行组�
 - 源码核查定位到证据采集顺序：先 `cache` 读到尚未创建执行器的默认状态，再
   `usage` 按需初始化普通 TP 页池；同一响应混合了初始化前后的状态。修正与控制
   回归独立记录在 PD-E01，不据此将本项标记通过。
-- 下一步保留当前服务，重新采集真实配置并与未修改的基线严格比较；不能把
+- 当时的续验安排为保留当前服务，重新采集真实配置并与未修改的基线严格比较；不能把
   `page_len=0` 手工替换为 128 或跳过比较。实际配置匹配后，在新目录续验原有
   15 个 exact 用例及实际执行核查，保留原始 FAIL 记录。
 
@@ -3031,6 +3060,404 @@ Attention 部署、性能或待讨论的 pull 统一入口改造；当前状态�
 
 </details>
 
+<a id="pd-v57"></a>
+
+<details>
+<summary>PD-V57｜第 7 步并行组合：普通 TP1→TP2 push、双端 Eager / Prefix 关闭</summary>
+
+**约定范围（2026-11-28）**：承接已通过的 PD-V56。P 使用物理 GPU 0（TP1），
+D 使用物理 GPU 2、3（TP2），FP16、分页 KV、page size 128，双端 Eager、Prefix
+及回传关闭。保留模型服务，只把同一 8000 Router 从 pull 切为 push，不新增 Router。
+复用 `20261127T111045Z_pd_generation_ce70244e/reference.json` 普通 TP2 离线基线。
+
+**执行与通过标准**：后台执行原 15 个正式入口生成用例，要求全部 exact PASS、
+生成退出码 0；另列 `tp1_tp2_push_runtime` 核查本轮双端各 21 次请求及一致的配对，
+源 TP1 完整 head 范围到目标 TP2 两个 rank 的 UUID/分片覆盖，双端完成、无错误且
+释放。P 完成 Prefill，D 两个 rank 均有 Eager Decode/NCCL 增量；P 端本轮推送
+批次及字节增量为正，模型服务、原生 worker、配置与启动身份保持不变。
+不要求 D 的 `prefill_done` 为真，不要求 P TP1 发生跨卡 NCCL。
+
+核查区分旧请求与本轮请求，允许已释放且无错误的旧记录自然过期，不比较整个
+动态快照。切换前验证原基线摘要、模型服务身份、配置、物理 UUID 与空闲状态；
+自动从现有进程取得认证，检查 PID/启动时刻后只停止 Router，并等待进程和端口
+均释放后再启动。结果写入独立目录，保留 PID、完整命令、日志、退出码、前后证据
+及 Markdown/CSV/JSON/XLSX 报告；任何功能失败返回非零，旧结果不覆盖。
+
+**实现边界**：正式推理/调度/分片/生命周期使用 C++，模型与传输使用 CUDA，
+Python 仅用于后台编排、正式入口调用和证据核查。现有 P/D 沿用已加载版本；
+重启的 Router 使用构建目录中的现有扩展。仅做命令 Review、Python/Bash 语法
+检查和文档差异检查，未本地编译、未执行服务器或 GPU 测试。当前状态见主表；
+本项不包含反向 TP、混合部署、其他 Graph/Prefix 配置或性能验收。
+
+**2026-11-28 用户回传验收证据**（非代理自行运行）：
+
+- 总流程：`test/distributed/results/20261128T094600Z_pd_tp1_tp2_push_0653f51d`。
+- 生成报告：`test/distributed/results/20261128T094605Z_pd_generation_8df450ef`，
+  15/15 exact PASS，生成与总流程退出码均为 0。
+- P/D 各 21 次请求；P rank 0 的 NCCL +504、Eager Decode +0；D 两个 rank 的
+  NCCL 各 +3864、Eager Decode 各 +161。
+- P 端实际推送 1008 批、1290338304 字节；源/目标配对与 head 范围、完成释放、
+  模型服务保持不变核查通过，`services_unchanged=true`、`passed=true`。
+- 本次结论限 TP1→TP2 push、Eager/Prefix 关闭配置；不扩大为反向 TP 验收。
+
+</details>
+
+<a id="pd-v58"></a>
+
+<details>
+<summary>PD-V58｜第 7 步并行组合：普通 TP2→TP1 pull、双端 Eager / Prefix 关闭</summary>
+
+**约定范围（2026-11-28）**：承接 PD-V57。P 使用物理 GPU 0、2（TP2），
+D 使用 GPU 3（TP1），完整 TP1 对照服务使用 GPU 1；四卡独立分配。普通 TP、
+DP1、FP16、分页 KV/page 128、tokens 2048，Graph、Prefix、回传及自定义
+AllReduce 关闭。8000 为 pull Router，8001 只路由到 8300 完整服务。
+使用在线完整 TP1 对照，不将旧 TP2 离线基线改写或用于 TP1 D。
+
+**执行与通过标准**：原 15 个正式入口用例全部 exact PASS、退出码 0；
+独立 `tp2_tp1_pull_runtime` 核查本轮 P/D/完整服务各 21 次请求，P/D 配对一致，
+源两个 rank 的 UUID/head 分片完整覆盖到 D 单 rank；P 双 rank 有 NCCL 增量且
+无 Decode，D 与完整服务有 Eager Decode 增量；P Prefill 完成，D/完整服务完成
+输出，三者无错误且释放，D 本轮拉取批次/字节增量为正。完整服务与 D 的实际
+模型、TP/副本数、Graph/Prefix、KV/page、自定义 AllReduce 配置严格相同。
+不得把在线对照省略或把仅有成功启动当作生成通过。
+
+**编排边界**：核对上轮已通过、现有配置/启动身份/物理 UUID/空闲状态后，
+停止旧 P/D 和 8000 Router；8001 若已有同模型完整服务 Router，核对身份后
+更新该 Router。等待原服务和 worker 退出、端口释放，再启动新 P/D、完整服务
+与两个 Router。不停止其他未知进程，不使用 pidfd_open、不强杀。
+认证从现有进程取得；允许已释放且无错误的旧请求自然过期，不比较动态快照整体。
+运行期间保存部署、配对、完整命令、PID、日志、退出码及 MD/CSV/JSON/XLSX 报告，
+每次新目录；生成与运行核查分别报告。完成后保留三个模型服务以便继续 push。
+
+**实现边界与验证**：正式推理、调度、协议、KV 映射/生命周期采用 C++，模型计算
+和 IPC 搬运采用 CUDA；Python 仅用于后台编排、公开入口调用与证据核查。
+本地仅 Review 和 Python/Bash 语法、差异检查，未编译、未运行服务器/GPU 验收。
+当前状态见主表。本项不覆盖反向 push、其他 Graph/Prefix、混合部署或性能验收。
+
+**2026-11-28 用户回传的启动失败证据**（非代理自行运行）：
+
+- 目录：`test/distributed/results/20261128T100137Z_pd_tp2_tp1_pull_664646da`；
+  总退出码 1，`tp2_tp1_pull_runtime` 因新服务退出判 FAIL。
+- 旧 8000/8001 Router 与旧 P/D 已停止；新 P、D、full 均在原生会话
+  `wait_ready` 阶段收到 `session disconnected`，未进入 15 个生成用例。
+- 原生日志分别位于该目录下 `p/20261128T100143Z_pd_10b20cd0/0`、
+  `d/20261128T100143Z_pd_d632ac06/0`、`full/20261128T100143Z_pd_5db24c84/0`。
+  本轮粘贴内容只有 Python 外层异常，尚无这些原生 stdout/stderr 的内容。
+- 用户同时回传四卡显存均为 0。该状态与模型服务退出一致，但无法据此确定
+  退出根因；Router 的可选 ML 框架提示不是本轮模型进程退出的证据。
+- 下一步先采集原生启动命令、原生日志、动态依赖与内存状态，保留失败现场，
+  不重复运行依赖旧服务仍在的切换脚本。根因确认后再决定修复/恢复方式。
+  本轮仅查看代码、更新记录和准备只读诊断命令，未编译、未执行 GPU 验证。
+
+**2026-11-28 原生日志定位及恢复命令修正**：
+
+- 用户回传 `diagnose_20261128T101009Z_0b3f65c0.log`：三组加载权重均报
+  `Qwen3 weights CUDA: out of memory`；动态依赖均可解析，容器
+  `oom`/`oom_kill` 计数均为 0。
+- 代理此前给出的启动参数把裸 `--tp 3`、`--tp 1` 错当 GPU 编号。正式进程
+  后端将裸数字解释为卡数：P 原生命令为 `--devices 0,2`，D 为
+  `--devices 0,1,2`，full 为 `--devices 0`；三组重叠使用 GPU 0，P/D
+  还重叠使用 GPU 2。该错误属于本轮部署命令，不修改已验收的 PD-V56/V57。
+- 恢复命令维持预定物理分配 P=[0,2]、D=[3]、full=[1]。P 可见顺序
+  [0,1,2,3]、`--tp 0,2`；D 可见顺序 [3,0,1,2]、`--tp 1`；full
+  可见顺序 [1,0,2,3]、`--tp 1`。可见列表使用物理 UUID，三者均保留全部
+  四卡供 IPC 查询，并在新子进程中应用顺序，不在已初始化 CUDA 的进程中改映射。
+- 权重加载前，用服务相同参数/环境调用正式 `build_parallel_plan`，逐服务核对
+  TP 数、副本数、设备 UUID、物理 GPU 以及三组无重叠；全部通过后才启动模型。
+  模型就绪后再次用对应环境核对实际 worker 映射，再执行原 15 个 exact 用例
+  及原资源/传输核查。原失败目录保留，新建独立 retry 目录。
+- 此次复用已启动的 8000 pull Router 与 8001 对照 Router；自动读取已有认证，
+  先核对模型端口空闲及显存余量。不重新编译，不修改核心代码或第三方文件。
+  本地仅 Review、Python/Bash 语法与差异检查；没有执行服务器或 GPU 验收。
+
+
+**2026-11-28 用户回传的续验成功证据**（非代理自行运行）：
+
+- 修正后运行：`test/distributed/results/20261128T101650Z_pd_tp2_tp1_pull_retry_4bde1d73`。
+- 生成报告：`test/distributed/results/20261128T101949Z_pd_generation_5d6ac2e0`；
+  15/15 actual output token IDs exact PASS，生成与总退出码均为 0。
+- 三端各 21 次请求。P 两个 rank 的 NCCL 各 +504、Eager Decode 各 +0；
+  D rank 0 的 NCCL +3864、Eager Decode +161；完整 TP1 对照 rank 0 的
+  NCCL +3864、Eager Decode +140。TP1 的 NCCL 计数不作为跨卡通信证据。
+- D 端实际拉取 1008 批、1290338304 字节；双源 rank/head 到单目标的合并、
+  配对与释放通过，`reference_matches_d=true`、`routers_unchanged=true`、
+  `passed=true`；服务及生成 stderr 为空。
+- 原启动失败目录保持原样。验收范围限本项 TP2→TP1 pull、Eager/Prefix 关闭；
+  不覆盖反向 push、其他 Graph/Prefix、混合部署或性能。下一项单列 PD-V59。
+
+</details>
+
+<a id="pd-v59"></a>
+
+<details>
+<summary>PD-V59｜第 7 步并行组合：普通 TP2→TP1 push、双端 Eager / Prefix 关闭</summary>
+
+**约定范围（2026-11-28）**：承接 PD-V58 已通过部署，P 物理 GPU [0,2] 为
+普通 TP2，D=[3]、完整对照=[1] 均为普通 TP1，DP1、FP16、分页 KV/page 128、
+tokens 2048，Graph/Prefix/回传/自定义 AllReduce 关闭。复用三个模型服务和
+8001 对照 Router，仅将 8000 从 pull 切为 push，继续使用在线同配置 TP1 对照。
+
+**通过标准**：15 个正式入口用例全部 exact PASS；独立运行核查三端各 21 次
+新请求，P/D 配对一致，双源 rank 的 UUID/head 完整覆盖单目标，P 双 rank 有
+NCCL 增量且无 Decode，D/完整服务有 Eager Decode 增量。P Prefill 与 P/D
+交接完成、三端释放且无错误，P 端本轮推送批次/字节均增加；模型服务身份、
+配置、worker 及 8001 Router 不变，完整服务与 D 的配置一致。完整服务不发生
+KV 交接，不要求其交接 `completed` 字段为真，实际输出由生成报告验证。
+
+**编排与证据**：核对 PD-V58 成功快照、现有进程命令/启动身份/空闲状态，
+按各服务自身 CUDA 可见顺序校验物理 UUID，不改动模型设备映射；允许已释放
+无错误的历史请求自然过期。仅停止已核对的 8000 Router，等待进程退出与端口
+释放，再启动 push Router；不使用 pidfd_open 或强杀。新建 UTC/随机 ID 目录，
+后台运行，记录完整命令、PID、stdout/stderr、最终退出码，分别保存生成与
+运行核查的 Markdown、CSV、JSON、XLSX 及部署前后快照；任一失败返回非零。
+
+**实现边界与验证**：调度、协议、KV 映射/生命周期为 C++，模型计算与搬运为
+CUDA，Python 仅用于服务入口、后台编排和证据核查。命令仅做本地静态 Review、
+Python/Bash 语法检查，未编译、未运行服务器或 GPU 验收；当前状态见主表。
+
+**2026-11-28 用户回传的验收证据**（非代理自行运行）：
+
+- 总流程：`test/distributed/results/20261128T102905Z_pd_tp2_tp1_push_a4ff71ae`。
+- 生成报告：`test/distributed/results/20261128T102911Z_pd_generation_ee019fb8`；
+  15/15 actual output token IDs exact PASS，生成与总退出码均为 0，
+  `tp2_tp1_push_runtime PASS`。
+- 三端各 21 次请求。P 两个 rank 的 NCCL 各 +504、Eager Decode 各 +0；
+  D rank 0 的 NCCL +3864、Eager Decode +161；完整 TP1 对照 rank 0 的
+  NCCL +3864、Eager Decode +140。TP1 NCCL 计数不作为跨卡通信证据。
+- P 端实际推送 1008 批、1290338304 字节；双源分片合并、配对、释放通过，
+  `reference_matches_d=true`、`services_unchanged=true`、`passed=true`。
+- 总流程 stderr 为空；Router 仅提示未安装可选 ML 框架，本轮 Tokenizer 与
+  原生推理已正常完成，未因此判 FAIL。
+- 本项限 TP2→TP1 push、Eager/Prefix 关闭；结合 PD-V56/V57/V58，普通
+  TP1→TP2 与 TP2→TP1 的 Eager/Prefix 关闭 pull/push 四种组合已通过，
+  不扩大为其他执行配置、混合部署、性能或第 7 步整体验收。
+
+</details>
+
+<a id="pd-v60"></a>
+
+<details>
+<summary>PD-V60｜第 7 步混合部署：Attention DP2/EP2 → 普通 TP1 pull、Eager / Prefix 关闭</summary>
+
+**约定范围（2026-11-28）**：承接 PD-V59。仅将物理 GPU [0,2] 上的 P 从
+普通 TP2 切为 Attention DP2/EP2、Attention TP1、load，采用连续 KV；D 继续
+使用 GPU 3、普通 TP1、分页 KV/page 128、tokens 2048，完整同配置 TP1 对照
+继续使用 GPU 1。全部 FP16、Eager，Prefix/回传关闭；8000 切为 pull，保留
+D、full 与 8001 对照 Router，使用已有固定 25 Token 输入展开原 15 个用例。
+无需重录基线或重新编译；本轮不扩大其他混合方向与 Graph/Prefix 测试矩阵。
+
+P 的两张卡组成同一个 Attention DP2/EP2 组，每请求选择一个 Attention TP1
+副本；其 KV 包含完整 head 范围，不能把 EP 组两个 rank 当成 TP2 分片。
+新 P 保留四卡可见，UUID 顺序为 [0,2,1,3]，正式规划器选择前两卡。
+先校验 CLI、实际规划及 UUID，无误后才停止旧 P 与 Router；等待旧进程、
+两个 worker 和端口释放后启动新实例，不使用 pidfd_open 或强杀。
+
+**通过标准**：15 个正式入口用例与在线普通 TP1 对照实际输出 Token ID exact
+一致、生成退出码 0；独立运行核查三端各 21 次新请求，P 两个 Attention 副本
+均有请求，P Prefill 完成且无 Decode，D/完整服务有 Eager Decode 增量。
+P/D 同请求配对一致，源选中副本/目标单副本的物理 UUID、完整 head 范围、
+Attention TP1 与目标 TP1、连续→分页布局正确。D 交接完成，三端无错误且
+已释放，D 本轮拉取批次/字节增量为正；D/full 配置、boot、worker 及 8001
+进程不变，测试期间新 P 也不重启。仅有生成 PASS 不能代替运行核查通过。
+
+**证据与实现边界**：C++ 负责调度、协议、KV 映射与资源生命周期，CUDA
+负责模型计算与 IPC，Python 只编排服务、调用正式生成入口及核查证据。
+后台运行，独立 UTC/8 位随机 ID 目录；记录完整命令、PID、最终退出码、
+stdout/stderr、设备规划、部署前后证据，生成与运行核查分别输出
+Markdown/CSV/JSON/XLSX。身份、配置检查允许已释放且无错误的旧请求自然
+过期，不以全快照相等阻塞切换。任一用例/核查失败保留证据并返回非零。
+
+**服务器验证（用户回传，2026-11-28）**：
+
+- 总目录：`test/distributed/results/20261128T103944Z_pd_ep2_tp1_pull_37d408ab`。
+- 生成目录：`test/distributed/results/20261128T104251Z_pd_generation_1eafc387`；
+  15/15 实际输出 Token ID exact PASS，生成及总退出码均为 0。
+- P 两个 Attention 副本分别承接 11、10 次请求，Eager Decode 增量均为 0。
+  D 与 full 各 21 次请求，Eager Decode 增量分别为 161、140。
+- D 本轮拉取 504 批、1290338304 字节；运行核查 `ep2_tp1_pull_runtime` PASS。
+  配对、连续→分页 KV、完成释放、在线对照配置一致、保留服务不变均核查通过。
+- 可选框架提示未影响本次 Tokenizer 与原生推理验收；没有其他标准错误。
+
+本项按约定范围验收，状态见主表；结果来源为用户服务器回传，本地未代跑、
+未编译。本项不代表混合反向、push、其他执行配置、第 7 步整体或性能验收通过。
+同配置 push 单列 PD-V61，不改变 PD-V60 的已通过结论。
+
+</details>
+
+<a id="pd-v61"></a>
+
+<details>
+<summary>PD-V61｜第 7 步混合部署：Attention DP2/EP2 → 普通 TP1 push、Eager / Prefix 关闭</summary>
+
+**约定范围（2026-11-28）**：承接 PD-V60，只将 8000 Router 从 pull 切为 push。
+P 物理 GPU [0,2] 继续为 Attention DP2/EP2、Attention TP1、load、连续 KV；
+D 物理 GPU 3 继续为普通 TP1、分页 KV/page 128、tokens 2048，full GPU 1
+为在线同配置普通 TP1 对照。保留 P/D/full/8001 的进程与原生 worker；全部
+FP16、Eager，Prefix/回传关闭，固定 Prompt Token ID 与 PD-V60 一致。
+无需更新功能代码、重新编译或重载模型。本次不扩大其他混合方向/执行配置。
+
+**通过标准**：正式生成入口的原 15 个 case 实际输出 Token ID exact 全部 PASS、
+生成退出码 0；独立运行核查 P/D/full 各 21 次新请求，P 两个 Attention 副本
+均有请求、Prefill 完成且没有 Decode，D/full 有 Eager Decode 增量。
+P/D 同请求配对一致，单副本完整 head 范围、源/目标 UUID、Attention TP1 →
+普通 TP1 与连续→分页 KV 布局正确。P/D 交接完成，三端无错误且已释放；
+D push 不要求 `prefill_done`，full 不要求 KV 交接 `completed`。
+以 **P 端本轮** 推送批次与字节增量为正作为实际传输证据；D/full 配置一致，
+三端模型服务配置、启动身份、worker 和 8001 进程保持不变。
+
+C++ 负责调度、协议、布局与资源管理，CUDA 负责计算与 IPC；Python 只做
+测试编排、正式入口调用及证据核查。沿用已验收的查询/停止/启动助手；校验
+归档命令、进程身份、四卡 UUID、空闲与配对后才停止旧 Router，等待端口释放
+后启动新 Router。不使用 pidfd_open、强杀或全快照相等条件。后台独立目录
+记录命令、PID、退出码、stdout/stderr、配置与请求前后证据，并由既有报告器
+生成 Markdown/CSV/JSON/XLSX；15 个生成用例与运行核查分别记录。
+
+**服务器验证（用户回传，2026-11-28）**：
+
+- 总目录：`test/distributed/results/20261128T105105Z_pd_ep2_tp1_push_be393099`。
+- 生成目录：`test/distributed/results/20261128T105111Z_pd_generation_757c2054`；
+  15/15 实际输出 Token ID exact PASS，生成及总退出码均为 0。
+- P 两个 Attention 副本分别承接 10、11 次请求，Eager Decode 增量均为 0。
+  D 与 full 各 21 次请求，Eager Decode 增量分别为 161、140。
+- P 本轮实际推送 504 批、1290338304 字节；`ep2_tp1_push_runtime` PASS，
+  `reference_matches_d`、`services_unchanged`、`passed` 均为 true，
+  `kv_layout=continuous_to_paged`。配对、布局与完成释放核查通过。
+- Router 仅有可选框架提示；生成与总流程标准错误为空。
+
+本项按约定范围验收，当前状态见主表。结论来自用户服务器回传，本地未编译、
+未代跑 GPU。至此本方向 Eager/Prefix 关闭的 pull/push 均已通过；反向与其他
+执行配置独立待验，不扩大为第 7 步整体或性能验收成功。
+
+</details>
+
+<a id="pd-v62"></a>
+
+<details>
+<summary>PD-V62｜第 7 步反向混合部署：普通 TP1 → Attention DP2/EP2 pull</summary>
+
+**后续范围（2026-11-28）**：P 普通 TP1、分页 KV；D Attention DP2/EP2、
+Attention TP1、load、连续 KV；FP16、Eager，Prefix/回传关闭。在当前四卡
+全互联 P2P 环境执行；优先复用同配置已验收的 Attention 非 PD 基线，使用前
+校验归档、模型/执行配置及固定输入一致性，不以普通 TP1 基线替代 Attention 基线。
+
+通过标准：15 个原有正式生成 case 与对应基线实际 Token ID exact 一致；
+独立核查 D 两个 Attention 副本均处理请求、双端配对与物理 UUID/head 范围正确、
+分页→连续布局正确、P Prefill/D Decode 实际执行、完成释放及 D 本轮拉取增量。
+生成与运行核查分别报告，均成功且退出码为 0 后验收。C++/CUDA 继续走正式路径，
+Python 仅做测试编排与证据核查。具体后台命令已准备，状态见主表。
+
+**本次部署安排**：承接用户 PD-V61 成功目录
+`test/distributed/results/20261128T105105Z_pd_ep2_tp1_push_be393099`。
+将旧 D 的普通 TP1 配置改为新 P（GPU 3、8100），旧 P 的 Attention DP2/EP2
+配置改为新 D（GPU 0、2、8200），8000 从 push 切为 pull。先核对已有服务
+身份、参数、空闲、UUID，再通过正式 CLI 参数校验和设备规划；校验通过后
+才停止 Router 和旧 P/D，并等待 worker 与端口释放。新 P 可见顺序为
+[3,0,1,2]，新 D 为 [0,2,1,3]，各进程仍可见四卡供 IPC 使用；不使用裸
+`--tp 3` 选择物理卡，不重编译、不修改功能代码或历史结果。
+
+对照复用 `test/distributed/results/20261128T033907Z_pd_generation_536f636f/reference.json`，
+使用该基线保存的固定 6 Token 输入展开原 15 个用例（长 Prompt 仍覆盖
+1/128/511/512/513）。运行前核对归档完整、报告摘要与模型/Attention 配置，
+启动后严格核对 D 与基线配置。GPU 1 的旧普通 TP1 完整服务及 8001 保持运行，
+本轮不向其生成请求；其输出不能替代 Attention 基线。P/D 各 21 次新请求，
+P Prefill 已完成且不 Decode，D 两个 Attention 副本都有实际 Decode；完成释放
+条件按角色判断，pull 不强制源端 `completed`。P/D 配对一致，源单副本及目标
+所选副本的完整 head 范围和物理 UUID 正确，D 拉取增量为正。
+
+命令使用 Python 编排；日志、设备规划、完整命令、PID、退出码、部署与请求
+前后证据写入新的 UTC/随机 ID 结果目录，生成和运行核查分别产出
+Markdown/CSV/JSON/XLSX。保持原脚本及历史 FAIL/PASS 证据；任一核查失败返回非零。
+本地仅静态 Review、Python AST（含嵌入规划代码）、Bash 语法及差异检查，
+未编译、未代跑服务器或 GPU；首次服务器结果与后续定位见下文。
+
+与 PD-V63 合计 30 个生成用例、2 项独立运行核查，作为此前建议的本轮四卡
+基础并行方向收尾范围；不追加其他 Graph/Prefix 交叉矩阵到这 30 个用例。
+扩展配置、规模及策略另列待验，完成本轮不等于第 7 步全量范围通过。
+
+
+**首次服务器结果（用户回传，2026-11-28）**：
+
+- 总目录：`test/distributed/results/20261128T110052Z_pd_tp1_ep2_pull_5ac24694`；
+  生成目录：`test/distributed/results/20261128T110401Z_pd_generation_d98fff95`。
+- 生成 13/15 case PASS，生成及总退出码均为 1。`sampling_fixed_seed` 首差索引 3
+  （第 4 个输出 Token）；`concurrent4` 汇总首个异常的首差索引 6（第 7 个输出 Token）。
+  并发组其余子请求是否也有差异，须读取各自 evidence，不能从汇总推定只有一个子请求失败。
+- `tp1_ep2_pull_runtime` 因“15 个 exact 用例未全部通过”中止，运行核查只保存
+  `generation_exit_code=1`；随后双目标副本、配对、释放、D 拉取增量的验收尚未完成。
+  原脚本已在此门槛前保存 `services.after_generation.json`，可用于只读诊断。
+- 用户回传 P/D 及规划 stderr 为空，Router 只有可选框架提示。现有证据只证明输出
+  不一致，尚不能归因为 KV 搬运、普通/Attention 计算差异、采样或并发调度。
+- 下一步先读取固定种子采样和 concurrent4 四个请求的 `.evidence.json`，保留双方
+  Token 序列、参数、首差位置，并将流式响应请求 ID 与保存的配对/副本记录关联；
+  非流式响应没有请求 ID 时不按请求顺序猜测。命令归档于
+  [PD-V62 已有证据提取](pd_test_commands/PD-V62_collect_exact.sh)。
+  本次不重新提交生成、不切换/重启服务，不降低 exact 标准，不将原 FAIL 改为 WARNING。
+
+当前状态见主表；以上为用户服务器报告，本地只进行代码阅读、静态检查与记录更新。
+
+
+**已有证据复核（用户回传，2026-11-28）**：
+
+- 诊断目录：`test/distributed/results/20261128T111230Z_pd_v62_exact_diag_e29698a5`。
+- 固定种子采样：6 Token Prompt，temperature=0.7、top_k=5、top_p=1、seed=20261126；
+  前三个输出一致，第 4 个 reference=106758、actual=104756。非流式响应无请求 ID，
+  未关联到目标副本，不按请求顺序猜测。
+- 并发 4 的 request0/1/2 全部 exact；只有 request3 第 7 个输出
+  reference=2073、actual=46553。四个请求为 512 Token Prompt、temperature=0 的贪心生成，
+  不能将该差异解释为随机采样。request0/3 均在 D 副本 1，request1/2 在副本 0；
+  同副本成功和失败同时存在，尚不能认定单副本故障。四次交接 ID 双端对应、
+  D completed/released、P released 且错误为空；这些记录不能代替 KV 内容精确核查。
+- 失败报告 Git `67bcb885`、基线报告 Git `6ac3c910`，测试进程加载的扩展 SHA256 不同。
+  本地 fetch 后对上述完整提交做差异核对：功能源码仅有证据接口 usage/cache 查询顺序修正，
+  未改模型计算/采样源码；其余为测试/文档变化。版本标签或扩展摘要差异本身不是已定位根因，
+  也不能据测试进程元信息确认所有在线模型执行器产物。
+- 下一步拟复验 3 种定位场景各两轮，共 6 次场景执行/12 次请求：原采样、
+  原 request3 单独执行、原并发 4。保持当前 P/D/8000、输入参数与旧基线，
+  不新增并行矩阵、不切换 Graph/Prefix/批次不变模式。保存每次 Token、首次分歧、
+  与旧 actual 是否相同、请求对应副本及完成释放；任一 exact 差异仍 FAIL、非零退出。
+- 脚本已保存至 [最小复验](pd_test_commands/PD-V62_replay_minimal.py)，本地仅 AST/静态 Review；
+  尚未服务器运行。后续需复制到新独立结果目录并后台执行，记录命令/PID/日志/退出码，
+  使用既有报告器生成 Markdown/CSV/JSON/XLSX。定位复验通过也不替代原 15 项与完整运行核查。
+
+
+**验收口径讨论（2026-11-28）**：用户询问差异是否很大，并提出若语义相同，
+是否有必要要求 exact。已核对现有 Token 数组：两条输出均为 8 Token，采样在
+第 4～8 位不同（5/8），并发 request3 在第 7～8 位不同（2/8）；位置差异数量
+不能直接量化语义差异，首差后的错位或生成分叉也不能按独立错误累计解释。
+当前本地没有原模型 Tokenizer；原服务器 evidence 中已保存双方响应文本，
+下一步可只读提取文本后讨论。暂不自动执行已准备的 6 次定位复验。
+本次讨论尚未改动全项目比较/退出码规则或原验收标准；原 exact FAIL 及未完成的
+运行核查状态保留。如果后续采用语义验收，应明确范围和判据，另记语义结论，
+不将旧 exact 失败改写成完全一致；串请求、KV 内容/协议错误、泄漏等仍需独立核查。
+
+**接续确认（2026-11-28）**：用户先选择“已启动任务，我提供目录或输出”，随后
+回传原总目录 `20261128T110052Z_pd_tp1_ep2_pull_5ac24694`、原生成目录
+`20261128T110401Z_pd_generation_d98fff95` 的日志、报告与退出码。两者均为 1，
+确认该任务已结束；报告仍为同一次 13/15 PASS，不是新增复验。运行核查仅有
+`generation_exit_code=1`，不能把门槛中止解释为已发现独立传输/释放故障。
+本次未回传新的最小复验结果，当前模型服务及其他任务状态仍需现场核查。
+下一步已准备 [状态与响应文本只读提取](pd_test_commands/PD-V62_read_status_text.sh)：
+使用 Python 标准库读取进程、近期运行目录、原任务 PID 与两条失败响应文本，
+写入独立诊断目录；不发推理请求，不导入推理模块，不改旧证据。
+代理仅做脚本 Review、Bash/AST 静态及差异检查，未连接服务器、执行该脚本、
+启动测试、切换服务或编译。原 exact FAIL 与待验范围保留。
+
+</details>
+
+<a id="pd-v63"></a>
+
+<details>
+<summary>PD-V63｜第 7 步反向混合部署：普通 TP1 → Attention DP2/EP2 push</summary>
+
+**后续范围（2026-11-28）**：接续 PD-V62，复用相同 P/D、输入、非 PD 对照
+与执行配置，将传输模式切为 push。15 个生成 case 均要求实际 Token ID exact；
+独立核查双目标 Attention 副本、配对、分页→连续 KV、实际执行、完成释放、
+模型服务不变及 **P 端本轮推送**增量。D 不以 `prefill_done` 作为完成条件。
+生成与运行核查均成功、退出码均为 0 后验收；具体命令待准备，状态见主表。
+该项和 PD-V62 为本轮四卡基础方向剩余两组，不替代扩展矩阵与后续步骤验收。
+
+</details>
+
 <a id="pd-e01"></a>
 
 <details>
@@ -3047,9 +3474,19 @@ Python 控制回归新增 `ordinary_tp2_cold_page_len`：注入双 rank 尚未�
 注入，不执行模型计算。通过标准是 10/10 PASS、退出码 0；该回归与 PD-V56 的
 真实生成验收分别记录。原 PD-V43 九个历史用例的验收结论保留。
 
-本地仅静态 Review、Python 语法与差异检查；未编译、未运行原生控制回归或 GPU。
-用户服务器当前部署已执行过页池初始化，可重新读取实际状态，配置严格匹配
-后继续 PD-V56；历史配置和失败报告不得改写。当前状态统一见主表。
+**服务器验证（用户回传，2026-11-28）**：
+
+- 目录：`test/distributed/results/20261128T092538Z_pd_evidence_a8c26f51`。
+- 10/10 用例全部 PASS，退出码 0，标准错误为空；冷启动双 rank 返回页长度 256，
+  `cold_matches_initialized=true`。普通 TP、Attention 副本与 EP 组规模、非法 rank/device
+  拒绝及基线配置检查均通过。本项仅为原生证据接口的控制回归。
+- 代理本地仅静态 Review、Python 语法与差异检查，未编译或运行上述回归/GPU；
+  通过结论来自用户服务器结果。现有 P/D 未重启，仍使用已加载版本；不得将独立
+  测试进程的新扩展验收表述为现有服务已经切换版本。
+
+随后用户回传 PD-V56 续验通过：现有服务不重启，重新读取已初始化的实际状态，
+与原基线严格匹配后完成模型生成和传输核查。该结果不代表重启后的新扩展冷启动
+GPU 验证；历史配置和失败报告保持原样。当前状态统一见主表。
 
 </details>
 
