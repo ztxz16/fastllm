@@ -1,7 +1,7 @@
 # PD 分离设计与实现清单
 
 本文汇总已确认的 PD 分离设计、功能清单与流程图。图 1～4 表示设计方案，
-图 5、6 说明当前短 Prompt Pull 的代码流程；图示本身不代表通过验收，
+图 5、6 说明当前短 Prompt Pull 的代码流程，图 7、8 说明 Push 的代码流程；图示本身不代表通过验收，
 各项实现与验收状态以对应条目的记录为准。
 待办内容和状态继续在 [项目待办](../../project/TODO.md#pd-分离实现清单) 中维护。
 实施顺序与阶段交付条件见[单机 PD 分离实施计划](IMPLEMENTATION_PLAN.md)。
@@ -28,6 +28,7 @@ Router 选择 P/D 服务、协调交接并统一输出；KV 数据由 P/D 之间
 | [Router 与现有调度](#routerproxy-与现有调度复用) | 服务选择、策略、健康检查、重试和容量背压。 |
 | [请求交接流程（图 2）](#kv-推送与拉取) | 短 Prompt 推送/拉取，以及长 Prompt 逐层传输。 |
 | [Pull 元信息检查（图 5）](#pull-metadata-checks)与 [传输 ID（图 6）](#pull-transfer-id) | 当前短 Prompt Pull 的检查阶段、ID 生成与分发时机。 |
+| [Push 元信息检查（图 7）](#push-metadata-checks)与 [传输 ID（图 8）](#push-transfer-id) | 当前短 Prompt Push 的并发准备、P 端检查及 ID 生成与分发时机。 |
 | [服务内部架构（图 3）](#异步传输任务管理) | 调度、交接接口、异步完成通知及资源生命周期。 |
 | [多轮 KV 复用（图 4）](#kv-回传与多轮复用) | 下一轮 P 从上一轮 D 拉取历史 KV。 |
 | [准确性比对与验收原则](#准确性比对与验收原则) | 比较优先级、FAIL 与 WARNING 的边界。 |
@@ -543,6 +544,60 @@ Token 和 Head 范围不能同时重叠，并非检查 P 源 meta 是否重复�
 
 两图中的蓝色箭头表示控制消息或元信息，绿色箭头表示 KV 数据；实际 KV 从 P 直接传到 D，
 不经过 Router。图中代码行号对应上述日期的版本，后续代码调整时需同步更新图示与文字定位。
+
+<a id="push-metadata-checks"></a>
+
+### Push 元信息检查发生在哪里（图 7）
+
+以下两张图按 **2026-11-28 当前代码的短 Prompt、P→D Push 流程**绘制。
+Router 并发请求 P Prefill 和 D 准备接收空间，见
+[pd_router.cpp:87](../../src/distributed/pd_router.cpp#L87)、
+[pd_router.cpp:90](../../src/distributed/pd_router.cpp#L90)。D 准备好目标空间后，直接向 P
+登记目标 meta，见 [pd_service.cpp:333](../../src/distributed/pd_service.cpp#L333)。
+P 计算与 D 准备的完成顺序不固定，图中的上下排布不表示 D 必须等 P 算完才登记。
+
+![图 7：Push 元信息检查阶段，红圈 A/B 为 P 端检查，紫圈 C 为独立测试](images/07_push_metadata_checks.png)
+
+图 7 从已完成 P/D 配对开始。P 持有自己的源 meta，描述“从哪里读”；D 发来的目标 meta
+描述“写到哪里”。**图中红圈 A、B 均在 P 端执行**，检查位置如下：
+
+| 图中位置 | 检查内容 | 当前代码 |
+|---|---|---|
+| A：第 2 步 P 收到 D 的目标 meta | 解析元信息；核对 Push 模式与目标归属；用传输 ID 查本地记录并核对完整身份；检查未取消、目标描述符合配对预留，且重复登记时描述未变。 | [service.py:238](../../tools/fastllm_pytools/pd/service.py#L238)、[pd_service.cpp:55](../../src/distributed/pd_service.cpp#L55)、[pd_service_transfer.cpp:168](../../src/distributed/pd_service_transfer.cpp#L168)、[pd_pairing.cpp:152](../../src/distributed/pd_pairing.cpp#L152) |
+| 第 3 步：启动条件 | 尚未启动、未取消、本地源 meta 与远端目标 meta 均已具备，才继续提交；缺少描述时本次暂不提交，后续描述就绪时再次触发检查。 | 条件 [pd_service_transfer.cpp:186](../../src/distributed/pd_service_transfer.cpp#L186)；目标登记触发 [pd_service_transfer.cpp:182](../../src/distributed/pd_service_transfer.cpp#L182)；源准备触发 [pd_service.cpp:331](../../src/distributed/pd_service.cpp#L331) |
+| B：第 4 步生成映射、第 5 步实际拷贝前 | 同时使用 P 源 meta 与 D 目标 meta，复查身份、模型/KV 语义、前缀和 Token 范围；检查源覆盖、目标范围重复及缺失，生成拷贝映射。 | 调用入口 [pd_service_transfer.cpp:250](../../src/distributed/pd_service_transfer.cpp#L250)；身份/布局 [pd_metadata.cpp:109](../../src/distributed/pd_metadata.cpp#L109)；目标重复 [pd_metadata.cpp:141](../../src/distributed/pd_metadata.cpp#L141)；源覆盖 [pd_metadata.cpp:166](../../src/distributed/pd_metadata.cpp#L166)；目标完整性 [pd_metadata.cpp:193](../../src/distributed/pd_metadata.cpp#L193) |
+| C：独立测试，不是线上额外步骤 | 将 meta 转成 JSON，再解析回来，断言前后对象一致；这是 Push/Pull 共用元信息类型的测试。 | [check_protocol.py:280](../../test/distributed/pd/check_protocol.py#L280) |
+
+“目标范围重复”仍指 **D 的目标区域描述**：同一 rank、同一层、同一 K/V 分量内，
+Token 和 Head 范围不能同时重叠；Push 由 P 检查这些描述。
+映射校验失败会抛错，不注册本次传输任务；通过后才注册并发布已就绪的源层，见
+[pd_service_transfer.cpp:250](../../src/distributed/pd_service_transfer.cpp#L250)、
+[pd_service_transfer.cpp:253](../../src/distributed/pd_service_transfer.cpp#L253)、
+[pd_service_transfer.cpp:259](../../src/distributed/pd_service_transfer.cpp#L259)。
+本图限定短 Prompt；长 Prompt 的源 meta 可以早于全部 Prefill 完成，仍须按对应层的就绪状态提交。
+
+<a id="push-transfer-id"></a>
+
+### Push 传输 ID 在哪里生成（图 8）
+
+![图 8：Push 的传输 ID 由 Router 在第 0 步生成，随后交给 P/D 并随目标 meta 返回 P](images/08_push_transfer_id.png)
+
+**红圈第 0 步生成传输 ID，早于选择 P/D、配对和 Prefill。** Push 与 Pull 使用同一生成逻辑；
+图中的 `T001` 是示例，实际生成 UUID。同一次尝试双方使用同一个传输 ID，重试时生成新 ID。
+
+| 阶段 | 行为 | 当前代码 |
+|---|---|---|
+| 第 0 步：开始本次请求尝试 | Router 调用重试预算的开始方法，通过预算检查后生成 UUID。 | [pd_router.cpp:10](../../src/distributed/pd_router.cpp#L10)、[pd_resources.cpp:29](../../src/distributed/pd_resources.cpp#L29)、[pd_resources.cpp:36](../../src/distributed/pd_resources.cpp#L36) |
+| 选择服务后 | 把已有传输 ID 与请求 ID、P/D 身份写入本次交接身份，再放入双方请求体；此处不再生成 ID。 | [pd_router.cpp:57](../../src/distributed/pd_router.cpp#L57)、[pd_router.cpp:60](../../src/distributed/pd_router.cpp#L60) |
+| 前置配对与预留 | Router 向 P 发起配对；P 携带同一身份向 D 申请目标副本预留。这里预留副本，D 的目标 KV 空间在第 1b 步准备。 | [pd_router.cpp:72](../../src/distributed/pd_router.cpp#L72)、[pd_pairing.cpp:259](../../src/distributed/pd_pairing.cpp#L259) |
+| 第 2 步 P 收到 D 目标 meta | D 把同一身份随目标 meta 发给 P；P 按传输 ID 查询已有记录，再核对完整身份。P 无需等实际推送开始才知道 ID。 | [pd_service.cpp:333](../../src/distributed/pd_service.cpp#L333)、[pd_service_transfer.cpp:175](../../src/distributed/pd_service_transfer.cpp#L175)、[pd_service.cpp:55](../../src/distributed/pd_service.cpp#L55) |
+
+第 5 步由 P 主动把 KV 写入 D；第 6 步由 P 将传输结果通知 D，见
+[pd_service_transfer.cpp:346](../../src/distributed/pd_service_transfer.cpp#L346)。
+两图中的蓝色箭头表示控制消息或元信息，绿色箭头表示真实 KV；KV 不经过 Router。
+图中省略 HTTP 响应和 Router 发往 D 的生成请求，后者见
+[pd_router.cpp:104](../../src/distributed/pd_router.cpp#L104)。图中代码行号对应上述日期的版本，
+后续代码调整时需同步更新图示与文字定位。
 
 <a id="pull-unified-receive"></a>
 
