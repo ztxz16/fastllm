@@ -45,9 +45,14 @@ GPU 测试的 `cuda_fixture.py` 仅在测试所有者进程分配、上传和读
 
 Python 测试适配 `generation_reference.py` 将 `parallel` 纳入离线基线配置，
 避免把 EP 规模误算成 TP，或把不同 EP 组配置视为相同配置。
-`check_evidence.py` 调用正式 C++ 证据接口检查 9 个控制用例，原生状态由测试注入；
+`check_evidence.py` 调用正式 C++ 证据接口检查 10 个控制用例，原生状态由测试注入；
 通过 `launch.py evidence` 后台执行并生成 Markdown/CSV/JSON/XLSX。
 这些控制检查不能替代 Attention DP/EP 的真实模型与传输验收。
+
+同日修正普通 TP 冷启动证据采集顺序：C++ 证据接口先执行已有的 `usage`
+查询（其原生路径会按需初始化页池），再读取 `cache` 状态，避免首次响应混入
+初始化前的 `page_len=0`。Python 新增一个冷启动回归用例，核查首次快照的真实
+页大小及其与后续快照的一致性；不改变基线配置比较规则或模型计算流程。
 
 ### 2026-11-27：局部 P2P 拓扑的副本配对
 

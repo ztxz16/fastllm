@@ -67,7 +67,8 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-V53](#pd-v53) | 第 7 步准备：Attention DP2/EP2 非 PD 离线基线，load、Graph 关闭 / Prefix 开启 | 已接入（C++ 调度/EP 协调及前缀缓存，CUDA Eager；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 录制 PASS；双 rank Eager/前缀复用、归档及 P/PD Router 不变核查通过，生成及总退出码 0） | 验收成功 | 已用于 PD-V54 pull 与 PD-V55 push 对照通过；本项仅为该配置非 PD 基线验收 |
 | [PD-V54](#pd-v54) | 第 7 步并行组合：Attention DP2/EP2→Attention DP2/EP2、load、pull、双端 Eager / Prefix 开启 | 已接入（C++ 调度/EP 协调与前缀复用，CUDA Eager/IPC；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；双副本复用、Eager、配对、释放、D 拉取及 P 不重启核查通过，生成及总退出码 0） | 验收成功 | 同配置 PD-V55 push 已通过；当前 Attention 基础矩阵 8/8 配置验收成功，其他并行组合及既有前缀一致性问题独立待验 |
 | [PD-V55](#pd-v55) | 第 7 步并行组合：Attention DP2/EP2→Attention DP2/EP2、load、push、双端 Eager / Prefix 开启 | 已接入（C++ 调度/EP 协调与前缀复用，CUDA Eager/IPC；Python 后台编排与证据核查） | 已通过（2026-11-28 用户回传 15/15 exact PASS；双副本复用、Eager、配对、释放、P 推送及模型服务不变核查通过，生成及总退出码 0） | 验收成功 | 本配置完成，Attention 基础矩阵 8/8 配置通过；下一项普通 TP1→TP2 pull 单列 PD-V56，其他并行范围独立待验 |
-| [PD-V56](#pd-v56) | 第 7 步并行组合：普通 TP1→TP2、pull、双端 Eager / Prefix 关闭 | 已接入（C++ 调度/分片映射与资源管理，CUDA Eager/IPC；Python 后台编排与证据核查） | 待验证（服务器命令已静态 Review；本地未编译、未运行 GPU） | 未验收 | 先校验原普通 TP2 离线基线；P=GPU 0、D=GPU 2/3，验证 15 个 exact 用例及双目标 rank、配对、释放和 D 拉取 |
+| [PD-V56](#pd-v56) | 第 7 步并行组合：普通 TP1→TP2、pull、双端 Eager / Prefix 关闭 | 已接入（C++ 调度/分片映射与资源管理，CUDA Eager/IPC；Python 后台编排与证据核查） | 未通过（2026-11-28 用户回传：D 首次快照两 rank 的 page_len=0、基线=128；其余配置相同，编排退出码 1，尚未提交生成） | 未通过 | 证据采集顺序修正另列 PD-E01；保留当前服务，重新采集并严格核对实际配置后续验，保留原 FAIL 与历史基线 |
+| [PD-E01](#pd-e01) | 普通 TP 冷启动证据：页池初始化后采集页大小 | 已修正（C++ 采集顺序；Python 冷启动回归） | 待验证（本地静态 Review/语法/差异检查；未编译、未运行原生回归） | 未验收 | 服务器更新原生产物后执行 evidence 共 10 个控制用例；既有 PD-V43 的 9 个历史 PASS 保留，不新增并行部署矩阵 |
 | [PD-V01](#pd-v01) | C++/CUDA 编译与加载 | 已实现 | 已通过（2026-11-27 用户确认） | 验收成功 | 重装后编译与 protocol 分列 PD-V41/V42，实际加载路径与摘要待归档 |
 | [PD-V02](#pd-v02) | 协议与逻辑映射（protocol） | 已实现 | 已通过（配对修复后用户回传 41/41 PASS，退出码 0） | 验收成功 | 本次控制回归完成；真实模型集成见 PD-V29/PD-02 |
 | [PD-V03](#pd-v03) | Router 重试边界（router） | 已实现 | 已通过（配对修复后用户回传 20/20 PASS，退出码 0） | 验收成功 | 本次重试边界回归完成；真实服务故障矩阵见 PD-13 |
@@ -2979,6 +2980,26 @@ Attention DP2/EP2 同布局基础矩阵，不扩展为第 7 步所有并行组�
 <details>
 <summary>PD-V56｜第 7 步并行组合：普通 TP1→TP2 pull、双端 Eager / Prefix 关闭</summary>
 
+**首次服务器运行（用户回传，2026-11-28）**：
+
+- 目录：`test/distributed/results/20261128T085912Z_pd_tp1_tp2_pull_d70982a5`。
+- 原普通 TP2 基线的归档检查通过；旧 Router、P、D 已停止，新 P TP1（GPU 0）、
+  D TP2（GPU 2、3）及 pull Router 已启动，并通过就绪查询。
+- `tp1_tp2_pull_runtime` 在比较新 D 配置与离线基线时失败：
+  `RuntimeError: D 配置与普通 TP2 基线不符`，总退出码 1。
+  失败位于生成 launcher 调用之前，15 个 exact 用例及本轮 KV 传输核查尚未执行；
+  不据此判断分片或模型计算错误。
+- 用户随后回传诊断目录
+  `test/distributed/results/20261128T091037Z_pd_tp1_tp2_config_diag_76bb04b4`：
+  基线摘要未变化，生成未提交；仅 D 两个 rank 的 `page_len` 不同，基线均为 128，
+  保存的首次快照均为 0，其余配置相同。
+- 源码核查定位到证据采集顺序：先 `cache` 读到尚未创建执行器的默认状态，再
+  `usage` 按需初始化普通 TP 页池；同一响应混合了初始化前后的状态。修正与控制
+  回归独立记录在 PD-E01，不据此将本项标记通过。
+- 下一步保留当前服务，重新采集真实配置并与未修改的基线严格比较；不能把
+  `page_len=0` 手工替换为 128 或跳过比较。实际配置匹配后，在新目录续验原有
+  15 个 exact 用例及实际执行核查，保留原始 FAIL 记录。
+
 **约定范围（2026-11-28）**：承接 PD-V55，切换至普通 TP 模式；P 使用物理
 GPU 0（TP1），D 使用物理 GPU 2、3（TP2），GPU 1 空闲。两端 DP1、Attention
 DP1、EP1，FP16、分页 KV、page size 128、cache tokens 2048；Graph、Prefix、
@@ -3006,6 +3027,28 @@ D 与完整 TP2 基线相同，P 的 TP1 与 D 的 TP2 差异属于本项预期�
 报告；失败保留证据，不覆盖旧结果。命令仅进行静态 Review 与 Python/Bash
 语法检查，本地未编译、未运行 GPU。本项不覆盖反向 TP2→TP1、push、混合
 Attention 部署、性能或待讨论的 pull 统一入口改造；当前状态统一见主表。
+
+</details>
+
+<a id="pd-e01"></a>
+
+<details>
+<summary>PD-E01｜普通 TP 冷启动证据页大小</summary>
+
+2026-11-28 因 PD-V56 的首次配置检查失败定位：普通 TP 尚未创建执行器时，
+`cache` 查询返回默认页长度 0；同一次证据请求随后执行的 `usage` 已初始化
+页池，但此前取得的 `states` 未刷新。C++ 证据接口改为先 `usage`、后 `cache`，
+保持既有初始化路径和严格配置比较，不修改模型、分页布局或第三方代码。
+
+Python 控制回归新增 `ordinary_tp2_cold_page_len`：注入双 rank 尚未初始化的
+状态，以及真实页长度 256，要求首次证据直接返回 256，并与后续快照一致，
+防止硬编码 128。`evidence` 共 10 个独立用例，使用正式 C++ 接口；状态由测试
+注入，不执行模型计算。通过标准是 10/10 PASS、退出码 0；该回归与 PD-V56 的
+真实生成验收分别记录。原 PD-V43 九个历史用例的验收结论保留。
+
+本地仅静态 Review、Python 语法与差异检查；未编译、未运行原生控制回归或 GPU。
+用户服务器当前部署已执行过页池初始化，可重新读取实际状态，配置严格匹配
+后继续 PD-V56；历史配置和失败报告不得改写。当前状态统一见主表。
 
 </details>
 
