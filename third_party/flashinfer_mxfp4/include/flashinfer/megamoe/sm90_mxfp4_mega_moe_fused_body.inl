@@ -546,7 +546,7 @@ if constexpr (kCompactLocalRows) {
       [] { __syncthreads(); }, gridDim.x);
 } else if constexpr (kGroupLocalRows) {
   static_assert(kLocalMaxRows == BLOCK_M && (BLOCK_M == 8 || BLOCK_M == 16));
-  static_assert(kNumExperts == 256 && kNumRanks == 1 && kNumTopk == 8);
+  static_assert(!kGroupLocalRows || (kNumExperts == 256 && kNumRanks == 1 && kNumTopk == 8));
   if (threadIdx.x < 32) {
     // The 16-row variant handles 9..16 rows. Only its final word can
     // contain stale slots from a preceding replay with a longer input.
